@@ -1,0 +1,87 @@
+{
+  "name": "nanfeng-main-ashare-v2",
+  "version": "2.2.0",
+  "display_name": "南风 Main/Ashare 协作流",
+  "description": "当前正式拓扑：main 为唯一前台入口，ashare 为量化中台与讨论主持人，量化子角色通过 ashare_api.sh 从 WSL 直连 Windows 服务，并围绕 discussion cycle API 执行 v0.9 两轮讨论。",
+  "governance_refs": {
+    "technical_manual": "docs/technical-manual.md",
+    "subsystem_specs": "docs/subsystem-specs.md",
+    "deliberation_protocol": "docs/multi-agent-deliberation-protocol-v1.md",
+    "delegation_templates": "docs/openclaw-subagent-delegation-templates.md",
+    "agent_data_usage": "docs/agent-data-usage.md"
+  },
+  "discussion_protocol": {
+    "round_1": "四个讨论子代理基于统一 agent-packets 独立判断，不先复读彼此观点。",
+    "round_2": "只处理 round_2_target_case_ids，必须附带 controversy_summary_lines / round_2_guidance / substantive_gap_case_ids。",
+    "round_2_completion": "不只看四个子代理都发言，还要求每条 round 2 opinion 含实质回应字段。",
+    "finalize_gate": "若 finalize 返回 discussion_not_ready，先补齐二轮结构化回应，不得绕过讨论直接执行。"
+  },
+  "entry_agent": "main",
+  "transport": {
+    "gateway": "openclaw-gateway",
+    "service_probe": "/mnt/d/Coding/lhjy/ashare-system-v2/scripts/ashare_api.sh probe",
+    "service_client": "/mnt/d/Coding/lhjy/ashare-system-v2/scripts/ashare_api.sh"
+  },
+  "agents": [
+    {
+      "id": "main",
+      "display_name": "南风",
+      "prompt_file": "openclaw/prompts/main.txt",
+      "delegates": ["ashare", "coder", "inspector", "designer", "ops", "info", "writer", "image", "social"]
+    },
+    {
+      "id": "ashare",
+      "display_name": "南风·量化",
+      "prompt_file": "openclaw/prompts/ashare.txt",
+      "delegates": [
+        "ashare-runtime",
+        "ashare-research",
+        "ashare-strategy",
+        "ashare-risk",
+        "ashare-executor",
+        "ashare-audit"
+      ]
+    },
+    {
+      "id": "ashare-runtime",
+      "display_name": "南风·运行",
+      "prompt_file": "openclaw/prompts/ashare-runtime.txt"
+    },
+    {
+      "id": "ashare-research",
+      "display_name": "南风·研报",
+      "prompt_file": "openclaw/prompts/ashare-research.txt"
+    },
+    {
+      "id": "ashare-strategy",
+      "display_name": "南风·策略",
+      "prompt_file": "openclaw/prompts/ashare-strategy.txt"
+    },
+    {
+      "id": "ashare-risk",
+      "display_name": "南风·风控",
+      "prompt_file": "openclaw/prompts/ashare-risk.txt"
+    },
+    {
+      "id": "ashare-executor",
+      "display_name": "南风·执行",
+      "prompt_file": "openclaw/prompts/ashare-executor.txt"
+    },
+    {
+      "id": "ashare-audit",
+      "display_name": "南风·审计",
+      "prompt_file": "openclaw/prompts/ashare-audit.txt"
+    }
+  ],
+  "handoff_rules": [
+    "飞书和 webchat 都先进 main",
+    "股票与量化问题统一从 main 转给 ashare",
+    "ashare 不越权替代子角色，但可直接写 discussion cycle 与治理层接口",
+    "ashare 发起 Round 1 / Round 2 委派时，默认按 docs/openclaw-subagent-delegation-templates.md 组织任务",
+    "Round 2 必须把 controversy_summary_lines / round_2_guidance / substantive_gap_case_ids 传给子代理",
+    "若子代理 Round 2 只重复结论而无结构化回应字段，该票不视为讨论完成",
+    "没有 ashare-risk 放行，不进入 ashare-executor",
+    "ashare 先收敛 base_pool / focus_pool / execution_pool，再由 main 对外回复",
+    "最终对外回复由 main 输出"
+  ]
+}

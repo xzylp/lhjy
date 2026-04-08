@@ -1,0 +1,234 @@
+version: v0.1
+updated_at: 2026-04-04
+description: >
+  Dynamic parameter registry draft for ashare-system-v2 multi-agent selection,
+  intraday T, and governance workflows.
+
+layers:
+  - system_defaults
+  - market_regime_params
+  - agent_adjusted_params
+
+precedence:
+  - agent_adjusted_params
+  - market_regime_params
+  - system_defaults
+
+parameters:
+  - param_key: base_pool_capacity
+    scope: runtime
+    value_type: integer
+    default_value: 20
+    allowed_range: [10, 50]
+    effective_period_default: next_trading_day
+    proposed_by: [ashare, user]
+    approved_by: ashare-audit
+    notes: Daily base pool must always exist.
+
+  - param_key: focus_pool_capacity
+    scope: strategy
+    value_type: integer
+    default_value: 10
+    allowed_range: [5, 20]
+    effective_period_default: next_trading_day
+    proposed_by: [ashare-strategy]
+    approved_by: ashare-audit
+
+  - param_key: watchlist_capacity
+    scope: strategy
+    value_type: integer
+    default_value: 8
+    allowed_range: [3, 12]
+    effective_period_default: next_trading_day
+    proposed_by: [ashare-strategy, ashare, user]
+    approved_by: ashare-audit
+
+  - param_key: execution_pool_capacity
+    scope: execution
+    value_type: integer
+    default_value: 3
+    allowed_range: [1, 3]
+    effective_period_default: until_revoked
+    proposed_by: [ashare-risk]
+    approved_by: ashare-audit
+    notes: Hard cap remains 3.
+
+  - param_key: trend_follow_through_ratio
+    scope: market
+    value_type: percent
+    default_value: 0.55
+    allowed_range: [0.40, 0.75]
+    effective_period_default: next_trading_day
+    proposed_by: [ashare-strategy, ashare-risk]
+    approved_by: ashare-audit
+
+  - param_key: rotation_switch_frequency
+    scope: market
+    value_type: integer
+    default_value: 2
+    allowed_range: [1, 5]
+    effective_period_default: next_trading_day
+    proposed_by: [ashare-strategy]
+    approved_by: ashare-audit
+
+  - param_key: risk_off_drawdown_threshold
+    scope: risk
+    value_type: percent
+    default_value: 0.045
+    allowed_range: [0.02, 0.08]
+    effective_period_default: next_trading_day
+    proposed_by: [ashare-risk]
+    approved_by: ashare-audit
+
+  - param_key: momentum_weight
+    scope: strategy
+    value_type: number
+    default_value: 0.25
+    allowed_range: [0.0, 0.60]
+    effective_period_default: next_trading_day
+    proposed_by: [ashare-strategy]
+    approved_by: ashare-audit
+
+  - param_key: reversion_weight
+    scope: strategy
+    value_type: number
+    default_value: 0.20
+    allowed_range: [0.0, 0.60]
+    effective_period_default: next_trading_day
+    proposed_by: [ashare-strategy]
+    approved_by: ashare-audit
+
+  - param_key: breakout_weight
+    scope: strategy
+    value_type: number
+    default_value: 0.20
+    allowed_range: [0.0, 0.60]
+    effective_period_default: next_trading_day
+    proposed_by: [ashare-strategy]
+    approved_by: ashare-audit
+
+  - param_key: event_driven_weight
+    scope: strategy
+    value_type: number
+    default_value: 0.15
+    allowed_range: [0.0, 0.50]
+    effective_period_default: next_trading_day
+    proposed_by: [ashare-strategy, ashare-research]
+    approved_by: ashare-audit
+
+  - param_key: sector_theme_rotation_weight
+    scope: strategy
+    value_type: number
+    default_value: 0.20
+    allowed_range: [0.0, 0.60]
+    effective_period_default: next_trading_day
+    proposed_by: [ashare-strategy, ashare-research]
+    approved_by: ashare-audit
+
+  - param_key: t_min_amplitude
+    scope: intraday
+    value_type: percent
+    default_value: 0.015
+    allowed_range: [0.005, 0.04]
+    effective_period_default: today_session
+    proposed_by: [ashare-strategy, ashare-risk]
+    approved_by: ashare-audit
+
+  - param_key: t_max_amplitude
+    scope: intraday
+    value_type: percent
+    default_value: 0.08
+    allowed_range: [0.04, 0.15]
+    effective_period_default: today_session
+    proposed_by: [ashare-risk]
+    approved_by: ashare-audit
+
+  - param_key: t_take_profit_1
+    scope: intraday
+    value_type: percent
+    default_value: 0.025
+    allowed_range: [0.01, 0.05]
+    effective_period_default: today_session
+    proposed_by: [ashare-strategy]
+    approved_by: ashare-audit
+
+  - param_key: t_take_profit_2
+    scope: intraday
+    value_type: percent
+    default_value: 0.04
+    allowed_range: [0.02, 0.08]
+    effective_period_default: today_session
+    proposed_by: [ashare-strategy]
+    approved_by: ashare-audit
+
+  - param_key: t_stop_loss_soft
+    scope: intraday
+    value_type: percent
+    default_value: -0.015
+    allowed_range: [-0.05, -0.005]
+    effective_period_default: today_session
+    proposed_by: [ashare-risk]
+    approved_by: ashare-audit
+
+  - param_key: t_stop_loss_hard
+    scope: intraday
+    value_type: percent
+    default_value: -0.02
+    allowed_range: [-0.08, -0.01]
+    effective_period_default: today_session
+    proposed_by: [ashare-risk]
+    approved_by: ashare-audit
+
+  - param_key: tail_open_cutoff
+    scope: intraday
+    value_type: time
+    default_value: "14:30"
+    allowed_range: ["14:00", "14:50"]
+    effective_period_default: today_session
+    proposed_by: [ashare-risk]
+    approved_by: ashare-audit
+
+  - param_key: tail_exit_cutoff
+    scope: intraday
+    value_type: time
+    default_value: "14:55"
+    allowed_range: ["14:30", "14:59"]
+    effective_period_default: today_session
+    proposed_by: [ashare-risk]
+    approved_by: ashare-audit
+
+  - param_key: max_total_position
+    scope: risk
+    value_type: percent
+    default_value: 0.80
+    allowed_range: [0.20, 1.00]
+    effective_period_default: until_revoked
+    proposed_by: [ashare-risk]
+    approved_by: ashare-audit
+
+  - param_key: max_single_position
+    scope: risk
+    value_type: percent
+    default_value: 0.25
+    allowed_range: [0.05, 0.40]
+    effective_period_default: until_revoked
+    proposed_by: [ashare-risk]
+    approved_by: ashare-audit
+
+  - param_key: daily_loss_limit
+    scope: risk
+    value_type: percent
+    default_value: 0.05
+    allowed_range: [0.01, 0.10]
+    effective_period_default: until_revoked
+    proposed_by: [ashare-risk]
+    approved_by: ashare-audit
+
+  - param_key: sector_exposure_limit
+    scope: risk
+    value_type: percent
+    default_value: 0.40
+    allowed_range: [0.10, 0.60]
+    effective_period_default: until_revoked
+    proposed_by: [ashare-risk]
+    approved_by: ashare-audit

@@ -1,0 +1,14 @@
+.env
+.venv/
+.ashare_state/
+.ashare_state_*/
+.pytest_cache/
+.serena/
+.tmp/
+.tmp_pytest/
+.codex_tmp/
+logs/
+src/*.egg-info/
+src/**/*.egg-info/
+__pycache__/
+*.pyc

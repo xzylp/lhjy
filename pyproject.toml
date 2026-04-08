@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ashare-system-v2"
+version = "0.2.0"
+description = "A股多Agent自动化量化交易系统 v2 升级版"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116",
+  "httpx>=0.27",
+  "pydantic>=2.7",
+  "uvicorn>=0.35",
+  "akshare>=1.15.54",
+  "pandas>=2.0.0",
+  "numpy>=1.24.0",
+  "scikit-learn>=1.8.0",
+  "xgboost>=3.2.0",
+  "apscheduler>=3.11.2",
+  "pywinauto>=0.6.9",
+  "python-dotenv>=1.2.2",
+]
+
+[project.scripts]
+ashare-run = "ashare_system.run:main"
+ashare-execution-gateway-worker = "ashare_system.windows_execution_gateway_worker:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,62 @@
+{
+  "name": "nanfeng-main-ashare-registry",
+  "version": "2.2.0",
+  "display_name": "南风团队当前正式注册表",
+  "governance_refs": {
+    "workflow": "openclaw/workflow.final.json",
+    "deliberation_protocol": "docs/multi-agent-deliberation-protocol-v1.md",
+    "delegation_templates": "docs/openclaw-subagent-delegation-templates.md"
+  },
+  "entrypoints": {
+    "webchat/main": "main",
+    "feishu": "main"
+  },
+  "teams": {
+    "main": ["ashare", "coder", "inspector", "designer", "ops", "info", "writer", "image", "social"],
+    "ashare": [
+      "ashare-runtime",
+      "ashare-research",
+      "ashare-strategy",
+      "ashare-risk",
+      "ashare-executor",
+      "ashare-audit"
+    ]
+  },
+  "agent_roles": {
+    "main": "唯一前台入口，总调度和最终回复出口",
+    "ashare": "量化中台总调度与讨论主持人，负责按正式委派模板下发 Round 1 / Round 2 任务、讨论归档与结果收敛",
+    "ashare-runtime": "运行面，负责 health、pipeline、intraday、runtime report 和候选 case 上下文确认",
+    "ashare-research": "研究面，负责 sync、news、announcements、summary 与研究 opinion，并在 Round 2 回应研究证据争议",
+    "ashare-strategy": "策略面，负责解释、比较、观察名单、筛选结论与策略 opinion，并在 Round 2 回应排序与胜出逻辑争议",
+    "ashare-risk": "风控闸门，负责 allow / limit / reject 与风险 opinion，并在 Round 2 回应限制条件是否解除",
+    "ashare-executor": "执行面，负责账户、持仓、订单、成交和已放行执行意图",
+    "ashare-audit": "审计面，负责审计、会议、运行报告、讨论质量与盘后复核，并在 Round 2 判断争议是否被充分回应"
+  },
+  "discussion_contract": {
+    "shared_context_entry": "/system/discussions/agent-packets",
+    "meeting_context_entry": "/system/discussions/meeting-context",
+    "finalize_packet_entry": "/system/discussions/finalize-packet",
+    "required_round_2_fields": [
+      "challenged_by",
+      "challenged_points",
+      "previous_stance",
+      "changed",
+      "changed_because",
+      "resolved_questions",
+      "remaining_disputes"
+    ],
+    "required_round_2_context": [
+      "controversy_summary_lines",
+      "round_2_guidance",
+      "substantive_gap_case_ids"
+    ]
+  },
+  "service_access": {
+    "wsl_client": "/mnt/d/Coding/lhjy/ashare-system-v2/scripts/ashare_api.sh",
+    "endpoint_discovery": "manifest-first dynamic detection",
+    "service_manifest": "/mnt/d/Coding/lhjy/ashare-system-v2/.ashare_state/service_endpoints.json",
+    "windows_service_bind": "0.0.0.0:8100",
+    "windows_local_url": "http://127.0.0.1:8100",
+    "wsl_url_source": "preferred_wsl_url in service manifest"
+  }
+}

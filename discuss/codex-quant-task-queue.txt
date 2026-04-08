@@ -1,0 +1,33 @@
+# Codex unattended task queue example
+# Use a line with exactly --- to separate tasks.
+
+阅读 discuss/quant-full-v1-task-breakdown.md、discuss/quant-full-v1-complete.md 和当前 src/tests 代码，
+先只处理 “让前排识别和快撤成立” 这一批任务。
+本任务目标：
+1. 扩展 contracts，补 StockBehaviorProfile 和 ExitSignal 所需契约。
+2. 实现 strategy/stock_profile.py 的最小可用版本。
+3. 新增或更新对应测试，保持现有行为兼容。
+要求：
+- 只改必要文件。
+- 完成后运行相关测试。
+- 最后把结果写入 discuss/执行记录-codex.md。
+---
+继续上一会话，不重复做已经完成的部分。
+本任务目标：
+1. 实现 strategy/leader_rank.py。
+2. 把 leader ranking 接入现有 router 或 playbook 选择逻辑，但保持向后兼容。
+3. 新增或更新测试，验证前排识别成立。
+要求：
+- 如果发现已有实现，先复查再补齐缺口。
+- 完成后运行相关测试。
+- 把本轮变更追加写入 discuss/执行记录-codex.md。
+---
+继续上一会话。
+本任务目标：
+1. 实现 strategy/exit_engine.py 的最小规则版本。
+2. 接入 sell_decision.py 的回退逻辑，优先保持旧逻辑可用。
+3. 新增或更新测试，验证快撤信号成立。
+要求：
+- 输出明确说明哪些场景仍是占位实现。
+- 完成后运行相关测试。
+- 把本轮变更追加写入 discuss/执行记录-codex.md。

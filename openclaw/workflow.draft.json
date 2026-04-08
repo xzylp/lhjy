@@ -1,0 +1,553 @@
+{
+  "name": "nanfeng-ashare-intraday-orchestration",
+  "version": "0.5.0",
+  "display_name": "南风·量化盘中联动",
+  "status": "legacy_draft_do_not_use_for_discussion_cycle",
+  "description": "历史草案。当前正式讨论/委派流程以 workflow.final.json、team_registry.final.json 与 docs/openclaw-subagent-delegation-templates.md 为准；本文件仅保留作旧设计参考。",
+  "superseded_by": {
+    "workflow": "openclaw/workflow.final.json",
+    "registry": "openclaw/team_registry.final.json",
+    "delegation_templates": "docs/openclaw-subagent-delegation-templates.md"
+  },
+  "entry_agent": "ashare",
+  "services": {
+    "all": "{{service_base_url}}"
+  },
+  "agents": [
+    {
+      "id": "ashare",
+      "display_name": "南风·量化",
+      "model": "GPT-5.4",
+      "prompt_file": "openclaw/prompts/ashare.txt",
+      "outputs": ["plan", "handoff_order", "system_home", "system_overview", "deployment_gate", "paper_validation_day", "paper_validation", "rollout_bootstrap_execution", "rollout_gate_summary", "final_report"]
+    },
+    {
+      "id": "ashare-research",
+      "display_name": "南风·研报",
+      "model": "MiniMax-M2.7",
+      "prompt_file": "openclaw/prompts/ashare-research.txt",
+      "outputs": ["symbols", "news_count", "announcement_count", "event_titles"]
+    },
+    {
+      "id": "ashare-strategy",
+      "display_name": "南风·策略",
+      "model": "GPT-5.4",
+      "prompt_file": "openclaw/prompts/ashare-strategy.txt",
+      "outputs": ["top_picks", "summary", "decisions", "decision_id", "protocol.strategy", "protocol.research"]
+    },
+    {
+      "id": "ashare-risk",
+      "display_name": "南风·风控",
+      "model": "GPT-5.4",
+      "prompt_file": "openclaw/prompts/ashare-risk.txt",
+      "outputs": ["risk_decision", "allowed_symbols", "rejected_symbols", "risk_notes", "decision_id", "protocol.risk", "protocol.execution"]
+    },
+    {
+      "id": "ashare-runtime",
+      "display_name": "南风·运行",
+      "model": "GPT-5.4",
+      "prompt_file": "openclaw/prompts/ashare-runtime.txt",
+      "outputs": ["health_status", "runtime_summary", "incident_notes", "system_home", "system_overview", "deployment_gate", "paper_validation_day", "paper_validation", "rollout_gate_snapshot", "experiment_status_updates", "operations_component_status", "release_decision_exports", "action_order_exports", "action_execution_results", "rollout_readiness", "rollout_bootstrap_plan", "rollout_bootstrap_execution", "rollout_recovery_plan", "rollout_recovery_action_order", "rollout_recovery_action_execution", "rollout_recovery_preflight", "rollout_recovery_execution"]
+    },
+    {
+      "id": "ashare-audit",
+      "display_name": "南风·审计",
+      "model": "GPT-5.4",
+      "prompt_file": "openclaw/prompts/ashare-audit.txt",
+      "outputs": ["盘中结论", "Top Picks", "观察名单", "审计摘要", "风险提示", "system_home", "system_overview", "deployment_gate", "paper_validation_day", "paper_validation", "rollout_gate_summary", "experiment_action_order", "experiment_action_execution", "decision_id", "experiment_id", "protocol_snapshots", "learning_stats", "learning_advice", "experiment_dashboard", "experiment_release_decision", "experiment_runtime_reports", "experiment_audit_chain", "postclose_master_report"]
+    }
+  ],
+  "phases": [
+    "governance",
+    "research",
+    "strategy",
+    "risk",
+    "runtime",
+    "audit"
+  ],
+  "steps": [
+    {
+      "id": "read_system_home_gate",
+      "phase": "governance",
+      "agent": "ashare",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/home"
+    },
+    {
+      "id": "read_system_overview_gate",
+      "phase": "governance",
+      "agent": "ashare",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/overview?probe_mode=external&recent_audit_limit=10"
+    },
+    {
+      "id": "read_deployment_gate_gate",
+      "phase": "governance",
+      "agent": "ashare",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/deployment-gate?probe_mode=external"
+    },
+    {
+      "id": "read_rollout_bootstrap_execution_gate",
+      "phase": "governance",
+      "agent": "ashare",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-bootstrap-execution?probe_mode=external"
+    },
+    {
+      "id": "read_paper_validation_day_gate",
+      "phase": "governance",
+      "agent": "ashare",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/paper-validation-day?required_sessions=3"
+    },
+    {
+      "id": "read_paper_validation_gate",
+      "phase": "governance",
+      "agent": "ashare",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/paper-validation?required_sessions=3"
+    },
+    {
+      "id": "sync_research",
+      "phase": "research",
+      "agent": "ashare-research",
+      "method": "POST",
+      "url": "{{service_base_url}}/research/sync"
+    },
+    {
+      "id": "write_news",
+      "phase": "research",
+      "agent": "ashare-research",
+      "method": "POST",
+      "url": "{{service_base_url}}/research/events/news"
+    },
+    {
+      "id": "write_announcements",
+      "phase": "research",
+      "agent": "ashare-research",
+      "method": "POST",
+      "url": "{{service_base_url}}/research/events/announcements"
+    },
+    {
+      "id": "run_pipeline",
+      "phase": "strategy",
+      "agent": "ashare-strategy",
+      "method": "POST",
+      "url": "{{service_base_url}}/runtime/jobs/pipeline"
+    },
+    {
+      "id": "read_latest_report",
+      "phase": "strategy",
+      "agent": "ashare-strategy",
+      "method": "GET",
+      "url": "{{service_base_url}}/runtime/reports/latest"
+    },
+    {
+      "id": "read_meeting_by_decision",
+      "phase": "strategy",
+      "agent": "ashare-strategy",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/meetings/by-decision?decision_id={{decision_id}}"
+    },
+    {
+      "id": "read_audits_by_decision",
+      "phase": "risk",
+      "agent": "ashare-risk",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/audits/by-decision?decision_id={{decision_id}}"
+    },
+    {
+      "id": "read_positions",
+      "phase": "risk",
+      "agent": "ashare-risk",
+      "method": "GET",
+      "url": "{{service_base_url}}/execution/account/8890130545/positions"
+    },
+    {
+      "id": "read_balance",
+      "phase": "risk",
+      "agent": "ashare-risk",
+      "method": "GET",
+      "url": "{{service_base_url}}/execution/account/8890130545/balance"
+    },
+    {
+      "id": "read_system_home_runtime",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/home"
+    },
+    {
+      "id": "read_system_overview_runtime",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/overview?probe_mode=external&recent_audit_limit=10"
+    },
+    {
+      "id": "read_deployment_gate_runtime",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/deployment-gate?probe_mode=external"
+    },
+    {
+      "id": "read_paper_validation_day_runtime",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/paper-validation-day?required_sessions=3"
+    },
+    {
+      "id": "read_paper_validation_runtime",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/paper-validation?required_sessions=3"
+    },
+    {
+      "id": "read_rollout_gate_runtime",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/rollout-gate"
+    },
+    {
+      "id": "check_runtime_health",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/runtime/health"
+    },
+    {
+      "id": "check_execution_health",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/execution/health"
+    },
+    {
+      "id": "read_operations_component_status",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/operations/components"
+    },
+    {
+      "id": "export_release_decision",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "POST",
+      "url": "{{service_base_url}}/system/experiments/{{experiment_id}}/release-decision/export"
+    },
+    {
+      "id": "export_action_order",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "POST",
+      "url": "{{service_base_url}}/system/experiments/{{experiment_id}}/action-order/export"
+    },
+    {
+      "id": "execute_action_order",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "POST",
+      "url": "{{service_base_url}}/system/experiments/{{experiment_id}}/action-execution/execute"
+    },
+    {
+      "id": "read_supervised_rollout_readiness",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-readiness"
+    },
+    {
+      "id": "read_supervised_rollout_bootstrap_plan",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-bootstrap-plan"
+    },
+    {
+      "id": "read_supervised_rollout_bootstrap_execution",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-bootstrap-execution?probe_mode=external"
+    },
+    {
+      "id": "read_supervised_rollout_recovery_plan",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-recovery-plan"
+    },
+    {
+      "id": "read_supervised_rollout_recovery_action_order",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-recovery-action-order"
+    },
+    {
+      "id": "read_supervised_rollout_recovery_action_execution",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-recovery-action-execution"
+    },
+    {
+      "id": "read_supervised_rollout_recovery_preflight",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "POST",
+      "url": "{{service_base_url}}/system/supervised-rollout-recovery-execution/preflight/export"
+    },
+    {
+      "id": "read_supervised_rollout_recovery_execution",
+      "phase": "runtime",
+      "agent": "ashare-runtime",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-recovery-execution"
+    },
+    {
+      "id": "read_system_home_audit",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/home"
+    },
+    {
+      "id": "read_system_overview_audit",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/overview?probe_mode=external&recent_audit_limit=10"
+    },
+    {
+      "id": "read_deployment_gate_audit",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/deployment-gate?probe_mode=external"
+    },
+    {
+      "id": "read_paper_validation_audit",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/paper-validation?required_sessions=3"
+    },
+    {
+      "id": "read_rollout_gate_audit",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/rollout-gate"
+    },
+    {
+      "id": "read_audits",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/audits"
+    },
+    {
+      "id": "read_learning_stats",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/learning/stats"
+    },
+    {
+      "id": "read_learning_advice",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/learning/advice"
+    },
+    {
+      "id": "read_operations_component_status_audit",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/operations/components"
+    },
+    {
+      "id": "read_experiment_dashboard",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/experiments/dashboard"
+    },
+    {
+      "id": "read_experiment_runtime_reports",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/reports/runtime?experiment_id={{experiment_id}}"
+    },
+    {
+      "id": "read_experiment_audits",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/audits/by-experiment?experiment_id={{experiment_id}}"
+    },
+    {
+      "id": "read_experiment_release_decision",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/experiments/{{experiment_id}}/release-decision"
+    },
+    {
+      "id": "read_experiment_action_order",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/experiments/{{experiment_id}}/action-order"
+    },
+    {
+      "id": "read_experiment_action_execution",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/experiments/{{experiment_id}}/action-execution"
+    },
+    {
+      "id": "read_rollout_readiness",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-readiness"
+    },
+    {
+      "id": "read_rollout_bootstrap_plan",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-bootstrap-plan"
+    },
+    {
+      "id": "read_rollout_bootstrap_execution",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-bootstrap-execution?probe_mode=external"
+    },
+    {
+      "id": "read_rollout_recovery_plan",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-recovery-plan"
+    },
+    {
+      "id": "read_rollout_recovery_action_order",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-recovery-action-order"
+    },
+    {
+      "id": "read_rollout_recovery_action_execution",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-recovery-action-execution"
+    },
+    {
+      "id": "read_rollout_recovery_preflight",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "POST",
+      "url": "{{service_base_url}}/system/supervised-rollout-recovery-execution/preflight/export"
+    },
+    {
+      "id": "read_rollout_recovery_execution",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/supervised-rollout-recovery-execution"
+    },
+    {
+      "id": "read_research_summary",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/research/summary"
+    },
+    {
+      "id": "read_meetings",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/meetings/latest"
+    },
+    {
+      "id": "read_runtime_report",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/runtime/reports/latest"
+    },
+    {
+      "id": "read_postclose_master_report",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/reports/postclose-master"
+    },
+    {
+      "id": "read_postclose_master_report_template",
+      "phase": "audit",
+      "agent": "ashare-audit",
+      "method": "GET",
+      "url": "{{service_base_url}}/system/reports/postclose-master-template"
+    }
+  ],
+  "governance": {
+    "risk_has_veto": true,
+    "executor_requires_approval": true,
+    "live_changes_require_paper_validation": true,
+    "controller_prefers_system_home": true,
+    "governance_only_when_gate_blocked_or_stale": true,
+    "governance_only_when_bootstrap_integrity_failed": true,
+    "primary_runtime_snapshot": "system/home",
+    "secondary_runtime_snapshot": "system/overview",
+    "primary_audit_output": "system/reports/postclose-master-template",
+    "experiment_release_requires_decision": true
+  },
+  "report_template": {
+    "required_fields": [
+      "Top Picks",
+      "decision_id",
+      "experiment_id",
+      "rank",
+      "selection_score",
+      "action",
+      "score_breakdown",
+      "protocol.research",
+      "protocol.strategy",
+      "protocol.risk",
+      "learning_stats",
+      "learning_advice",
+      "experiment_dashboard",
+      "experiment_release_decision",
+      "experiment_action_order",
+      "experiment_action_execution",
+      "postclose_master_report",
+      "system_home",
+      "system_overview",
+      "deployment_gate",
+      "rollout_bootstrap_execution",
+      "paper_validation",
+      "buy_count",
+      "hold_count",
+      "reject_count",
+      "审计摘要"
+    ]
+  }
+}
