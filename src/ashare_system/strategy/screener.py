@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..contracts import MarketProfile
 from ..infra.filters import get_price_limit_ratio
@@ -46,6 +47,7 @@ class StockScreener:
         ai_scores: dict[str, float] | None = None,
         stock_info: dict[str, StockInfo] | None = None,
         runtime_config: RuntimeConfig | None = None,
+        blocked_symbols: set[str] | None = None,
         min_factor_score: float = 0.5,
         min_ai_score: float = 0.6,
         top_n: int = 30,
@@ -66,6 +68,10 @@ class StockScreener:
         # 层0: 基础过滤 (ST/涨停/停牌/次新/流动性)
         pool = self._filter_basic(pool, stock_info, result)
         result.stage_stats["after_basic"] = len(pool)
+
+        # 层0.5: 事件阻断
+        pool = self._filter_event_blocks(pool, blocked_symbols, result)
+        result.stage_stats["after_event"] = len(pool)
 
         # 层1: 环境过滤
         pool = self._filter_environment(pool, profile, result)
@@ -96,6 +102,61 @@ class StockScreener:
         logger.info("选股漏斗: %d → %d", result.stage_stats["input"], len(pool))
         return result
 
+    def run_base_sample(
+        self,
+        candidates: list[str],
+        stock_info: dict[str, StockInfo] | None = None,
+        runtime_config: RuntimeConfig | None = None,
+        blocked_symbols: set[str] | None = None,
+        top_n: int = 60,
+    ) -> ScreenerResult:
+        """运行基础样本生成逻辑，仅执行硬性过滤与范围约束，不执行策略打分。"""
+        if runtime_config:
+            # 基础样本容量通常大于策略候选容量，以便给 Agent 留出筛选空间
+            top_n = max(runtime_config.screener_pool_size * 2, top_n)
+
+        result = ScreenerResult()
+        pool = list(candidates)
+
+        # 层-1: 买股范围过滤
+        if runtime_config:
+            pool = [s for s in pool if runtime_config.scope.is_allowed(s)]
+        result.stage_stats["input"] = len(pool)
+
+        # 层0: 基础过滤 (ST/停牌/涨停/上市天数/换手率)
+        pool = self._filter_basic(pool, stock_info, result)
+        result.stage_stats["after_basic"] = len(pool)
+
+        # 层0.5: 事件阻断 (风控哨兵直接阻断)
+        pool = self._filter_event_blocks(pool, blocked_symbols, result)
+        result.stage_stats["after_event"] = len(pool)
+
+        # 基础样本不再执行环境过滤、因子过滤与 AI 过滤
+        # 直接截断 Top-N 作为 Agent 的原始讨论素材
+        result.passed = pool[:top_n]
+        result.stage_stats["final"] = len(result.passed)
+        logger.info("基础样本生成: %d → %d", result.stage_stats["input"], len(result.passed))
+        return result
+
+    @staticmethod
+    def build_blocked_symbols_from_event_context(event_context: dict[str, Any] | None) -> set[str]:
+        payload = dict(event_context or {})
+        blocked: set[str] = set()
+        by_scope = payload.get("by_scope") or {}
+        related = list(payload.get("highlights") or [])
+        related.extend(list(by_scope.get("symbol") or []))
+        related.extend(list(by_scope.get("market") or []))
+        for item in related:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "").strip()
+            impact = str(item.get("impact") or "").strip().lower()
+            severity = str(item.get("severity") or "").strip().lower()
+            tags = {str(tag).strip().lower() for tag in list(item.get("tags") or [])}
+            if symbol and (impact == "block" or severity == "block" or "suspension" in tags):
+                blocked.add(symbol)
+        return blocked
+
     def _filter_basic(self, pool: list[str], info: dict[str, StockInfo] | None, result: ScreenerResult) -> list[str]:
         """层0: ST排除 + 涨停排除 + 停牌排除 + 上市天数≥60 + 换手率≥0.5%"""
         if not info:
@@ -118,6 +179,18 @@ class StockScreener:
                 result.rejected[s] = f"换手率{si.turnover_rate_5d:.1f}%过低"
             else:
                 passed.append(s)
+        return passed
+
+    def _filter_event_blocks(self, pool: list[str], blocked_symbols: set[str] | None, result: ScreenerResult) -> list[str]:
+        if not blocked_symbols:
+            return pool
+        passed = []
+        blocked = set(blocked_symbols)
+        for symbol in pool:
+            if symbol in blocked:
+                result.rejected[symbol] = "event_blocked"
+                continue
+            passed.append(symbol)
         return passed
 
     def _filter_environment(self, pool: list[str], profile: MarketProfile | None, result: ScreenerResult) -> list[str]:

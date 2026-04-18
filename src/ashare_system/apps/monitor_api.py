@@ -8,13 +8,16 @@ from ..data.serving import ServingStore
 from ..monitor.stock_pool import StockPoolManager
 from ..monitor.alert_engine import AlertEngine
 from ..monitor.persistence import MonitorStateService
+from ..monitor.polling_view import decorate_polling_status_for_display
 from ..settings import AppSettings
+from ..discussion.discussion_service import DiscussionCycleService
 
 
 def build_router(
     pool_mgr: StockPoolManager,
     alert_engine: AlertEngine,
     monitor_state_service: MonitorStateService | None = None,
+    discussion_cycle_service: DiscussionCycleService | None = None,
     settings: AppSettings | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/monitor", tags=["monitor"])
@@ -138,7 +141,29 @@ def build_router(
         if not monitor_state_service:
             monitor_context = serving_store.get_latest_monitor_context() if serving_store else None
             return monitor_context or {"available": False}
-        return monitor_state_service.get_state(event_limit=event_limit)
+        state = monitor_state_service.get_state(event_limit=event_limit)
+        latest_pool_snapshot = dict(state.get("latest_pool_snapshot") or {})
+        cycle_payload = None
+        trade_date = str(latest_pool_snapshot.get("trade_date") or "")
+        if discussion_cycle_service and trade_date:
+            cycle = discussion_cycle_service.get_cycle(trade_date)
+            if cycle:
+                cycle_payload = {
+                    "trade_date": trade_date,
+                    "cycle_id": cycle.cycle_id,
+                    "discussion_state": cycle.discussion_state,
+                    "pool_state": cycle.pool_state,
+                    "execution_pool_case_ids": cycle.execution_pool_case_ids,
+                    "blockers": cycle.blockers,
+                    "updated_at": cycle.updated_at,
+                }
+        state["polling_status"] = decorate_polling_status_for_display(
+            state.get("polling_status"),
+            cycle=cycle_payload,
+        )
+        if cycle_payload:
+            state["cycle"] = cycle_payload
+        return state
 
     @router.get("/changes/summary")
     async def get_change_summary(event_limit: int = 20):

@@ -297,3 +297,107 @@ def governance_adjustment_template(title: str, instruction: str, summary_lines: 
     lines = [f"🛠 **{title}**", f"- 指令: {instruction}"]
     lines.extend(f"- {line}" for line in summary_lines)
     return "\n".join(lines)
+
+
+def feishu_briefing_template(title: str, summary_lines: list[str], data_refs: list[str] | None = None) -> str:
+    lines = [f"📮 **{title}**"]
+    lines.extend(f"- {line}" for line in summary_lines if line)
+    refs = [str(item).strip() for item in (data_refs or []) if str(item).strip()]
+    if refs:
+        lines.append("- 数据入口:")
+        lines.extend(f"  - {item}" for item in refs)
+    return "\n".join(lines)
+
+
+def feishu_answer_template(
+    question: str,
+    answer_lines: list[str],
+    data_refs: list[str] | None = None,
+    trade_advice: dict | None = None,
+) -> str:
+    lines = [f"💬 **飞书问答**", f"- 问题: {question}"]
+    lines.extend(f"- {line}" for line in answer_lines if line)
+    advice = dict(trade_advice or {})
+    if advice:
+        lines.append("- 交易台建议卡:")
+        if advice.get("recommendation_level") or advice.get("stance"):
+            lines.append(
+                f"  - 建议级别: {advice.get('recommendation_level') or '-'} | 立场: {advice.get('stance') or '-'}"
+            )
+        if advice.get("summary"):
+            lines.append(f"  - 结论: {advice.get('summary')}")
+        trigger_conditions = [str(item).strip() for item in list(advice.get("trigger_conditions") or []) if str(item).strip()]
+        if trigger_conditions:
+            lines.append("  - 触发条件: " + "；".join(trigger_conditions[:3]))
+        risk_notes = [str(item).strip() for item in list(advice.get("risk_notes") or []) if str(item).strip()]
+        if risk_notes:
+            lines.append("  - 风险提示: " + "；".join(risk_notes[:3]))
+    refs = [str(item).strip() for item in (data_refs or []) if str(item).strip()]
+    if refs:
+        lines.append("- 相关入口:")
+        lines.extend(f"  - {item}" for item in refs)
+    return "\n".join(lines)
+
+
+def agent_supervision_template(title: str, summary_lines: list[str], items: list[dict] | None = None) -> str:
+    def _compact_task_prompt(text: str) -> str:
+        normalized = " ".join(str(text or "").split())
+        if len(normalized) <= 180:
+            return normalized
+        return normalized[:177] + "..."
+
+    lines = [f"🧷 **{title}**"]
+    seen_summary: set[str] = set()
+    for line in summary_lines:
+        text = str(line or "").strip()
+        if not text or text in seen_summary:
+            continue
+        seen_summary.add(text)
+        lines.append(f"- {text}")
+    for item in (items or [])[:8]:
+        agent_id = str(item.get("agent_id") or "-")
+        status = str(item.get("status") or "-")
+        phase_label = str(item.get("phase_label") or "").strip()
+        task_mode = str(item.get("task_mode") or "").strip()
+        last_active_at = str(item.get("last_active_at") or "").strip()
+        reasons = item.get("reasons") or []
+        reason_text = "；".join(str(reason).strip() for reason in reasons[:2] if str(reason).strip())
+        suffix = f" | last_active={last_active_at}" if last_active_at else ""
+        header = f"- {agent_id}: {status}"
+        if phase_label:
+            header += f" | 阶段={phase_label}"
+        if task_mode:
+            header += f" | 模式={task_mode}"
+        quality_state = str(item.get("quality_state") or "").strip()
+        if quality_state:
+            header += f" | 质量={quality_state}"
+        header += suffix
+        if reason_text:
+            header += f" | {reason_text}"
+        lines.append(header)
+        quality_reason = str(item.get("quality_reason") or "").strip()
+        if quality_reason:
+            lines.append(f"  - 推进质量: {quality_reason}")
+        task_reason = str(item.get("task_reason") or "").strip()
+        if task_reason:
+            lines.append(f"  - 派工缘由: {task_reason}")
+        supervision_tier = str(item.get("supervision_tier") or "").strip()
+        supervision_tier_reason = str(item.get("supervision_tier_reason") or "").strip()
+        if supervision_tier:
+            tier_line = f"  - 催办等级: {supervision_tier}"
+            if supervision_tier_reason:
+                tier_line += f" | {supervision_tier_reason}"
+            lines.append(tier_line)
+        supervision_action_reason = str(item.get("supervision_action_reason") or "").strip()
+        if supervision_action_reason:
+            lines.append(f"  - 优先原因: {supervision_action_reason}")
+        task_prompt = str(item.get("task_prompt") or "").strip()
+        if task_prompt:
+            lines.append(f"  - 当前任务: {_compact_task_prompt(task_prompt)}")
+        expected_outputs = [str(output).strip() for output in list(item.get("expected_outputs") or []) if str(output).strip()]
+        if expected_outputs:
+            lines.append(f"  - 预期产物: {'；'.join(expected_outputs[:3])}")
+        last_completed_at = str(item.get("last_completed_at") or "").strip()
+        if last_completed_at:
+            lines.append(f"  - 最近完成: {last_completed_at}")
+    return "\n".join(lines)

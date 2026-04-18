@@ -1,18 +1,29 @@
 {
   "name": "nanfeng-main-ashare-registry",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "display_name": "南风团队当前正式注册表",
   "governance_refs": {
     "workflow": "openclaw/workflow.final.json",
     "deliberation_protocol": "docs/multi-agent-deliberation-protocol-v1.md",
-    "delegation_templates": "docs/openclaw-subagent-delegation-templates.md"
+    "delegation_templates": "docs/openclaw-subagent-delegation-templates.md",
+    "quant_playbook_draft": "docs/openclaw_quant_playbook_draft_20260412.md"
   },
   "entrypoints": {
     "webchat/main": "main",
     "feishu": "main"
   },
   "teams": {
-    "main": ["ashare", "coder", "inspector", "designer", "ops", "info", "writer", "image", "social"],
+    "main": [
+      "ashare",
+      "coder",
+      "inspector",
+      "designer",
+      "ops",
+      "info",
+      "writer",
+      "image",
+      "social"
+    ],
     "ashare": [
       "ashare-runtime",
       "ashare-research",
@@ -24,13 +35,13 @@
   },
   "agent_roles": {
     "main": "唯一前台入口，总调度和最终回复出口",
-    "ashare": "量化中台总调度与讨论主持人，负责按正式委派模板下发 Round 1 / Round 2 任务、讨论归档与结果收敛",
-    "ashare-runtime": "运行面，负责 health、pipeline、intraday、runtime report 和候选 case 上下文确认",
-    "ashare-research": "研究面，负责 sync、news、announcements、summary 与研究 opinion，并在 Round 2 回应研究证据争议",
-    "ashare-strategy": "策略面，负责解释、比较、观察名单、筛选结论与策略 opinion，并在 Round 2 回应排序与胜出逻辑争议",
-    "ashare-risk": "风控闸门，负责 allow / limit / reject 与风险 opinion，并在 Round 2 回应限制条件是否解除",
-    "ashare-executor": "执行面，负责账户、持仓、订单、成交和已放行执行意图",
-    "ashare-audit": "审计面，负责审计、会议、运行报告、讨论质量与盘后复核，并在 Round 2 判断争议是否被充分回应"
+    "ashare": "量化中台班长与讨论主持人，负责组织自主协作、推进目标仓位、形成治理提案与结果收敛；程序服务负责支撑、监督和围栏",
+    "ashare-runtime": "运行面与盘中事实哨兵，负责读取服务清洗后的 health、pipeline、intraday、runtime report、候选 case 上下文，以及识别候选池外异动和新机会提案",
+    "ashare-research": "研究面与事件研究员，负责 sync、news、announcements、summary、事件催化判断、盘中新题材机会提案分析，以及在 Round 2 回应研究证据争议",
+    "ashare-strategy": "策略面与交易负责人，负责排序、比较、观察名单、胜出与淘汰逻辑、仓位替换建议、日内 T 机会判断，以及在 Round 2 回应排序与胜出逻辑争议",
+    "ashare-risk": "风控闸门与首席风控官，负责 allow / limit / reject、执行前检查、仓位纪律、替换约束、风险提案，以及在 Round 2 回应限制条件是否解除",
+    "ashare-executor": "执行面，负责账户、持仓、订单、成交和已放行执行意图，不参与候选排名与机会发现裁决",
+    "ashare-audit": "审计面与会议秘书处，负责审计、会议、运行报告、讨论质量、机会票准入留痕、盘后复核与学习归档，并在 Round 2 判断争议是否被充分回应"
   },
   "discussion_contract": {
     "shared_context_entry": "/system/discussions/agent-packets",
@@ -49,14 +60,41 @@
       "controversy_summary_lines",
       "round_2_guidance",
       "substantive_gap_case_ids"
+    ],
+    "opportunity_ticket_fields": [
+      "symbol",
+      "source_agent",
+      "trigger_type",
+      "trigger_time",
+      "why_now",
+      "challenge_target_case_ids",
+      "evidence_refs",
+      "recommended_action"
     ]
   },
   "service_access": {
-    "wsl_client": "/mnt/d/Coding/lhjy/ashare-system-v2/scripts/ashare_api.sh",
-    "endpoint_discovery": "manifest-first dynamic detection",
-    "service_manifest": "/mnt/d/Coding/lhjy/ashare-system-v2/.ashare_state/service_endpoints.json",
+    "wsl_client": "/srv/projects/ashare-system-v2/scripts/ashare_api.sh",
+    "endpoint_discovery": "env-first local control-plane",
+    "service_manifest": null,
     "windows_service_bind": "0.0.0.0:8100",
-    "windows_local_url": "http://127.0.0.1:8100",
-    "wsl_url_source": "preferred_wsl_url in service manifest"
+    "windows_local_url": "http://127.0.0.1:18793",
+    "wsl_url_source": "ASHARE_API_BASE_URL / ASHARE_WSL_SERVICE_URL / ASHARE_SERVICE_HOST + ASHARE_SERVICE_PORT"
+  },
+  "agent_weights": {
+    "ashare-audit": 1.0,
+    "ashare-strategy": 1.0,
+    "ashare-research": 1.0,
+    "ashare-risk": 1.0
+  },
+  "operating_model": {
+    "mode": "continuous_desk",
+    "principles": [
+      "市场开放阶段每个量化子角色都处于持续值班状态，不是被动等开会。",
+      "团队除评审既有候选外，还拥有发现新机会、提出治理建议、盘后学习与次日修正的职责。",
+      "若用户或治理层规定目标仓位，团队在风控允许前提下有持续补足目标仓位的义务。",
+      "若已接近或达到目标仓位，新机会提案必须明确挑战现有 execution_pool 或持仓占位，不能只做模糊推荐。",
+      "agent 负责自主协作和提案判断，程序服务负责正式固化、执行、留痕、监督和风控围栏。",
+      "持仓股的日内 T 机会属于正式职责，但必须同时满足策略判断与风控约束。"
+    ]
   }
 }

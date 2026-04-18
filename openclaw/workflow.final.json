@@ -1,14 +1,15 @@
 {
   "name": "nanfeng-main-ashare-v2",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "display_name": "南风 Main/Ashare 协作流",
-  "description": "当前正式拓扑：main 为唯一前台入口，ashare 为量化中台与讨论主持人，量化子角色通过 ashare_api.sh 从 WSL 直连 Windows 服务，并围绕 discussion cycle API 执行 v0.9 两轮讨论。",
+  "description": "当前正式拓扑：main 为唯一前台入口，ashare 为量化中台班长与讨论主持人，量化子角色通过 ashare_api.sh 从 WSL 直连服务，基于服务清洗后的数据自主协作分析机会、推进仓位、执行两轮讨论、盘后学习与治理提案；程序服务负责执行、监督与风控围栏。",
   "governance_refs": {
     "technical_manual": "docs/technical-manual.md",
     "subsystem_specs": "docs/subsystem-specs.md",
     "deliberation_protocol": "docs/multi-agent-deliberation-protocol-v1.md",
     "delegation_templates": "docs/openclaw-subagent-delegation-templates.md",
-    "agent_data_usage": "docs/agent-data-usage.md"
+    "agent_data_usage": "docs/agent-data-usage.md",
+    "mainline_workflow": "docs/agent_robot_mainline_workflow.md"
   },
   "discussion_protocol": {
     "round_1": "四个讨论子代理基于统一 agent-packets 独立判断，不先复读彼此观点。",
@@ -16,11 +17,18 @@
     "round_2_completion": "不只看四个子代理都发言，还要求每条 round 2 opinion 含实质回应字段。",
     "finalize_gate": "若 finalize 返回 discussion_not_ready，先补齐二轮结构化回应，不得绕过讨论直接执行。"
   },
+  "desk_protocol": {
+    "continuous_duty": "市场开放阶段各量化子角色默认处于持续值班状态，agent 自主协作推进交易，服务负责数据支撑、执行落地与流程监督。",
+    "exposure_discipline": "若用户或治理层给定目标仓位，例如 50%，团队在风控允许前提下有持续补足目标仓位的义务。",
+    "position_replacement": "若出现更优机会票，允许对 execution_pool 或现有持仓发起替换讨论，但必须说明替换对象与胜出逻辑。",
+    "intraday_t": "持仓股的日内 T 属于正式职责，需由 runtime 提供事实、strategy 判断机会、risk 判断约束。",
+    "opportunity_ticket": "候选池外新机会必须以 opportunity_ticket 结构返回给服务，包含来源、触发时间、why_now、挑战对象和证据引用；服务负责正式固化、留痕、监督和风控约束。"
+  },
   "entry_agent": "main",
   "transport": {
     "gateway": "openclaw-gateway",
-    "service_probe": "/mnt/d/Coding/lhjy/ashare-system-v2/scripts/ashare_api.sh probe",
-    "service_client": "/mnt/d/Coding/lhjy/ashare-system-v2/scripts/ashare_api.sh"
+    "service_probe": "/srv/projects/ashare-system-v2/scripts/ashare_api.sh probe",
+    "service_client": "/srv/projects/ashare-system-v2/scripts/ashare_api.sh"
   },
   "agents": [
     {
@@ -77,9 +85,14 @@
     "飞书和 webchat 都先进 main",
     "股票与量化问题统一从 main 转给 ashare",
     "ashare 不越权替代子角色，但可直接写 discussion cycle 与治理层接口",
+    "市场开放阶段各量化子角色默认持续值班，ashare 负责按查询、讨论、执行、治理、盘中机会处理等模式组织自主协作，而不是只在开会时委派。",
+    "若目标仓位未满且风控无明确阻断，ashare 要推动团队继续寻找并论证合格机会，不得把空仓视为自然状态。",
+    "若已有更优机会提案，ashare 可组织 execution_pool 或现有持仓替换讨论，但必须要求 strategy/risk/audit 给出替换理由、风险约束和留痕判断。",
     "ashare 发起 Round 1 / Round 2 委派时，默认按 docs/openclaw-subagent-delegation-templates.md 组织任务",
     "Round 2 必须把 controversy_summary_lines / round_2_guidance / substantive_gap_case_ids 传给子代理",
     "若子代理 Round 2 只重复结论而无结构化回应字段，该票不视为讨论完成",
+    "候选池外新机会必须先形成服务可消费的 opportunity_ticket 结构，再由服务固化并进入 watch_review、focus_review 或 challenge_execution_pool，不能口头插票。",
+    "盘后学习会产出的 missed_opportunities、late_discoveries、risk_overblocking、proposal_candidates 等应继续流入 nightly_sandbox、prompt_patcher、registry_updater 或参数提案。",
     "没有 ashare-risk 放行，不进入 ashare-executor",
     "ashare 先收敛 base_pool / focus_pool / execution_pool，再由 main 对外回复",
     "最终对外回复由 main 输出"

@@ -1,0 +1,11 @@
+{
+  "id": "ashare-sessions-spawn-guard",
+  "name": "Ashare Sessions Spawn Guard",
+  "description": "在 runtime=subagent 时清洗 sessions_spawn 的 ACP 专属字段，避免 OpenClaw 误注入坏参数导致子代理启动失败。",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

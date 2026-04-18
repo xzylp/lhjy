@@ -1,0 +1,19 @@
+[Unit]
+Description=ashare-system-v2 Linux Go Data Platform (Concurrency & Cache)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yxz
+Group=yxz
+WorkingDirectory=/srv/projects/ashare-system-v2/go_data_platform
+EnvironmentFile=/srv/projects/ashare-system-v2/.env
+ExecStart=/srv/projects/ashare-system-v2/go_data_platform/go-data-platform
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

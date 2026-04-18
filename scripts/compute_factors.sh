@@ -5,11 +5,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
+source "$SCRIPT_DIR/common_env.sh"
+
+PYTHON_BIN="$(resolve_project_python || true)"
+if [[ -z "${PYTHON_BIN}" ]]; then
+    echo "[ashare-v2] 未找到可用 Python 解释器，请先创建 .venv 或设置 ASHARE_PYTHON_BIN" >&2
+    exit 1
+fi
 
 mkdir -p logs
 
 echo "[ashare-v2] 开始因子批量计算..."
-exec .venv/Scripts/python.exe -c "
+echo "[ashare-v2] Python: ${PYTHON_BIN}"
+exec "${PYTHON_BIN}" -c "
 from ashare_system.factors import registry, FactorEngine
 from ashare_system.container import get_market_adapter
 from ashare_system.logging_config import setup_logging, get_logger

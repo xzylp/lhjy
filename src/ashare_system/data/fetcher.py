@@ -28,9 +28,15 @@ class DataFetcher:
             logger.warning("快照获取失败: %s", e)
             return []
 
-    def fetch_bars(self, symbols: list[str], period: str = "1d", count: int = 1) -> FetchResult:
+    def fetch_bars(
+        self,
+        symbols: list[str],
+        period: str = "1d",
+        count: int = 1,
+        end_time: str | None = None,
+    ) -> FetchResult:
         try:
-            bars = self.market.get_bars(symbols, period, count=count)
+            bars = self.market.get_bars(symbols, period, count=count, end_time=end_time)
             quality = DataQuality(source="real", completeness=1.0)
             return FetchResult(symbols=symbols, bars=bars, quality=quality)
         except Exception as e:
@@ -82,6 +88,7 @@ class DataPipeline:
         symbols: list[str],
         meta: dict[str, StockMeta] | None = None,
         count: int = 1,
+        as_of_time: str | None = None,
     ) -> list[CleanedBar]:
         """完整管道: 获取日线 → 缓存 → 清洗 → 验证"""
         all_bars: list[BarSnapshot] = []
@@ -101,7 +108,7 @@ class DataPipeline:
 
         # 2. 获取未缓存的数据
         if uncached:
-            result = self.fetcher.fetch_bars(uncached, "1d", count=requested_count)
+            result = self.fetcher.fetch_bars(uncached, "1d", count=requested_count, end_time=as_of_time)
             all_bars.extend(result.bars)
             # 写入缓存
             if self.cache and result.bars:

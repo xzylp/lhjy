@@ -69,6 +69,14 @@ def get_monitor_state_store():
 
 
 @lru_cache(maxsize=1)
+def get_feishu_longconn_state_store():
+    from .infra.audit_store import StateStore
+
+    settings = get_settings()
+    return StateStore(settings.storage_root / "feishu_longconn_state.json")
+
+
+@lru_cache(maxsize=1)
 def get_monitor_state_service():
     from .data.archive import DataArchiveStore
     from .monitor.persistence import MonitorStateService
@@ -90,6 +98,8 @@ def get_feishu_notifier():
         settings.notify.feishu_app_id,
         settings.notify.feishu_app_secret,
         settings.notify.feishu_chat_id,
+        important_chat_id=settings.notify.feishu_important_chat_id,
+        supervision_chat_id=settings.notify.feishu_supervision_chat_id,
     )
 
 
@@ -134,6 +144,19 @@ def get_candidate_case_service():
 
 
 @lru_cache(maxsize=1)
+def get_learned_asset_service():
+    from .strategy.learned_asset_service import LearnedAssetService
+    from .strategy.atomic_repository import strategy_atomic_repository
+
+    return LearnedAssetService(
+        strategy_atomic_repository,
+        state_store=get_runtime_state_store(),
+        audit_store=get_audit_store(),
+        candidate_case_service=get_candidate_case_service(),
+    )
+
+
+@lru_cache(maxsize=1)
 def get_discussion_cycle_service():
     from .discussion.discussion_service import DiscussionCycleService
 
@@ -142,6 +165,7 @@ def get_discussion_cycle_service():
         settings.storage_root / "discussion_cycles.json",
         candidate_case_service=get_candidate_case_service(),
         parameter_service=get_parameter_service(),
+        learned_asset_service=get_learned_asset_service(),
     )
 
 
@@ -177,6 +201,7 @@ def reset_container() -> None:
     get_research_state_store.cache_clear()
     get_meeting_state_store.cache_clear()
     get_monitor_state_store.cache_clear()
+    get_feishu_longconn_state_store.cache_clear()
     get_monitor_state_service.cache_clear()
     get_feishu_notifier.cache_clear()
     get_message_dispatcher.cache_clear()

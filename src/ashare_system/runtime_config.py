@@ -63,6 +63,8 @@ class RuntimeConfig(BaseModel):
     max_buy_count: int = 3              # 每次最多买入几只
     max_hold_count: int = 5             # 最多同时持有几只
     screener_pool_size: int = 30        # 粗筛候选池大小
+    excluded_theme_keywords: str = ""   # 逗号分隔的排除方向关键词，如 银行,白酒
+    live_trade_enabled: bool = False    # 是否允许实盘落单执行
 
     # 仓位
     max_total_position: float = 0.8     # 最高总仓位 (0-1)

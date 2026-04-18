@@ -21,6 +21,20 @@ def summarize_case(case: DiscussionCaseRecord | dict) -> DiscussionCaseRecord:
     round_1 = [item for item in record.opinions if item.round == 1]
     round_2 = [item for item in record.opinions if item.round == 2]
 
+    # S1.2: 提取反证与质询目标
+    counter_evidence = _collect_reason_points(round_1, {"rejected", "oppose", "question", "limit", "hold"})
+    inquiry_targets = []
+    for op in round_1:
+        if op.stance in {"rejected", "limit", "hold", "question"}:
+            # 针对负面观点，生成质询目标 (通常指向策略或研究)
+            for reason in op.reasons[:2]:
+                inquiry_targets.append({
+                    "from_agent": op.agent_id,
+                    "to_agent": "ashare-strategy" if op.agent_id != "ashare-strategy" else "ashare-research",
+                    "question": reason,
+                    "case_id": record.case_id
+                })
+
     record.round_1_summary = DiscussionRoundSummary(
         selected_points=_collect_reason_points(round_1, {"support", "selected"}),
         support_points=_collect_reason_points(round_1, {"support", "selected"}),
@@ -31,6 +45,8 @@ def summarize_case(case: DiscussionCaseRecord | dict) -> DiscussionCaseRecord:
         theses=_collect_theses(round_1),
         key_evidence=_collect_key_evidence(round_1),
         challenged_points=_collect_challenged_points(round_1),
+        counter_evidence=counter_evidence,
+        inquiry_targets=inquiry_targets,
     )
     record.round_2_summary = DiscussionRoundSummary(
         resolved_points=_collect_reason_points(round_2, {"support", "selected"}),
@@ -100,6 +116,17 @@ def build_trade_date_summary(cases: Iterable[DiscussionCaseRecord | dict], trade
     if substantive_gap_case_ids:
         gap_case_ids = set(substantive_gap_case_ids)
         summary_lines.append("二轮待实质回应：" + "；".join(_round_2_gap_line(item) for item in items if item.case_id in gap_case_ids))
+    
+    # S1.2: 明确质询要求
+    all_inquiry_targets = []
+    for item in items:
+        all_inquiry_targets.extend(item.round_1_summary.inquiry_targets)
+    if all_inquiry_targets:
+        summary_lines.append("本轮质询要求：" + "；".join(
+            f"@{it['to_agent']} 应回应 {it['from_agent']} 对 {it['case_id']} 的质询: {it['question']}"
+            for it in all_inquiry_targets[:8]
+        ))
+
     if revised_cases:
         summary_lines.append("已修正观点：" + "；".join(
             f"{item.symbol} {item.name or item.symbol} -> {item.round_2_summary.revision_notes[0]}"
@@ -125,6 +152,7 @@ def build_trade_date_summary(cases: Iterable[DiscussionCaseRecord | dict], trade
         "substantive_gap_case_ids": substantive_gap_case_ids,
         "controversy_summary_lines": [_controversy_line(item) for item in disputed_cases[:5]],
         "round_2_guidance": [_round_2_gap_line(item) for item in items if item.case_id in set(substantive_gap_case_ids)][:5],
+        "all_inquiry_targets": all_inquiry_targets,
         "candidate_pool_lines": [_summary_line(item) for item in candidate_pool],
         "selected_lines": [_summary_line(item) for item in status_groups["selected"]],
         "watchlist_lines": [_summary_line(item) for item in status_groups["watchlist"]],
@@ -227,19 +255,23 @@ def round_2_has_substantive_response(case: DiscussionCaseRecord | dict) -> bool:
 def derive_risk_gate(opinions: list[DiscussionOpinion]) -> RiskGate:
     if not opinions:
         return "pending"
-    latest = opinions[-1]
-    if latest.stance == "rejected":
+    # S1.2: 只有显式的 allow 且没有 reject 才放行
+    stances = {op.stance for op in opinions}
+    if "rejected" in stances:
         return "reject"
-    if latest.stance in {"limit", "hold", "question", "watch", "watchlist"}:
+    if any(s in {"limit", "hold", "question"} for s in stances):
         return "limit"
-    return "allow"
+    if "support" in stances or "selected" in stances:
+        return "allow"
+    return "pending"
 
 
 def derive_audit_gate(opinions: list[DiscussionOpinion]) -> AuditGate:
     if not opinions:
         return "pending"
-    latest = opinions[-1]
-    if latest.stance in {"rejected", "hold", "question"}:
+    # S1.2: 审计需要所有回合都没有 hold 或 question
+    stances = {op.stance for op in opinions}
+    if any(s in {"rejected", "hold", "question"} for s in stances):
         return "hold"
     return "clear"
 

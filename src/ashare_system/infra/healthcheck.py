@@ -26,10 +26,13 @@ class EnvironmentHealthcheck:
 
     def run(self) -> HealthcheckResult:
         checks: list[dict[str, str]] = []
+        xtquant_paths_required = self._xtquant_paths_required()
+        expected_execution_mode = self._expected_execution_mode()
+        expected_market_mode = self._expected_market_mode()
         checks.append(self._path_check("workspace", self.settings.workspace))
         checks.append(self._path_check("storage_root", self.settings.storage_root))
-        checks.append(self._path_check("xtquant_root", self.settings.xtquant.root))
-        checks.append(self._path_check("xtquantservice_root", self.settings.xtquant.service_root))
+        checks.append(self._path_check("xtquant_root", self.settings.xtquant.root, required=xtquant_paths_required))
+        checks.append(self._path_check("xtquantservice_root", self.settings.xtquant.service_root, required=xtquant_paths_required))
 
         if self.settings.run_mode == "live":
             checks.append(
@@ -39,18 +42,37 @@ class EnvironmentHealthcheck:
                     str(self.settings.live_trade_enabled).lower(),
                 )
             )
-            checks.append(self._value_check("execution_mode", self.settings.execution_mode == "xtquant", self.settings.execution_mode))
-            checks.append(self._value_check("market_mode", self.settings.market_mode == "xtquant", self.settings.market_mode))
-            checks.append(self._adapter_mode_check("execution_adapter_mode", build_execution_adapter, expected="xtquant"))
-            checks.append(self._adapter_mode_check("market_adapter_mode", build_market_adapter, expected="xtquant"))
+            checks.append(self._value_check("execution_mode", self.settings.execution_mode == expected_execution_mode, self.settings.execution_mode))
+            checks.append(self._value_check("market_mode", self.settings.market_mode == expected_market_mode, self.settings.market_mode))
+            checks.append(self._adapter_mode_check("execution_adapter_mode", build_execution_adapter, expected=expected_execution_mode))
+            checks.append(self._adapter_mode_check("market_adapter_mode", build_market_adapter, expected=expected_market_mode))
 
-        ok = all(item["status"] == "ok" for item in checks)
+        ok = not any(item["status"] in {"missing", "invalid", "blocked"} for item in checks)
         return HealthcheckResult(ok=ok, checks=checks)
 
-    def _path_check(self, name: str, path: Path) -> dict[str, str]:
+    def _xtquant_paths_required(self) -> bool:
+        return (
+            self._expected_execution_mode() == "xtquant"
+            or self._expected_market_mode() == "xtquant"
+        )
+
+    def _expected_execution_mode(self) -> str:
+        return "go_platform" if self.settings.go_platform.enabled else "xtquant"
+
+    def _expected_market_mode(self) -> str:
+        return "go_platform" if self.settings.go_platform.enabled else "xtquant"
+
+    def _path_check(self, name: str, path: Path, required: bool = True) -> dict[str, str]:
+        exists = path.exists()
+        if not required:
+            return {
+                "name": name,
+                "status": "ok",
+                "detail": str(path) if exists else f"{path} (当前执行平面未使用，已跳过)",
+            }
         return {
             "name": name,
-            "status": "ok" if path.exists() else "missing",
+            "status": "ok" if exists else "missing",
             "detail": str(path),
         }
 

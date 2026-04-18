@@ -7,6 +7,7 @@ import threading
 
 import uvicorn
 
+from .feishu_longconn import run_feishu_long_connection
 from .container import (
     get_candidate_case_service,
     get_market_adapter,
@@ -46,7 +47,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ashare-system-v2 启动器")
     parser.add_argument(
         "command",
-        choices=["serve", "healthcheck", "scheduler", "refresh-profiles"],
+        choices=["serve", "healthcheck", "scheduler", "refresh-profiles", "feishu-longconn"],
         default="serve",
         nargs="?",
     )
@@ -106,6 +107,10 @@ def main() -> None:
                 result.get("reason"),
                 result.get("trade_date"),
             )
+        return
+
+    if args.command == "feishu-longconn":
+        run_feishu_long_connection(settings)
         return
 
     # serve 模式: 先启动 QMT，再启动 FastAPI

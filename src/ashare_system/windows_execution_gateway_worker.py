@@ -71,7 +71,7 @@ class ExecutionGatewayWorker:
         self.submitter = submitter or self._default_submitter
         self.now_factory = now_factory or datetime.now
         self._owns_client = client is None
-        self.client = client or httpx.Client(timeout=config.timeout_sec)
+        self.client = client or httpx.Client(timeout=config.timeout_sec, trust_env=False)
 
     def close(self) -> None:
         if self._owns_client:

@@ -1,0 +1,21 @@
+[Unit]
+Description=ashare-system-v2 Feishu long connection worker
+After=network-online.target ashare-system-v2.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yxz
+Group=yxz
+WorkingDirectory=/srv/projects/ashare-system-v2
+EnvironmentFile=/srv/projects/ashare-system-v2/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/srv/projects/ashare-system-v2/src
+ExecStart=/srv/projects/ashare-system-v2/scripts/ashare_feishu_longconn_service.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

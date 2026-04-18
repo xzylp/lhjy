@@ -1,6 +1,7 @@
 """FastAPI 应用工厂"""
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
@@ -10,6 +11,7 @@ from .container import (
     get_candidate_case_service,
     get_discussion_cycle_service,
     get_execution_adapter,
+    get_feishu_longconn_state_store,
     get_message_dispatcher,
     get_market_adapter,
     get_meeting_state_store,
@@ -24,6 +26,7 @@ from .container import (
 from .monitor.stock_pool import StockPoolManager
 from .monitor.alert_engine import AlertEngine
 from .precompute import DossierPrecomputeService
+from .account_state import AccountStateService
 from .strategy.screener import StockScreener
 from .startup_recovery import StartupRecoveryService
 
@@ -42,13 +45,50 @@ def create_app() -> FastAPI:
     discussion_cycle_service = get_discussion_cycle_service()
     agent_score_service = get_agent_score_service()
     monitor_state_service = get_monitor_state_service()
+    feishu_longconn_state_store = get_feishu_longconn_state_store()
     message_dispatcher = get_message_dispatcher()
     startup_recovery_service = StartupRecoveryService(execution_adapter, meeting_state_store)
+    account_state_service = AccountStateService(
+        settings,
+        execution_adapter,
+        meeting_state_store,
+        config_mgr=get_runtime_config_manager(),
+        parameter_service=parameter_service,
+    )
 
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI):
+    async def _run_startup_housekeeping() -> None:
         try:
-            startup_payload = startup_recovery_service.recover(settings.xtquant.account_id, persist=True)
+            account_state_payload = await asyncio.to_thread(
+                account_state_service.snapshot,
+                settings.xtquant.account_id,
+                True,
+                include_trades=False,
+            )
+            if audit_store:
+                audit_store.append(
+                    category="execution",
+                    message="服务启动完成账户状态刷新",
+                    payload={
+                        "account_id": settings.xtquant.account_id,
+                        "status": account_state_payload.get("status"),
+                        "verified": account_state_payload.get("verified"),
+                        "config_match": account_state_payload.get("config_match"),
+                    },
+                )
+        except Exception as exc:
+            if audit_store:
+                audit_store.append(
+                    category="execution",
+                    message="服务启动账户状态刷新失败",
+                    payload={"error": str(exc)},
+                )
+
+        try:
+            startup_payload = await asyncio.to_thread(
+                startup_recovery_service.recover,
+                settings.xtquant.account_id,
+                True,
+            )
             if audit_store:
                 audit_store.append(
                     category="execution",
@@ -68,7 +108,22 @@ def create_app() -> FastAPI:
                     message="服务启动恢复扫描失败",
                     payload={"error": str(exc)},
                 )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        startup_task = asyncio.create_task(_run_startup_housekeeping(), name="startup-housekeeping")
+        _app.state.startup_housekeeping_task = startup_task
+        if audit_store:
+            audit_store.append(
+                category="execution",
+                message="服务启动后台恢复任务已提交",
+                payload={"account_id": settings.xtquant.account_id},
+            )
         yield
+        if not startup_task.done():
+            startup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await startup_task
 
     # 运行时动态配置
     config_mgr = get_runtime_config_manager()
@@ -103,6 +158,7 @@ def create_app() -> FastAPI:
             discussion_cycle_service=discussion_cycle_service,
             agent_score_service=agent_score_service,
             monitor_state_service=monitor_state_service,
+            feishu_longconn_state_store=feishu_longconn_state_store,
             message_dispatcher=message_dispatcher,
             market_adapter=market_adapter,
             execution_adapter=execution_adapter,
@@ -138,7 +194,15 @@ def create_app() -> FastAPI:
     from .apps.monitor_api import build_router as build_monitor_router
     pool_mgr = StockPoolManager()
     alert_engine = AlertEngine()
-    app.include_router(build_monitor_router(pool_mgr, alert_engine, monitor_state_service, settings=settings))
+    app.include_router(
+        build_monitor_router(
+            pool_mgr,
+            alert_engine,
+            monitor_state_service,
+            discussion_cycle_service=discussion_cycle_service,
+            settings=settings,
+        )
+    )
 
     # 策略路由
     from .apps.strategy_api import build_router as build_strategy_router
@@ -158,6 +222,7 @@ def create_app() -> FastAPI:
             pool_mgr=pool_mgr,
             audit_store=audit_store,
             runtime_state_store=runtime_state_store,
+            meeting_state_store=meeting_state_store,
             config_mgr=config_mgr,
             parameter_service=parameter_service,
             candidate_case_service=candidate_case_service,
@@ -176,6 +241,29 @@ def create_app() -> FastAPI:
             research_state_store=research_state_store,
         )
     )
+
+    # 仪表盘路由 (SPA)
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse
+    import os
+
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    if not os.path.exists(static_dir):
+        os.makedirs(static_dir)
+
+    @app.get("/dashboard/{full_path:path}")
+    async def dashboard_spa(full_path: str):
+        # 1. 尝试直接查找静态文件 (assets, favicon 等)
+        file_path = os.path.join(static_dir, full_path)
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+        
+        # 2. 如果文件不存在，且不带后缀，则可能是 SPA 路由，返回 index.html
+        index_file = os.path.join(static_dir, "index.html")
+        if os.path.exists(index_file):
+            return FileResponse(index_file)
+        
+        return {"detail": "Dashboard frontend not built. Please run 'npm run build' in web directory."}
 
     @app.get("/health")
     async def health():

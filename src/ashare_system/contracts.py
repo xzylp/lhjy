@@ -247,6 +247,143 @@ class PositionPlan(BaseModel):
     final_ratio: float = 0.0
 
 
+class PlaybookMatchScore(BaseModel):
+    """战法匹配分契约，供 runtime / buy_decision / discussion 统一消费。"""
+
+    playbook: PlaybookName
+    symbol: str
+    qualified: bool = False
+    score: float = 0.0
+    reason: str = ""
+    bull_evidence: list[str] = Field(default_factory=list)
+    bear_evidence: list[str] = Field(default_factory=list)
+
+
+class BullCase(BaseModel):
+    """多头证据最小契约。"""
+
+    thesis: str = ""
+    key_facts: list[str] = Field(default_factory=list)
+    data_gaps: list[str] = Field(default_factory=list)
+
+
+class BearCase(BaseModel):
+    """空头证据最小契约。"""
+
+    thesis: str = ""
+    key_risks: list[str] = Field(default_factory=list)
+    data_gaps: list[str] = Field(default_factory=list)
+
+
+class UncertaintyProfile(BaseModel):
+    """不确定性画像最小契约。"""
+
+    thesis: str = ""
+    key_unknowns: list[str] = Field(default_factory=list)
+    data_gaps: list[str] = Field(default_factory=list)
+
+
+class CaseEvidence(BaseModel):
+    """discussion 可直接消费的最小证据包。"""
+
+    symbol: str
+    playbook: str = ""
+    reason: str = ""
+    bull_case: BullCase = Field(default_factory=BullCase)
+    bear_case: BearCase = Field(default_factory=BearCase)
+    uncertainty: UncertaintyProfile = Field(default_factory=UncertaintyProfile)
+
+
+class Contradiction(BaseModel):
+    """单个 case 内的最小矛盾对象。"""
+
+    case_id: str
+    between: list[str] = Field(default_factory=list)
+    type: str = ""
+    question: str = ""
+    must_resolve_before_round_2: bool = True
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class CaseContradictionSummary(BaseModel):
+    """单个 case 的矛盾汇总，供 discussion 主链直接挂载。"""
+
+    case_id: str
+    contradictions: list[Contradiction] = Field(default_factory=list)
+    summary_lines: list[str] = Field(default_factory=list)
+    must_answer_questions: list[str] = Field(default_factory=list)
+
+
+class RankAction(BaseModel):
+    """盘中候选重排动作。"""
+
+    symbol: str
+    action: Literal["UPGRADE", "DOWNGRADE", "FREEZE", "FREEZE_ALL"]
+    reason: str = ""
+    trigger: str = ""
+    priority_delta: int = 0
+    generated_at: str = ""
+
+
+class IntradayRankResult(BaseModel):
+    """盘中重排结果汇总。"""
+
+    generated_at: str = ""
+    actions: list[RankAction] = Field(default_factory=list)
+    freeze_all_active: bool = False
+    summary_lines: list[str] = Field(default_factory=list)
+
+
+class PlaybookOverride(BaseModel):
+    """学习治理生成的战法 override。"""
+
+    playbook: str
+    status: Literal["suspend", "boost"]
+    reason: str = ""
+    source: str = ""
+    trade_date: str = ""
+    expires_on: str = ""
+    streak: int = 0
+
+
+class PlaybookOverrideSnapshot(BaseModel):
+    """战法 override 快照，供次日 route 读取。"""
+
+    trade_date: str = ""
+    generated_at: str = ""
+    source: str = "auto_governance"
+    overrides: list[PlaybookOverride] = Field(default_factory=list)
+    streaks: dict[str, int] = Field(default_factory=dict)
+    summary_lines: list[str] = Field(default_factory=list)
+
+
+class StructuredEvent(BaseModel):
+    """结构化事件最小契约。"""
+
+    symbol: str
+    event_type: str
+    impact: Literal["positive", "neutral", "negative", "block"] = "neutral"
+    severity: str = "info"
+    title: str
+    published_at: str
+    source: str
+    tags: list[str] = Field(default_factory=list)
+    category: Literal["news", "announcements", "policy"] = "announcements"
+    impact_scope: Literal["market", "sector", "symbol", "macro", "unknown"] = "symbol"
+    summary: str = ""
+    name: str = ""
+    evidence_url: str = ""
+
+
+class EventFetchResult(BaseModel):
+    """盘前结构化事件抓取结果。"""
+
+    trade_date: str = ""
+    generated_at: str = ""
+    events: list[StructuredEvent] = Field(default_factory=list)
+    summary_lines: list[str] = Field(default_factory=list)
+
+
 class PlaybookContext(BaseModel):
     """战法路由输出，供买入决策和讨论系统消费"""
 
@@ -259,6 +396,7 @@ class PlaybookContext(BaseModel):
     leader_score: float = 0.0
     style_tag: str = ""
     exit_params: dict = Field(default_factory=dict)
+    playbook_match_score: PlaybookMatchScore | None = None
 
 
 class ExitContext(BaseModel):
@@ -311,6 +449,9 @@ class LeaderRankResult(BaseModel):
     sector: str = ""
     leader_score: float = 0.0
     zt_order_rank: int = 99
+    seal_ratio: float = 0.0
+    first_limit_time: str = ""
+    open_times: int = 0
     is_core_leader: bool = False
 
 
@@ -324,6 +465,128 @@ class ExitSignal(BaseModel):
     current_price: float = 0.0
     reference_price: float = 0.0
     notes: list[str] = Field(default_factory=list)
+
+
+# ── 集合竞价 ──────────────────────────────────────────────
+
+AuctionAction = Literal["PROMOTE", "HOLD", "DEMOTE", "KILL"]
+
+
+class AuctionSnapshot(BaseModel):
+    """集合竞价快照，09:15 / 09:20 / 09:24 三个时间点各抓一次。"""
+
+    symbol: str
+    name: str = ""
+    price: float                    # 竞价价格
+    volume: int                     # 竞价成交量（手）
+    prev_close: float               # 昨日收盘价
+    prev_volume_5d_avg: int = 0     # 近 5 日平均成交量（手）
+    timestamp: str = ""             # 快照时间，如 "09:24:00"
+    open_change_pct: float = 0.0    # 竞价涨幅 = (price - prev_close) / prev_close
+
+
+class AuctionSignal(BaseModel):
+    """竞价研判信号。"""
+
+    symbol: str
+    action: AuctionAction = "HOLD"
+    reason: str = ""
+    auction_volume_ratio: float = 0.0   # 竞价量 / 5日均量
+    open_change_pct: float = 0.0        # 竞价涨幅
+    playbook: str = ""
+    confidence: float = 0.0
+
+
+# ── 微观节奏 ──────────────────────────────────────────────
+
+MicroSignalType = Literal["PEAK_FADE", "VALLEY_HOLD", "RHYTHM_BREAK"]
+
+
+class MicroBarSnapshot(BaseModel):
+    """1 分钟 K 线微观快照。"""
+
+    symbol: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    timestamp: str = ""
+
+
+class MicroSignal(BaseModel):
+    """微观节奏信号。"""
+
+    symbol: str
+    signal_type: MicroSignalType
+    strength: float = 0.0           # 0~1，信号强度
+    timestamp: str = ""
+    bar_count: int = 1              # 触发该信号所用的 bar 数量
+    notes: list[str] = Field(default_factory=list)
+
+
+# ── 事件总线 ──────────────────────────────────────────────
+
+EventType = Literal[
+    "NEGATIVE_NEWS",
+    "PRICE_ALERT",
+    "AUCTION_SIGNAL",
+    "DISCUSSION_TIMEOUT",
+    "SETTLEMENT_COMPLETE",
+    "MODEL_UPDATED",
+]
+
+
+class MarketEvent(BaseModel):
+    """事件总线中的最小事件单元。"""
+
+    event_type: EventType
+    symbol: str | None = None
+    payload: dict = Field(default_factory=dict)
+    timestamp: str = ""
+    priority: int = 0               # 0=普通 1=高 2=紧急
+    source: str = ""
+
+
+# ── 夜间沙盘 ──────────────────────────────────────────────
+
+class SandboxResult(BaseModel):
+    """夜间沙盘推演结果。"""
+
+    trade_date: str = ""
+    generated_at: str = ""
+    tomorrow_priorities: list[str] = Field(default_factory=list)
+    missed_opportunities: list[dict] = Field(default_factory=list)
+    simulation_log: list[str] = Field(default_factory=list)
+    summary_lines: list[str] = Field(default_factory=list)
+
+
+# ── 数据时效 ──────────────────────────────────────────────
+
+DataFreshnessLevel = Literal["REALTIME", "NEAR_REALTIME", "DELAYED", "STALE"]
+
+
+# ── Prompt 自进化 ─────────────────────────────────────────
+
+class Lesson(BaseModel):
+    """单条 Agent 教训记录。"""
+
+    text: str
+    source: str = ""                # 触发来源，如 "attribution.by_playbook"
+    agent_id: str = ""
+    created_at: str = ""
+    expires_at: str = ""            # 30 天后自动淘汰
+
+
+class PatchResult(BaseModel):
+    """Prompt patch 操作结果。"""
+
+    agent_id: str
+    lessons_before: int = 0
+    lessons_after: int = 0
+    added: list[str] = Field(default_factory=list)
+    removed: list[str] = Field(default_factory=list)
+    error: str | None = None
 
 
 # ── 审计 ──────────────────────────────────────────────────

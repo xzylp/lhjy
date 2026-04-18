@@ -13,12 +13,29 @@ logger = get_logger("factors.pipeline")
 class FactorPipeline:
     """三步标准化 pipeline"""
 
-    def run(self, series: pd.Series, industry: pd.Series | None = None) -> pd.Series:
-        """完整 pipeline: 去极值 → 标准化 → 中性化"""
-        s = self.winsorize(series)
+    @staticmethod
+    def mad(series: pd.Series, n: float = 3.0) -> pd.Series:
+        """中位数绝对偏差去极值 (Median Absolute Deviation)
+        比 Winsorize 更稳健，是 A 股量化常用的去极值方法。
+        """
+        median = series.median()
+        ad = (series - median).abs()
+        mad = ad.median()
+        threshold = n * 1.4826 * mad # 1.4826 是为了与正态分布标准差对齐的常数
+        return series.clip(median - threshold, median + threshold)
+
+    def run(self, series: pd.Series, industry: pd.Series | None = None, method: str = "mad", use_rank: bool = False) -> pd.Series:
+        """完整 pipeline: 去极值 → 标准化 → 中性化 → [排名标准化]"""
+        if method == "mad":
+            s = self.mad(series)
+        else:
+            s = self.winsorize(series)
         s = self.zscore(s)
         if industry is not None:
             s = self.neutralize(s, industry)
+        
+        if use_rank:
+            s = self.rank_normalize(s)
         return s
 
     @staticmethod

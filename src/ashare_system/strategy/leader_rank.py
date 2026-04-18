@@ -27,6 +27,9 @@ class LeaderRanker:
                     sector=str(sector_meta.get("sector", "")),
                     leader_score=score,
                     zt_order_rank=zt_order_rank,
+                    seal_ratio=round(float(sector_meta.get("seal_ratio", 0.0) or 0.0), 4),
+                    first_limit_time=str(sector_meta.get("first_limit_time", "") or ""),
+                    open_times=int(sector_meta.get("open_times", 0) or 0),
                     is_core_leader=score >= 0.7,
                 )
             )

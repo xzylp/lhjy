@@ -70,3 +70,31 @@ def build_freshness_meta(
         expires_at=expires_at,
         staleness_level=staleness,
     )
+
+
+# ── 数据时效性分级（v1.0 新增） ────────────────────────────
+# 与 contracts.DataFreshnessLevel 对应
+
+def tag_freshness(fetched_at: str | None, now: datetime | None = None) -> str:
+    """为数据打上时效性标签。
+
+    Returns:
+        "REALTIME" (<30s), "NEAR_REALTIME" (<5min),
+        "DELAYED" (<15min), "STALE" (>15min)
+
+    用途：Agent 在讨论中可以看到数据时效性，
+    避免用 STALE 数据做出高置信度判断。
+    """
+    parsed = parse_dt(fetched_at)
+    if parsed is None:
+        return "STALE"
+    current = now or datetime.now(parsed.tzinfo)
+    age_seconds = max((current - parsed).total_seconds(), 0.0)
+    if age_seconds <= 30:
+        return "REALTIME"
+    if age_seconds <= 300:
+        return "NEAR_REALTIME"
+    if age_seconds <= 900:
+        return "DELAYED"
+    return "STALE"
+

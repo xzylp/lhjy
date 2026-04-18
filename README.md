@@ -61,10 +61,20 @@ ashare-system-v2/
 │   ├── strategy/           # 交易策略
 │   └── scheduler.py          # 任务调度
 ├── scripts/                  # 运维脚本
+│   ├── ashare_service.sh     # Linux systemd 服务启停
+│   ├── ashare_scheduler_service.sh # Linux scheduler 服务启停
+│   ├── ashare_feishu_longconn_service.sh # 飞书长连接 worker 启动包装
+│   ├── ashare_feishu_longconn_ctl.sh # 飞书长连接 systemd 服务启停
+│   ├── install_linux_systemd_service.sh # 安装 Linux systemd 服务
+│   ├── install_linux_scheduler_service.sh # 安装 Linux scheduler 服务
+│   ├── install_feishu_longconn_service.sh # 安装飞书长连接 systemd 服务
+│   ├── install_openclaw_gateway_service.sh # 安装 OpenClaw systemd 服务
 │   ├── start.sh             # Linux 启动
 │   ├── start_openclaw_gateway.sh # Linux 侧 OpenClaw Gateway 启动
+│   ├── print_windows_gateway_handoff.sh # 输出 Windows 接线摘要
 │   ├── start_unattended.ps1  # Windows 无人值守启动
 │   ├── setup_autostart.ps1  # 配置开机自启
+│   ├── openclaw_gateway_service.sh # OpenClaw systemd 服务启停
 │   └── health_check.sh      # Linux control plane 健康检查
 ├── openclaw/               # OpenClaw 配置
 │   ├── prompts/ashare.txt  # Agent Prompt
@@ -82,8 +92,9 @@ ashare-system-v2/
 cd /mnt/d/Coding/lhjy/ashare-system-v2
 
 # 创建虚拟环境
-python -m venv .venv
-./.venv/Scripts/pip.exe install -e .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 ```
 
 ### 2. 配置 .env
@@ -97,6 +108,9 @@ ASHARE_RUN_MODE=dry-run           # dry-run | paper | real
 ASHARE_EXECUTION_MODE=mock        # mock | xtquant
 ASHARE_EXECUTION_PLANE=windows_gateway
 ASHARE_XTQUANT_ROOT=../XtQuant
+ASHARE_PYTHON_BIN=/srv/projects/ashare-system-v2/.venv/bin/python   # Ubuntu Server 可选
+OPENCLAW_BIN=/usr/local/bin/openclaw                                # Ubuntu Server 可选
+ASHARE_PUBLIC_BASE_URL=http://192.168.99.16:8100                    # Windows Gateway 接线推荐
 ```
 
 说明：
@@ -118,7 +132,24 @@ ASHARE_XTQUANT_ROOT=../XtQuant
 powershell.exe -ExecutionPolicy Bypass -File scripts\start_unattended.ps1
 
 # 方式四: 手动启动 API
-./.venv/Scripts/python.exe -m ashare_system.run serve
+./.venv/bin/python -m ashare_system.run serve
+```
+
+Ubuntu Server 正式部署建议改用 `systemd` 常驻：
+
+```bash
+cd /srv/projects/ashare-system-v2
+./scripts/install_linux_systemd_service.sh
+./scripts/ashare_service.sh start
+./scripts/ashare_service.sh status
+./scripts/install_linux_scheduler_service.sh
+./scripts/ashare_scheduler_service.sh start
+./scripts/install_feishu_longconn_service.sh
+./scripts/ashare_feishu_longconn_ctl.sh start
+./scripts/ashare_feishu_longconn_ctl.sh status
+./scripts/install_openclaw_gateway_service.sh
+./scripts/openclaw_gateway_service.sh start
+./scripts/print_windows_gateway_handoff.sh
 ```
 
 ### 4. 健康检查
@@ -132,6 +163,8 @@ Linux control plane 启动后，还应额外查看：
 
 - `GET /system/deployment/linux-control-plane-startup-checklist`
 - `GET /system/deployment/windows-execution-gateway-onboarding-bundle`
+- `GET /system/operations/components`
+- `GET /system/feishu/longconn/status`
 
 ### 5. 访问 API
 

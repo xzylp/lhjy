@@ -82,6 +82,7 @@ class ServiceSettings(BaseModel):
     host: str = Field(default_factory=lambda: _env("ASHARE_SERVICE_HOST", "127.0.0.1"))
     port: int = Field(default_factory=lambda: _env_int("ASHARE_SERVICE_PORT", 8100))
     probe_timeout_sec: float = Field(default_factory=lambda: _env_float("ASHARE_SERVICE_PROBE_TIMEOUT_SEC", 3.0))
+    public_base_url: str = Field(default_factory=lambda: _env("ASHARE_PUBLIC_BASE_URL", ""))
 
 
 class NotifySettings(BaseModel):
@@ -89,7 +90,28 @@ class NotifySettings(BaseModel):
     feishu_app_id: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_APP_ID", ""))
     feishu_app_secret: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_APP_SECRET", ""))
     feishu_chat_id: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_CHAT_ID", ""))
+    feishu_important_chat_id: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_IMPORTANT_CHAT_ID", ""))
+    feishu_supervision_chat_id: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_SUPERVISION_CHAT_ID", ""))
+    feishu_verification_token: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_VERIFICATION_TOKEN", ""))
+    feishu_control_plane_base_url: str = Field(
+        default_factory=lambda: _env("ASHARE_FEISHU_CONTROL_PLANE_BASE_URL", "")
+    )
     alerts_enabled: bool = Field(default_factory=lambda: _env_bool("ASHARE_ALERTS_ENABLED"))
+
+
+class WindowsGatewaySettings(BaseModel):
+    """Windows HTTP 交易桥配置"""
+    base_url: str = Field(default_factory=lambda: _env("ASHARE_WINDOWS_GATEWAY_BASE_URL", ""))
+    token: str = Field(default_factory=lambda: _env("ASHARE_WINDOWS_GATEWAY_TOKEN", ""))
+    token_file: str = Field(default_factory=lambda: _env("ASHARE_WINDOWS_GATEWAY_TOKEN_FILE", ""))
+    timeout_sec: float = Field(default_factory=lambda: _env_float("ASHARE_WINDOWS_GATEWAY_TIMEOUT_SEC", 10.0))
+
+
+class GoPlatformSettings(BaseModel):
+    """Linux 本地 Go 并发数据平台配置"""
+    base_url: str = Field(default_factory=lambda: _env("ASHARE_GO_PLATFORM_BASE_URL", "http://127.0.0.1:18793"))
+    timeout_sec: float = Field(default_factory=lambda: _env_float("ASHARE_GO_PLATFORM_TIMEOUT_SEC", 15.0))
+    enabled: bool = Field(default_factory=lambda: _env_bool("ASHARE_GO_PLATFORM_ENABLED", False))
 
 
 class AppSettings(BaseModel):
@@ -114,6 +136,8 @@ class AppSettings(BaseModel):
     xtquant: XtQuantSettings = Field(default_factory=XtQuantSettings)
     service: ServiceSettings = Field(default_factory=ServiceSettings)
     notify: NotifySettings = Field(default_factory=NotifySettings)
+    windows_gateway: WindowsGatewaySettings = Field(default_factory=WindowsGatewaySettings)
+    go_platform: GoPlatformSettings = Field(default_factory=GoPlatformSettings)
 
     # 策略参数
     strategy_name: str = Field(default_factory=lambda: _env("ASHARE_STRATEGY_NAME", "ashare-system-v2"))

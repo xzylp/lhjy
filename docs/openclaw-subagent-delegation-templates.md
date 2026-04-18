@@ -188,6 +188,42 @@ Round 2 是争议讨论，不是重复表态。四个讨论子代理都必须满
 
 ## 5. `ashare` 推荐委派写法
 
+### 5.0 最小稳定参数原则
+
+对 `runtime:"subagent"` 的 `sessions_spawn`，默认只使用最小参数集：
+
+```text
+agentId
+label
+mode:"run"
+runtime:"subagent"
+task
+```
+
+只有明确需要固定模型时，才额外传 `model`。
+
+不要把 ACP 语义或空默认值混进普通子代理调用，尤其不要追加：
+
+- `streamTo`
+- `attachAs`
+- `attachments`
+- `cleanup`
+- `cwd`
+- `lightContext`
+- `resumeSessionId`
+- `runTimeoutSeconds`
+- `timeoutSeconds`
+- `thread`
+- `sandbox`
+
+原因：
+
+1. 官方文档明确 `streamTo` 只适用于 ACP，不适用于 `runtime:"subagent"`。
+2. 额外可选键越多，模型越容易生成“看起来完整、实际漂移”的工具调用。
+3. 盘中值班链路追求稳定收敛，优先保证子代理能稳定启动和返回结构化结果，而不是追求花哨的流式转发。
+4. 当前 OpenClaw `2026.4.10` 的 `sessions_spawn` schema 把 ACP 与 subagent 参数放在同一个工具定义里，执行时才对非法组合报错；因此不能因为工具面板里“看得到这些字段”就把它们填进去。
+5. 如果一次调用已经报 `streamTo is only supported for runtime=acp; got runtime=subagent`，不要再用空字符串、`0`、空对象去做“去参数重试”；这类重试仍可能被同一工具层继续补回坏参数。
+
 ## 5.1 Round 1
 
 ```text
@@ -221,3 +257,5 @@ sessions_spawn({
 3. 返回的每条 Round 2 opinion 是否包含至少一个“实质回应字段”。
 4. 是否仍有纯口号式内容，例如“继续支持”“审计通过”“风险已澄清”但没有回应对象和回应内容。
 5. 若 `finalize` 返回 `discussion_not_ready`，是否先补齐二轮结构化回应，而不是误判为程序故障。
+6. `runtime:"subagent"` 的 `sessions_spawn` 是否严格保持最小参数集，没有混入 `streamTo` 或其他 ACP / 空默认值参数。
+7. 若第一次已收到 `streamTo ... runtime=subagent` 报错，是否立即把它升级为工具层阻断，而不是继续对子角色做空值重试。

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 from typing import Callable
 
@@ -32,13 +33,54 @@ class AccountStateService:
         self._parameter_service = parameter_service
         self._now_factory = now_factory or datetime.now
 
-    def snapshot(self, account_id: str, persist: bool = True) -> dict:
+    def latest(self) -> dict:
+        payload = self._state_store.get("latest_account_state", {})
+        return payload if isinstance(payload, dict) else {}
+
+    def latest_for(self, account_id: str) -> dict:
+        payload = self.latest()
+        if not payload:
+            return {}
+        if str(payload.get("account_id") or "") != str(account_id):
+            return {}
+        return payload
+
+    def snapshot(
+        self,
+        account_id: str,
+        persist: bool = True,
+        *,
+        include_trades: bool = True,
+        timeout_sec: float | None = None,
+    ) -> dict:
         now = self._now_factory()
         trade_date = now.date().isoformat()
+        resolved_timeout = float(timeout_sec or getattr(self._settings.windows_gateway, "timeout_sec", 10.0) or 10.0)
+        resolved_timeout = min(resolved_timeout, 8.5)
         try:
-            balance = self._execution_adapter.get_balance(account_id)
-            positions = self._execution_adapter.get_positions(account_id)
-            trades = self._execution_adapter.get_trades(account_id)
+            with ThreadPoolExecutor(max_workers=(3 if include_trades else 2), thread_name_prefix="account-state") as executor:
+                future_map = {
+                    "balance": executor.submit(self._execution_adapter.get_balance, account_id),
+                    "positions": executor.submit(self._execution_adapter.get_positions, account_id),
+                }
+                if include_trades:
+                    future_map["trades"] = executor.submit(self._execution_adapter.get_trades, account_id)
+
+                done, not_done = wait(future_map.values(), timeout=resolved_timeout)
+                if not_done:
+                    timed_out_items = [
+                        name for name, future in future_map.items() if future in not_done
+                    ]
+                    raise RuntimeError(
+                        "account_state_timeout: " + ",".join(sorted(timed_out_items))
+                    )
+
+                result_map: dict[str, object] = {}
+                for name, future in future_map.items():
+                    result_map[name] = future.result()
+                balance = result_map["balance"]
+                positions = result_map["positions"]
+                trades = result_map.get("trades", [])
         except Exception as exc:
             payload = {
                 "account_id": account_id,
@@ -95,10 +137,12 @@ class AccountStateService:
         reverse_repo_value = buckets.reverse_repo_value
         gross_invested_value = buckets.total_value
         trading_budget = build_test_trading_budget(
+            total_asset,
             invested_value,
             reverse_repo_value,
             minimum_total_invested_amount=minimum_total_invested_amount,
             reverse_repo_reserved_amount=reverse_repo_reserved_amount,
+            stock_position_limit_ratio=equity_position_limit,
         )
         unrealized_pnl = sum((float(item.last_price) - float(item.cost_price)) * float(item.quantity) for item in positions)
         daily_pnl = round(total_asset - float(baseline["baseline_total_asset"]), 4)
@@ -127,6 +171,7 @@ class AccountStateService:
             "balance": balance.model_dump(),
             "position_count": len(positions),
             "trade_count": len(trades),
+            "trade_count_included": include_trades,
             "positions": [item.model_dump() for item in positions],
             "equity_positions": [item.model_dump() for item in buckets.equity_positions],
             "reverse_repo_positions": [item.model_dump() for item in buckets.reverse_repo_positions],

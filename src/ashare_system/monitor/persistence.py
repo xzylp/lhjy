@@ -163,6 +163,10 @@ def build_execution_bridge_health_ingress_payload(
         **dict(payload["qmt_vm"]),
         **qmt_vm,
     }
+    if "reachable" not in windows_execution_gateway:
+        payload["windows_execution_gateway"]["reachable"] = bool(payload["gateway_online"])
+    if "reachable" not in qmt_vm:
+        payload["qmt_vm"]["reachable"] = bool(payload["qmt_connected"])
     payload["component_health"] = [
         {
             "key": str(payload["windows_execution_gateway"].get("key") or "windows_execution_gateway"),
@@ -319,7 +323,7 @@ def get_execution_bridge_health_latest_descriptor() -> dict:
 
 def build_execution_bridge_health_deployment_contract_sample(
     *,
-    api_base_url: str = "http://127.0.0.1:8100",
+    api_base_url: str = "http://127.0.0.1:18793",
     trigger: str = "windows_gateway",
 ) -> dict:
     """返回 execution bridge 统一部署契约样本（Windows 上报 + Linux 读取）。"""

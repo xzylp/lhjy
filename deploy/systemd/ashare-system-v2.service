@@ -1,0 +1,21 @@
+[Unit]
+Description=ashare-system-v2 Linux control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yxz
+Group=yxz
+WorkingDirectory=/srv/projects/ashare-system-v2
+EnvironmentFile=/srv/projects/ashare-system-v2/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/srv/projects/ashare-system-v2/src
+ExecStart=/srv/projects/ashare-system-v2/.venv/bin/python -m ashare_system.run serve
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

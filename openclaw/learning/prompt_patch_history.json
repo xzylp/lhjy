@@ -1,0 +1,146 @@
+[
+  {
+    "timestamp": "2026-04-13T16:45:00.002880",
+    "agent_id": "ashare-research",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-13T16:45:00.003431",
+    "agent_id": "ashare-strategy",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-13T16:45:00.003928",
+    "agent_id": "ashare-risk",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-13T16:45:00.006748",
+    "agent_id": "ashare-audit",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-14T16:45:00.002791",
+    "agent_id": "ashare-research",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-14T16:45:00.003202",
+    "agent_id": "ashare-strategy",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-14T16:45:00.006263",
+    "agent_id": "ashare-risk",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-14T16:45:00.006658",
+    "agent_id": "ashare-audit",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-15T16:45:00.004578",
+    "agent_id": "ashare-research",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-15T16:45:00.006163",
+    "agent_id": "ashare-strategy",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-15T16:45:00.007351",
+    "agent_id": "ashare-risk",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-15T16:45:00.008111",
+    "agent_id": "ashare-audit",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-17T16:45:00.001545",
+    "agent_id": "ashare-research",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-17T16:45:00.001803",
+    "agent_id": "ashare-strategy",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-17T16:45:00.004603",
+    "agent_id": "ashare-risk",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  },
+  {
+    "timestamp": "2026-04-17T16:45:00.004929",
+    "agent_id": "ashare-audit",
+    "lessons_before": 0,
+    "lessons_after": 0,
+    "added": [],
+    "removed": [],
+    "error": null
+  }
+]

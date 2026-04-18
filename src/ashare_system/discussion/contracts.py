@@ -135,6 +135,9 @@ class DiscussionRoundSummary(BaseModel):
     challenged_points: list[str] = Field(default_factory=list)
     revision_notes: list[str] = Field(default_factory=list)
     persuasion_summary: list[str] = Field(default_factory=list)
+    # S1.2: 新增结构化质询字段
+    counter_evidence: list[str] = Field(default_factory=list)
+    inquiry_targets: list[dict[str, str]] = Field(default_factory=list) # [{"agent_id": "...", "question": "..."}]
 
 
 class DiscussionCaseRecord(BaseModel):

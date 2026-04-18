@@ -19,8 +19,11 @@ DISCUSSION_ROUND_2_REQUIRED_FIELDS = [
 ]
 DISCUSSION_ROUND_2_REQUIRED_CONTEXT = [
     "controversy_summary_lines",
+    "contradiction_summary_lines",
     "round_2_guidance",
     "substantive_gap_case_ids",
+    "must_answer_questions",
+    "learned_asset_review_guidance",
 ]
 
 
@@ -43,7 +46,11 @@ class DiscussionAgentPacketsEnvelope(BaseModel):
     case_count: int = 0
     round_coverage: dict[str, Any] = Field(default_factory=dict)
     controversy_summary_lines: list[str] = Field(default_factory=list)
+    contradiction_summary_lines: list[str] = Field(default_factory=list)
+    case_contradictions: list[dict[str, Any]] = Field(default_factory=list)
     round_2_guidance: list[str] = Field(default_factory=list)
+    must_answer_questions: list[str] = Field(default_factory=list)
+    learned_asset_review_guidance: dict[str, Any] = Field(default_factory=dict)
     shared_context: dict[str, Any] = Field(default_factory=dict)
     shared_context_lines: list[str] = Field(default_factory=list)
     workspace_context: dict[str, Any] = Field(default_factory=dict)
@@ -69,7 +76,11 @@ class DiscussionMeetingContextEnvelope(BaseModel):
     disputed_case_ids: list[str] = Field(default_factory=list)
     substantive_gap_case_ids: list[str] = Field(default_factory=list)
     controversy_summary_lines: list[str] = Field(default_factory=list)
+    contradiction_summary_lines: list[str] = Field(default_factory=list)
+    case_contradictions: list[dict[str, Any]] = Field(default_factory=list)
     round_2_guidance: list[str] = Field(default_factory=list)
+    must_answer_questions: list[str] = Field(default_factory=list)
+    learned_asset_review_guidance: dict[str, Any] = Field(default_factory=dict)
     shared_context: dict[str, Any] = Field(default_factory=dict)
     shared_context_lines: list[str] = Field(default_factory=list)
     data_catalog_ref: dict[str, Any] = Field(default_factory=dict)
@@ -114,7 +125,11 @@ def build_agent_packets_envelope(payload: dict[str, Any], *, trade_date: str, re
         case_count=payload.get("case_count", 0),
         round_coverage=payload.get("round_coverage", {}),
         controversy_summary_lines=payload.get("controversy_summary_lines", []),
+        contradiction_summary_lines=payload.get("contradiction_summary_lines", []),
+        case_contradictions=payload.get("case_contradictions", []),
         round_2_guidance=payload.get("round_2_guidance", []),
+        must_answer_questions=payload.get("must_answer_questions", []),
+        learned_asset_review_guidance=payload.get("learned_asset_review_guidance", {}),
         shared_context=payload.get("shared_context", {}),
         shared_context_lines=payload.get("shared_context_lines", []),
         workspace_context=payload.get("workspace_context", {}),
@@ -152,7 +167,11 @@ def build_meeting_context_envelope(payload: dict[str, Any], *, trade_date: str) 
         disputed_case_ids=payload.get("disputed_case_ids", []),
         substantive_gap_case_ids=payload.get("substantive_gap_case_ids", []),
         controversy_summary_lines=payload.get("controversy_summary_lines", []),
+        contradiction_summary_lines=payload.get("contradiction_summary_lines", []),
+        case_contradictions=payload.get("case_contradictions", []),
         round_2_guidance=payload.get("round_2_guidance", []),
+        must_answer_questions=payload.get("must_answer_questions", []),
+        learned_asset_review_guidance=payload.get("learned_asset_review_guidance", {}),
         shared_context=payload.get("shared_context", {}),
         shared_context_lines=payload.get("shared_context_lines", []),
         data_catalog_ref=payload.get("data_catalog_ref", {}),

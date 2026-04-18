@@ -18,8 +18,9 @@ dependencies = [
   "scikit-learn>=1.8.0",
   "xgboost>=3.2.0",
   "apscheduler>=3.11.2",
-  "pywinauto>=0.6.9",
+  "pywinauto>=0.6.9; platform_system == 'Windows'",
   "python-dotenv>=1.2.2",
+  "lark-oapi>=1.4.12",
 ]
 
 [project.scripts]

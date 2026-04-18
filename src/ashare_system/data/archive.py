@@ -380,34 +380,48 @@ class DataArchiveStore:
         self._write_json(self.layout.serving_root / "latest_workspace_context.json", payload)
 
     def refresh_workspace_context(self) -> dict[str, Any] | None:
-        market_context = self._read_json(self.layout.serving_root / "latest_market_context.json")
-        event_context = self._read_json(self.layout.serving_root / "latest_event_context.json")
-        symbol_contexts = self._read_json(self.layout.serving_root / "latest_symbol_contexts.json")
-        dossier_pack = self._read_json(self.layout.serving_root / "latest_dossier_pack.json")
-        discussion_context = self._read_json(self.layout.serving_root / "latest_discussion_context.json")
-        monitor_context = self._read_json(self.layout.serving_root / "latest_monitor_context.json")
-        runtime_context = self._read_json(self.layout.serving_root / "latest_runtime_context.json")
+        market_context_raw = self._read_json(self.layout.serving_root / "latest_market_context.json")
+        event_context_raw = self._read_json(self.layout.serving_root / "latest_event_context.json")
+        symbol_contexts_raw = self._read_json(self.layout.serving_root / "latest_symbol_contexts.json")
+        dossier_pack_raw = self._read_json(self.layout.serving_root / "latest_dossier_pack.json")
+        discussion_context_raw = self._read_json(self.layout.serving_root / "latest_discussion_context.json")
+        monitor_context_raw = self._read_json(self.layout.serving_root / "latest_monitor_context.json")
+        runtime_context_raw = self._read_json(self.layout.serving_root / "latest_runtime_context.json")
         contexts = [
-            discussion_context,
-            runtime_context,
-            dossier_pack,
-            monitor_context,
-            market_context,
-            event_context,
-            symbol_contexts,
+            discussion_context_raw,
+            runtime_context_raw,
+            dossier_pack_raw,
+            monitor_context_raw,
+            market_context_raw,
+            event_context_raw,
+            symbol_contexts_raw,
         ]
         available_contexts = [item for item in contexts if item]
         if not available_contexts:
             return None
 
-        trade_date = next(
-            (
-                item.get("trade_date")
-                for item in available_contexts
-                if item.get("trade_date")
-            ),
-            self._trade_date_from_iso(datetime.now().isoformat()),
-        )
+        candidate_trade_dates = [
+            str(item.get("trade_date")).strip()
+            for item in available_contexts
+            if str(item.get("trade_date") or "").strip()
+        ]
+        trade_date = max(candidate_trade_dates) if candidate_trade_dates else self._trade_date_from_iso(datetime.now().isoformat())
+
+        def _pick_for_trade_date(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+            if not payload:
+                return None
+            payload_trade_date = str(payload.get("trade_date") or "").strip()
+            if payload_trade_date and payload_trade_date != trade_date:
+                return None
+            return payload
+
+        market_context = _pick_for_trade_date(market_context_raw)
+        event_context = _pick_for_trade_date(event_context_raw)
+        symbol_contexts = _pick_for_trade_date(symbol_contexts_raw)
+        dossier_pack = _pick_for_trade_date(dossier_pack_raw)
+        discussion_context = _pick_for_trade_date(discussion_context_raw)
+        monitor_context = _pick_for_trade_date(monitor_context_raw)
+        runtime_context = _pick_for_trade_date(runtime_context_raw)
         generated_at = datetime.now().isoformat()
         summary_lines = [
             f"workspace trade_date={trade_date} runtime={'yes' if runtime_context else 'no'} discussion={'yes' if discussion_context else 'no'} monitor={'yes' if monitor_context else 'no'} dossier={'yes' if dossier_pack else 'no'}"

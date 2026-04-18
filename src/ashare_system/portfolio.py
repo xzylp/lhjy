@@ -73,6 +73,7 @@ class PositionBucketSummary:
 class TestTradingBudget:
     minimum_total_invested_amount: float
     reverse_repo_reserved_amount: float
+    stock_position_limit_ratio: float
     stock_test_budget_amount: float
     stock_test_budget_remaining: float
     reverse_repo_gap_value: float
@@ -96,17 +97,22 @@ def summarize_position_buckets(positions: list[PositionSnapshot]) -> PositionBuc
 
 
 def build_test_trading_budget(
+    total_asset: float,
     equity_value: float,
     reverse_repo_value: float,
     minimum_total_invested_amount: float,
     reverse_repo_reserved_amount: float,
+    stock_position_limit_ratio: float,
 ) -> TestTradingBudget:
-    stock_test_budget_amount = max(float(minimum_total_invested_amount) - float(reverse_repo_reserved_amount), 0.0)
+    baseline_budget_amount = max(float(minimum_total_invested_amount) - float(reverse_repo_reserved_amount), 0.0)
+    position_limit_budget_amount = max(float(total_asset) * float(stock_position_limit_ratio), 0.0)
+    stock_test_budget_amount = min(position_limit_budget_amount, baseline_budget_amount)
     stock_test_budget_remaining = max(stock_test_budget_amount - float(equity_value), 0.0)
     reverse_repo_gap_value = max(float(reverse_repo_reserved_amount) - float(reverse_repo_value), 0.0)
     return TestTradingBudget(
         minimum_total_invested_amount=float(minimum_total_invested_amount),
         reverse_repo_reserved_amount=float(reverse_repo_reserved_amount),
+        stock_position_limit_ratio=float(stock_position_limit_ratio),
         stock_test_budget_amount=round(stock_test_budget_amount, 4),
         stock_test_budget_remaining=round(stock_test_budget_remaining, 4),
         reverse_repo_gap_value=round(reverse_repo_gap_value, 4),

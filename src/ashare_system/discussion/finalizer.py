@@ -118,7 +118,20 @@ def build_finalize_bundle(
     watchlist_limit: int = 5,
     rejected_limit: int = 5,
     include_client_brief: bool = True,
+    agent_weights: dict[str, float] | None = None,
 ) -> DiscussionFinalizeBundle:
+    """构建最终决策包。
+
+    Args:
+        agent_weights: {agent_id: weight_value}，如 {"ashare-risk": 0.6, ...}
+            当提供时，各 Agent 的 opinion 置信度会乘以其 weight_value。
+            未提供时回退到等权（所有 Agent 权重 1.0）。
+
+    TODO:
+        当 agent_weights 提供时，在 build_reason_board 之前对 cases 中的
+        opinion confidence 进行加权调整：
+        effective_confidence = base_confidence * agent_weights.get(agent_id, 1.0)
+    """
     cycle_payload = cycle.model_dump() if isinstance(cycle, DiscussionCycleSnapshot) else dict(cycle or {})
     reason_board = build_reason_board(cases, trade_date)
     reply_pack = build_reply_pack(

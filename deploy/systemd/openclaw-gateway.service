@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenClaw gateway for ashare-system-v2
+After=network-online.target ashare-system-v2.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yxz
+Group=yxz
+WorkingDirectory=/srv/projects/ashare-system-v2
+EnvironmentFile=/srv/projects/ashare-system-v2/.env
+ExecStart=/srv/projects/ashare-system-v2/scripts/start_openclaw_gateway.sh /srv/projects/ashare-system-v2/logs/openclaw-gateway.log
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

@@ -6,6 +6,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 
+from ..contracts import MarketEvent
 from .alert_engine import AlertEngine, AlertEvent
 from .exit_monitor import ExitMonitor
 from .persistence import MonitorStateService
@@ -52,6 +53,7 @@ class MarketWatcher:
         exit_monitor: ExitMonitor | None = None,
         exit_context_provider=None,
         board_snapshot_provider=None,
+        event_bus=None,
     ) -> None:
         self.market = market_adapter
         self.alert_engine = AlertEngine()
@@ -62,6 +64,7 @@ class MarketWatcher:
         self.exit_monitor = exit_monitor
         self.exit_context_provider = exit_context_provider
         self.board_snapshot_provider = board_snapshot_provider
+        self.event_bus = event_bus
 
     def add_symbols(self, symbols: list[str]) -> None:
         self.state.watched_symbols = list(set(self.state.watched_symbols + symbols))
@@ -137,6 +140,7 @@ class MarketWatcher:
                     )
             for alert in alerts:
                 logger.info("预警: [%s] %s", alert.severity, alert.message)
+                self._publish_price_alert(alert)
                 for cb in self._alert_callbacks:
                     cb(alert)
             if exit_signals:
@@ -145,3 +149,23 @@ class MarketWatcher:
         except Exception as e:
             logger.warning("盯盘检查失败: %s", e)
             return []
+
+    def _publish_price_alert(self, alert: AlertEvent) -> None:
+        if self.event_bus is None:
+            return
+        self.event_bus.publish_sync(
+            MarketEvent(
+                event_type="PRICE_ALERT",
+                symbol=alert.symbol,
+                payload={
+                    "alert_type": alert.alert_type,
+                    "message": alert.message,
+                    "severity": alert.severity,
+                    "price": alert.price,
+                    "change_pct": alert.change_pct,
+                },
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+                priority=2 if alert.severity == "critical" else 1,
+                source="market_watcher",
+            )
+        )

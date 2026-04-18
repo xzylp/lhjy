@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel, Field
 
 from .param_registry import EffectivePeriod, ParameterRegistry
+from ..selection_preferences import normalize_excluded_theme_keywords
 
 _NUM_TOKEN = r"(\d+(?:\.\d+)?|[一二两三四五六七八九十])"
 _UNIT_TOKEN = r"(秒钟|秒|分钟|分|小时|时|天|日|周|星期|只|个|成|%|元|块|万|万元|千|百)?"
@@ -84,6 +85,8 @@ class NaturalLanguageAdjustmentInterpreter:
         spec: AdjustmentSpec,
         inferred_period: EffectivePeriod | None,
     ) -> ParsedAdjustment | None:
+        if spec.kind == "exclude_keywords":
+            return self._match_excluded_keywords(text, spec, inferred_period)
         alias_group = "|".join(re.escape(alias) for alias in spec.aliases)
         patterns = [
             rf"(?P<alias>{alias_group})[^0-9一二两三四五六七八九十]{{0,12}}?(?P<num>{_NUM_TOKEN})\s*(?P<unit>{_UNIT_TOKEN})",
@@ -112,6 +115,35 @@ class NaturalLanguageAdjustmentInterpreter:
                 effective_period=inferred_period,
             )
         return None
+
+    def _match_excluded_keywords(
+        self,
+        text: str,
+        spec: AdjustmentSpec,
+        inferred_period: EffectivePeriod | None,
+    ) -> ParsedAdjustment | None:
+        alias_group = "|".join(re.escape(alias) for alias in spec.aliases)
+        match = re.search(rf"(?P<alias>{alias_group})(?P<targets>[^。；\n]+)", text)
+        if not match:
+            return None
+        targets = self._extract_excluded_targets(match.group("targets"))
+        if not targets:
+            return None
+        definition = self._registry.get(spec.param_key)
+        if definition is None:
+            return None
+        value = ",".join(targets)
+        return ParsedAdjustment(
+            param_key=spec.param_key,
+            scope=definition.scope,
+            value_type=definition.value_type,
+            new_value=value,
+            config_key=spec.config_key,
+            config_value=value if spec.config_key else None,
+            matched_alias=match.group("alias"),
+            matched_text=match.group(0),
+            effective_period=inferred_period,
+        )
 
     def _convert_value(self, raw_number: str, unit: str, kind: str) -> int | float:
         numeric = self._parse_number(raw_number)
@@ -157,8 +189,25 @@ class NaturalLanguageAdjustmentInterpreter:
             return "today_session"
         return None
 
+    @staticmethod
+    def _extract_excluded_targets(text: str) -> list[str]:
+        clause = str(text or "").strip()
+        suffix_hits = re.findall(r"([A-Za-z0-9\u4e00-\u9fff]+?)(?:概念股|行业股|板块股|题材股|概念|行业|板块|题材|个股|股票|股)", clause)
+        if suffix_hits:
+            return normalize_excluded_theme_keywords(suffix_hits)
+        fallback = re.split(r"[，,、；;和及与/]", clause)
+        cleaned = []
+        for item in fallback:
+            token = str(item or "").strip()
+            token = re.sub(r"^(的|先|暂时|今天|今日|盘中|本次)", "", token)
+            token = re.sub(r"(为主|这些|这类|方向|标的|即可|都|等|等等)$", "", token).strip()
+            if token:
+                cleaned.append(token)
+        return normalize_excluded_theme_keywords(cleaned)
+
 
 _SPECS = [
+    AdjustmentSpec("excluded_theme_keywords", ("不买", "不要买", "先不买", "先不碰", "禁买", "排除", "剔除", "回避", "避开"), "exclude_keywords"),
     AdjustmentSpec("monitor_auction_heartbeat_save_seconds", ("竞价心跳", "开盘心跳", "尾盘心跳"), "seconds", "watch.auction_heartbeat_save_seconds"),
     AdjustmentSpec("monitor_heartbeat_save_seconds", ("心跳时间", "心跳频率", "心跳"), "seconds", "watch.heartbeat_save_seconds"),
     AdjustmentSpec("candidate_poll_seconds", ("候选轮询", "候选刷新", "候选巡检"), "seconds", "watch.candidate_poll_seconds"),
@@ -171,9 +220,9 @@ _SPECS = [
     AdjustmentSpec("dossier_retention_trading_days", ("保存时长", "保留时长", "留存时长", "保留天数"), "days", "snapshots.dossier_retention_trading_days"),
     AdjustmentSpec("archive_retention_trading_days", ("归档时长", "归档保留", "归档天数"), "days", "snapshots.archive_retention_trading_days"),
     AdjustmentSpec("max_total_position", ("总仓位", "总体仓位"), "percent", "max_total_position"),
-    AdjustmentSpec("equity_position_limit", ("测试仓位", "股票测试仓位", "测试股票仓位", "测试资金仓位"), "percent", "equity_position_limit"),
+    AdjustmentSpec("equity_position_limit", ("测试仓位", "股票测试仓位", "测试股票仓位", "测试资金仓位", "仓位", "股票仓位", "持仓仓位"), "percent", "equity_position_limit"),
     AdjustmentSpec("max_single_position", ("单票仓位", "单股仓位"), "percent", "max_single_position"),
-    AdjustmentSpec("max_single_amount", ("单票金额上限", "单票金额", "单股金额上限", "单股金额"), "amount", "max_single_amount"),
+    AdjustmentSpec("max_single_amount", ("单票金额上限", "单票金额", "单股金额上限", "单股金额", "个股最多", "单股最多", "个股不超过", "单股不超过", "个股上限", "单股上限"), "amount", "max_single_amount"),
     AdjustmentSpec("daily_loss_limit", ("日亏损上限", "日损失上限", "单日止损"), "percent", "daily_loss_limit"),
     AdjustmentSpec("reverse_repo_target_ratio", ("逆回购目标", "逆回购仓位", "逆回购占比"), "percent", "reverse_repo_target_ratio"),
     AdjustmentSpec("minimum_total_invested_amount", ("总持仓基线", "测试总持仓", "总持仓金额", "测试总资金"), "amount", "minimum_total_invested_amount"),

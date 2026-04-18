@@ -31,7 +31,7 @@ class MessageDispatcher:
         if not force and self._is_rate_limited(channel):
             logger.debug("消息限流跳过: %s", channel)
             return False
-        success = self.feishu.send_alert(title, content, level)
+        success = self.feishu.send_alert(title, content, level, channel=channel)
         self._update_record(channel)
         return success
 

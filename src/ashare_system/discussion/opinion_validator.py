@@ -135,12 +135,12 @@ def validate_opinion_payload(
                 round=opinion.round,
             )
         )
-    if opinion.round == 2 and not has_substantive_round_2_response(opinion):
+    if opinion.round >= 2 and not has_substantive_round_2_response(opinion):
         issues.append(
             OpinionValidationIssue(
                 level="error",
                 code="round_2_not_substantive",
-                message="Round 2 opinion 未包含当前实现要求的实质回应字段",
+                message=f"Round {opinion.round} opinion 未包含当前实现要求的实质回应字段",
                 field="round",
                 case_id=opinion.case_id or None,
                 agent_id=opinion.agent_id,

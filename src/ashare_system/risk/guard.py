@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from ..contracts import PlaceOrderRequest, BalanceSnapshot, MarketProfile
 from ..logging_config import get_logger
-from .rules import RiskRules, RuleResult
+from ..runtime_config import RuntimeConfig
+from .rules import RiskRules, RiskThresholds, RuleResult
 
 logger = get_logger("risk.guard")
 
@@ -12,8 +13,12 @@ logger = get_logger("risk.guard")
 class ExecutionGuard:
     """执行守卫: 在下单前进行风控拦截"""
 
-    def __init__(self) -> None:
-        self.rules = RiskRules()
+    def __init__(self, rules: RiskRules | None = None) -> None:
+        self.rules = rules or RiskRules()
+
+    @classmethod
+    def from_runtime_config(cls, config: RuntimeConfig) -> "ExecutionGuard":
+        return cls(rules=RiskRules(RiskThresholds.from_runtime_config(config)))
 
     def approve(
         self,

@@ -73,14 +73,16 @@ class DossierPrecomputeService:
         source: str = "candidate_pool",
         limit: int = 30,
         force: bool = False,
+        as_of_time: str | None = None,
     ) -> dict:
-        resolved_trade_date = trade_date or self._resolve_trade_date()
+        resolved_as_of_time = self._resolve_as_of_time(as_of_time)
+        resolved_trade_date = trade_date or self._resolve_trade_date(resolved_as_of_time)
         resolved_symbols = self._resolve_symbols(resolved_trade_date, symbols or [], source, limit)
         if not resolved_symbols:
             raise ValueError("no symbols available for dossier precompute")
 
         now = self._now_factory()
-        signature = self._build_signature(resolved_trade_date, resolved_symbols, source)
+        signature = self._build_signature(resolved_trade_date, resolved_symbols, source, resolved_as_of_time)
         latest = self._research_state_store.get("latest_dossier_pack")
         if latest and not force and latest.get("signature") == signature and self._is_fresh(latest, now):
             reused = dict(latest)
@@ -107,7 +109,7 @@ class DossierPrecomputeService:
         case_map = self._case_map(resolved_trade_date)
         snapshots = self._fetcher.fetch_snapshots(resolved_symbols)
         snapshot_map = {item.symbol: item for item in snapshots}
-        daily_bars = self._pipeline.get_daily_bars(resolved_symbols, count=60)
+        daily_bars = self._pipeline.get_daily_bars(resolved_symbols, count=60, as_of_time=resolved_as_of_time)
         bar_history_map: dict[str, list] = {}
         for item in daily_bars:
             bar_history_map.setdefault(item.bar.symbol, []).append(item)
@@ -119,7 +121,7 @@ class DossierPrecomputeService:
             generated_at=now.isoformat(),
             force_rebuild=force,
         )
-        research_items = self._research_items()
+        research_items = self._research_items(as_of_time=resolved_as_of_time)
         research_map = self._research_map(resolved_symbols, research_items)
         index_snapshots = self._fetch_core_index_snapshots()
         market_context = self._build_market_context(index_snapshots, now.isoformat())
@@ -249,6 +251,7 @@ class DossierPrecomputeService:
             "symbol_count": len(items),
             "generated_at": now.isoformat(),
             "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat(),
+            "as_of_time": resolved_as_of_time,
             "signature": signature,
             "reused": False,
             "market_context": market_context,
@@ -295,8 +298,10 @@ class DossierPrecomputeService:
         source: str = "candidate_pool",
         limit: int = 30,
         force: bool = False,
+        as_of_time: str | None = None,
     ) -> dict | None:
-        resolved_trade_date = trade_date or self._resolve_trade_date()
+        resolved_as_of_time = self._resolve_as_of_time(as_of_time)
+        resolved_trade_date = trade_date or self._resolve_trade_date(resolved_as_of_time)
         symbols = self._resolve_candidate_symbols(resolved_trade_date, limit)
         if not symbols:
             return None
@@ -306,6 +311,7 @@ class DossierPrecomputeService:
             source=source,
             limit=limit,
             force=force,
+            as_of_time=resolved_as_of_time,
         )
 
     def refresh_behavior_profiles(
@@ -336,7 +342,7 @@ class DossierPrecomputeService:
             }
 
         now = self._now_factory()
-        daily_bars = self._pipeline.get_daily_bars(resolved_symbols, count=60)
+        daily_bars = self._pipeline.get_daily_bars(resolved_symbols, count=60, as_of_time=self._resolve_as_of_time(None))
         history_map: dict[str, list] = {}
         for item in daily_bars:
             history_map.setdefault(item.bar.symbol, []).append(item)
@@ -380,9 +386,11 @@ class DossierPrecomputeService:
         trade_date: str | None = None,
         source: str = "candidate_pool",
         limit: int = 30,
+        as_of_time: str | None = None,
     ) -> dict:
         now = self._now_factory()
-        resolved_trade_date = trade_date or self._resolve_trade_date()
+        resolved_as_of_time = self._resolve_as_of_time(as_of_time)
+        resolved_trade_date = trade_date or self._resolve_trade_date(resolved_as_of_time)
         symbols = self._resolve_candidate_symbols(resolved_trade_date, limit)
         if not symbols:
             return {
@@ -390,11 +398,12 @@ class DossierPrecomputeService:
                 "reason": "no_candidates",
                 "trade_date": resolved_trade_date,
                 "source": source,
+                "as_of_time": resolved_as_of_time,
                 "symbol_count": 0,
                 "symbols": [],
             }
 
-        signature = self._build_signature(resolved_trade_date, symbols, source)
+        signature = self._build_signature(resolved_trade_date, symbols, source, resolved_as_of_time)
         latest = self.get_latest()
         interval_seconds = self._runtime_config().watch.candidate_poll_seconds
         if not latest:
@@ -403,6 +412,7 @@ class DossierPrecomputeService:
                 "reason": "missing",
                 "trade_date": resolved_trade_date,
                 "source": source,
+                "as_of_time": resolved_as_of_time,
                 "symbol_count": len(symbols),
                 "symbols": symbols,
                 "signature": signature,
@@ -423,13 +433,14 @@ class DossierPrecomputeService:
             if elapsed_seconds is None or elapsed_seconds >= interval_seconds:
                 reason = "signature_changed" if signature_changed else "expired"
                 return {
-                    "should_refresh": True,
-                    "reason": reason,
-                    "trade_date": resolved_trade_date,
-                    "source": source,
-                    "symbol_count": len(symbols),
-                    "symbols": symbols,
-                    "signature": signature,
+                "should_refresh": True,
+                "reason": reason,
+                "trade_date": resolved_trade_date,
+                "source": source,
+                "as_of_time": resolved_as_of_time,
+                "symbol_count": len(symbols),
+                "symbols": symbols,
+                "signature": signature,
                     "interval_seconds": interval_seconds,
                     "elapsed_seconds": elapsed_seconds,
                     "is_fresh": is_fresh,
@@ -440,6 +451,7 @@ class DossierPrecomputeService:
                 "reason": "poll_interval",
                 "trade_date": resolved_trade_date,
                 "source": source,
+                "as_of_time": resolved_as_of_time,
                 "symbol_count": len(symbols),
                 "symbols": symbols,
                 "signature": signature,
@@ -454,6 +466,7 @@ class DossierPrecomputeService:
             "reason": "fresh",
             "trade_date": resolved_trade_date,
             "source": source,
+            "as_of_time": resolved_as_of_time,
             "symbol_count": len(symbols),
             "symbols": symbols,
             "signature": signature,
@@ -470,11 +483,13 @@ class DossierPrecomputeService:
         limit: int = 30,
         force: bool = False,
         trigger: str = "scheduler",
+        as_of_time: str | None = None,
     ) -> dict:
         decision = self.should_refresh_candidates(
             trade_date=trade_date,
             source=source,
             limit=limit,
+            as_of_time=as_of_time,
         )
         if force:
             decision["should_refresh"] = True
@@ -493,6 +508,7 @@ class DossierPrecomputeService:
             source=source,
             limit=limit,
             force=force,
+            as_of_time=decision.get("as_of_time"),
         )
         return {
             "ok": True,
@@ -572,7 +588,12 @@ class DossierPrecomputeService:
             retained_reversed.append(item)
         return list(reversed(retained_reversed))
 
-    def _resolve_trade_date(self) -> str:
+    def _resolve_trade_date(self, as_of_time: str | None = None) -> str:
+        if as_of_time:
+            try:
+                return datetime.fromisoformat(as_of_time).date().isoformat()
+            except ValueError:
+                pass
         latest_runtime = self._runtime_state_store.get("latest_runtime_report", {})
         generated_at = latest_runtime.get("generated_at")
         if generated_at:
@@ -612,11 +633,20 @@ class DossierPrecomputeService:
         cases = self._candidate_case_service.list_cases(trade_date=trade_date, limit=500)
         return {item.symbol: item for item in cases}
 
-    def _research_items(self) -> list[dict]:
+    def _research_items(self, as_of_time: str | None = None) -> list[dict]:
         news = self._research_state_store.get("news", [])
         announcements = self._research_state_store.get("announcements", [])
         policy = self._research_state_store.get("policy", [])
         items = [self._normalize_event_item(item) for item in (news + announcements + policy)]
+        cutoff = self._parse_optional_datetime(as_of_time)
+        if cutoff is not None:
+            items = [
+                item for item in items
+                if (
+                    self._parse_optional_datetime(self._event_sort_key(item)) is None
+                    or self._parse_optional_datetime(self._event_sort_key(item)) <= cutoff
+                )
+            ]
         items.sort(key=self._event_sort_key, reverse=True)
         return items
 
@@ -633,8 +663,23 @@ class DossierPrecomputeService:
         return self._config_mgr.get() if self._config_mgr else RuntimeConfig()
 
     @staticmethod
-    def _build_signature(trade_date: str, symbols: list[str], source: str) -> str:
-        return f"{trade_date}:{source}:{','.join(symbols)}"
+    def _build_signature(trade_date: str, symbols: list[str], source: str, as_of_time: str | None = None) -> str:
+        suffix = f":{as_of_time}" if as_of_time else ""
+        return f"{trade_date}:{source}:{','.join(symbols)}{suffix}"
+
+    @staticmethod
+    def _resolve_as_of_time(as_of_time: str | None) -> str | None:
+        text = str(as_of_time or "").strip()
+        return text or None
+
+    @staticmethod
+    def _parse_optional_datetime(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
 
     @staticmethod
     def _is_fresh(payload: dict, now: datetime) -> bool:
@@ -1157,6 +1202,8 @@ class DossierPrecomputeService:
             "source": item.get("source", ""),
             "source_type": item.get("source_type") or item.get("category", ""),
             "category": item.get("category") or item.get("event_type") or "news",
+            "event_type": item.get("event_type") or payload.get("event_type") or item.get("category") or "news",
+            "impact": item.get("impact") or payload.get("impact") or "neutral",
             "severity": item.get("severity", "info"),
             "sentiment": item.get("sentiment", "neutral"),
             "event_at": item.get("event_at") or item.get("event_time") or item.get("recorded_at") or "",
@@ -1191,6 +1238,8 @@ class DossierPrecomputeService:
             "symbol": item.get("symbol"),
             "title": item.get("title"),
             "category": item.get("category"),
+            "event_type": item.get("event_type"),
+            "impact": item.get("impact"),
             "severity": item.get("severity"),
             "sentiment": item.get("sentiment"),
             "impact_scope": item.get("impact_scope"),

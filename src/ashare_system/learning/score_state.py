@@ -9,6 +9,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, Field
 
+from ..logging_config import get_logger
 from .settlement import determine_governance_state, determine_weight_bucket, determine_weight_value
 
 
@@ -21,6 +22,8 @@ DEFAULT_AGENT_IDS = (
     "ashare-risk",
     "ashare-audit",
 )
+
+logger = get_logger("learning.score_state")
 
 
 class AgentCaseEvaluation(BaseModel):
@@ -150,3 +153,71 @@ class AgentScoreService:
     def _write_states(self, states: list[AgentScoreState]) -> None:
         payload = {"states": [item.model_dump() for item in states]}
         self._storage_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # ── 自进化扩展方法 ──────────────────────────────────────
+
+    def read_states(self, target_date: str | None = None) -> list[AgentScoreState]:
+        """兼容旧调用名，返回指定日期的 score states。"""
+        return self.list_scores(target_date)
+
+    def export_weights(self, target_date: str | None = None) -> dict[str, float]:
+        """导出所有 Agent 的当日 weight_value。
+
+        Returns:
+            {agent_id: weight_value}，如 {"ashare-risk": 0.6, "ashare-research": 1.0, ...}
+
+        用途：传给 finalizer.build_finalize_bundle(agent_weights=...) 实现加权投票。
+        """
+        states = self.read_states(target_date)
+        return {
+            state.agent_id: state.weight_value
+            for state in states
+        }
+
+    def run_daily_settlement(
+        self,
+        *,
+        settlement_results: list[dict] | None = None,
+        trade_date: str | None = None,
+    ) -> list[dict]:
+        """每日盘后统一结算入口。
+
+        协调调用 settlement → record_settlement → 更新 score_state。
+
+        Args:
+            settlement_results: settlement.py:run_daily() 的输出
+            trade_date: 交易日
+
+        Returns:
+            更新后的所有 agent score state dicts
+
+        TODO:
+            1. 调用 settlement.run_daily(attribution_report, cases, outcomes)
+            2. 遍历 settlement_results，调用 record_settlement()
+            3. 通过 EventBus 发布 SETTLEMENT_COMPLETE 事件
+        """
+        target_date = trade_date or datetime.now().strftime("%Y-%m-%d")
+        settlement_results = settlement_results or []
+
+        for result in settlement_results:
+            agent_id = str(result.get("agent_id", ""))
+            if not agent_id:
+                continue
+            result_score_delta = float(result.get("result_score_delta", result.get("credit_delta", 0.0)) or 0.0)
+            learning_score_delta = float(result.get("learning_score_delta", 0.0) or 0.0)
+            governance_score_delta = float(result.get("governance_score_delta", 0.0) or 0.0)
+            if result_score_delta == 0.0 and learning_score_delta == 0.0 and governance_score_delta == 0.0:
+                continue
+            self.record_settlement(
+                agent_id=agent_id,
+                score_date=target_date,
+                result_score_delta=result_score_delta,
+                learning_score_delta=learning_score_delta,
+                governance_score_delta=governance_score_delta,
+                cases_evaluated=list(result.get("cases_evaluated") or []),
+                learning_updates=list(result.get("learning_updates") or []),
+            )
+
+        updated_states = self.read_states(target_date)
+        logger.info("每日学分结算完成: trade_date=%s agents=%d", target_date, len(updated_states))
+        return [state.model_dump() for state in updated_states]

@@ -1,4 +1,4 @@
-"""交易执行适配器 — 基类 + Mock + XtQuant 真实适配器"""
+"""交易执行适配器 — 基类 + Mock + XtQuant / Windows Proxy 真实适配器"""
 
 from __future__ import annotations
 
@@ -6,7 +6,10 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
+
+import httpx
 
 from ..contracts import (
     BalanceSnapshot,
@@ -18,11 +21,24 @@ from ..contracts import (
 from ..logging_config import get_logger
 from ..portfolio import is_reverse_repo_symbol, reverse_repo_order_amount
 from ..settings import AppSettings
+from .go_client import GoPlatformClient
 
 logger = get_logger("execution.adapter")
 
 XTQUANT_CONNECT_RETRY_ATTEMPTS = 3
 XTQUANT_CONNECT_RETRY_BACKOFF_SEC = 1.0
+
+
+def _sanitize_gateway_detail(detail: Any) -> str:
+    text = str(detail or "").strip()
+    if not text:
+        return text
+    if "http://127.0.0.1:18792" in text or "127.0.0.1:18792" in text:
+        return (
+            "Windows 18791 网关已收到请求，但其内部交易桥 127.0.0.1:18792 当前不可用；"
+            f"原始错误: {text}"
+        )
+    return text
 
 
 class ExecutionAdapter:
@@ -341,7 +357,313 @@ class XtQuantExecutionAdapter(ExecutionAdapter):
         return refreshed.model_copy(update={"status": "CANCEL_REQUESTED"})
 
 
+class WindowsProxyExecutionAdapter(ExecutionAdapter):
+    """通过 Windows 侧 HTTP 交易桥访问 QMT。"""
+
+    def __init__(self, settings: AppSettings) -> None:
+        self.settings = settings
+        self._base_url = str(settings.windows_gateway.base_url or "").rstrip("/")
+        if not self._base_url:
+            raise RuntimeError("ASHARE_WINDOWS_GATEWAY_BASE_URL 未配置")
+        self._timeout_sec = float(settings.windows_gateway.timeout_sec or 10.0)
+        self._token = self._load_token()
+        if not self._token:
+            raise RuntimeError("Windows Gateway token 未配置，请设置 ASHARE_WINDOWS_GATEWAY_TOKEN 或 TOKEN_FILE")
+        self._client = httpx.Client(timeout=self._timeout_sec, trust_env=False)
+
+    def _timeout_for_path(self, method: str, path: str) -> float:
+        if method == "GET" and path in {"/qmt/account/asset", "/qmt/account/positions"}:
+            return min(self._timeout_sec, 8.0)
+        if method == "GET" and path in {"/qmt/account/orders", "/qmt/account/trades"}:
+            return min(self._timeout_sec, 12.0)
+        if method == "POST" and path == "/qmt/trade/order":
+            return min(self._timeout_sec, 8.0)
+        return self._timeout_sec
+
+    @staticmethod
+    def _gateway_error_prefix(path: str, status_code: int) -> str:
+        if status_code == 429:
+            return "windows_gateway_overloaded"
+        if status_code == 401:
+            return "windows_gateway_auth_failed"
+        if status_code == 404:
+            return "windows_gateway_not_found"
+        if status_code == 408:
+            return "windows_gateway_timeout"
+        if 500 <= status_code <= 599:
+            return "windows_gateway_upstream_error"
+        return "windows_gateway_http_error"
+
+    def _load_token(self) -> str:
+        explicit = str(self.settings.windows_gateway.token or "").strip()
+        if explicit:
+            return explicit
+        token_file = str(self.settings.windows_gateway.token_file or "").strip()
+        if not token_file:
+            return ""
+        path = Path(token_file)
+        if not path.exists():
+            raise RuntimeError(f"Windows Gateway token 文件不存在: {path}")
+        return path.read_text(encoding="utf-8").strip()
+
+    def _headers(self) -> dict[str, str]:
+        return {"X-Ashare-Token": self._token}
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        request_timeout = timeout or self._timeout_for_path(method, path)
+        try:
+            response = self._client.request(
+                method,
+                f"{self._base_url}{path}",
+                headers=self._headers(),
+                params=params,
+                json=json_payload,
+                timeout=request_timeout,
+            )
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(f"windows_gateway_timeout: {path} | elapsed>{request_timeout:.1f}s") from exc
+        except httpx.ConnectError as exc:
+            raise RuntimeError(f"windows_gateway_unavailable: {path} | {exc}") from exc
+        if response.status_code >= 400:
+            detail = ""
+            try:
+                raw_payload = response.json()
+                if isinstance(raw_payload, dict):
+                    detail = str(
+                        raw_payload.get("last_error")
+                        or raw_payload.get("message")
+                        or raw_payload.get("error")
+                        or raw_payload.get("detail")
+                        or ""
+                    )
+            except Exception:
+                detail = response.text[:200]
+            prefix = self._gateway_error_prefix(path, response.status_code)
+            raise RuntimeError(f"{prefix}: {path} | {_sanitize_gateway_detail(detail)}".strip())
+        payload = dict(response.json())
+        if not payload.get("ok", False):
+            error = (
+                payload.get("last_error")
+                or payload.get("message")
+                or payload.get("error")
+                or payload.get("detail")
+                or "windows_gateway_request_failed"
+            )
+            error_text = _sanitize_gateway_detail(error)
+            if "invalid token" in error_text.lower():
+                raise RuntimeError(f"windows_gateway_auth_failed: {path} | {error_text}")
+            raise RuntimeError(f"windows_gateway_request_failed: {path} | {error_text}")
+        return payload
+
+    @staticmethod
+    def _normalize_side(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"buy", "b", "23"}:
+            return "BUY"
+        if text in {"sell", "s", "24"}:
+            return "SELL"
+        return "BUY"
+
+    @staticmethod
+    def _normalize_status(value: Any) -> str:
+        mapping = {
+            "48": "PENDING",
+            "49": "PENDING",
+            "50": "ACCEPTED",
+            "51": "CANCEL_REQUESTED",
+            "52": "CANCEL_REQUESTED",
+            "53": "CANCEL_REQUESTED",
+            "54": "CANCELLED",
+            "55": "PARTIAL_FILLED",
+            "56": "FILLED",
+            "57": "REJECTED",
+            "pending": "PENDING",
+            "accepted": "ACCEPTED",
+            "partial_filled": "PARTIAL_FILLED",
+            "filled": "FILLED",
+            "cancel_requested": "CANCEL_REQUESTED",
+            "cancelled": "CANCELLED",
+            "canceled": "CANCELLED",
+            "rejected": "REJECTED",
+        }
+        return mapping.get(str(value or "").strip().lower(), "UNKNOWN")
+
+    def get_balance(self, account_id: str) -> BalanceSnapshot:
+        payload = self._request_json("GET", "/qmt/account/asset")
+        asset = dict(payload.get("asset") or {})
+        resolved_account_id = str(payload.get("account_id") or asset.get("account_id") or account_id)
+        return BalanceSnapshot(
+            account_id=resolved_account_id,
+            total_asset=float(asset.get("total_asset", 0.0) or 0.0),
+            cash=float(asset.get("cash", 0.0) or 0.0),
+            frozen_cash=float(asset.get("frozen_cash", 0.0) or 0.0),
+        )
+
+    def get_positions(self, account_id: str) -> list[PositionSnapshot]:
+        payload = self._request_json("GET", "/qmt/account/positions")
+        positions = []
+        for item in list(payload.get("positions") or []):
+            positions.append(
+                PositionSnapshot(
+                    account_id=str(payload.get("account_id") or item.get("account_id") or account_id),
+                    symbol=str(item.get("stock_code") or item.get("symbol") or ""),
+                    quantity=int(item.get("volume", 0) or 0),
+                    available=int(item.get("can_use_volume", 0) or 0),
+                    cost_price=float(item.get("open_price", item.get("avg_price", 0.0)) or 0.0),
+                    last_price=float(
+                        item.get("last_price")
+                        or (
+                            float(item.get("market_value", 0.0) or 0.0) / max(int(item.get("volume", 0) or 0), 1)
+                        )
+                    ),
+                )
+            )
+        return positions
+
+    def get_orders(self, account_id: str) -> list[OrderSnapshot]:
+        payload = self._request_json("GET", "/qmt/account/orders")
+        orders = []
+        for item in list(payload.get("orders") or []):
+            orders.append(
+                OrderSnapshot(
+                    order_id=str(item.get("order_id") or ""),
+                    account_id=str(payload.get("account_id") or item.get("account_id") or account_id),
+                    symbol=str(item.get("stock_code") or item.get("symbol") or ""),
+                    side=self._normalize_side(item.get("side") or item.get("order_type")),
+                    quantity=int(item.get("order_volume", item.get("quantity", 0)) or 0),
+                    price=float(item.get("price", 0.0) or 0.0),
+                    status=self._normalize_status(item.get("status") or item.get("order_status")),
+                )
+            )
+        return orders
+
+    def get_order(self, account_id: str, order_id: str) -> OrderSnapshot:
+        payload = self._request_json("POST", "/qmt/trade/order_status", json_payload={"order_id": int(order_id)})
+        item = dict(payload.get("order") or {})
+        if not item:
+            raise KeyError(order_id)
+        return OrderSnapshot(
+            order_id=str(payload.get("order_id") or item.get("order_id") or order_id),
+            account_id=str(payload.get("account_id") or item.get("account_id") or account_id),
+            symbol=str(item.get("stock_code") or item.get("symbol") or ""),
+            side=self._normalize_side(item.get("side") or item.get("order_type")),
+            quantity=int(item.get("order_volume", item.get("quantity", 0)) or 0),
+            price=float(item.get("price", 0.0) or 0.0),
+            status=self._normalize_status(item.get("status") or item.get("order_status")),
+        )
+
+    def get_trades(self, account_id: str) -> list[TradeSnapshot]:
+        payload = self._request_json("GET", "/qmt/account/trades")
+        trades = []
+        for item in list(payload.get("trades") or []):
+            trades.append(
+                TradeSnapshot(
+                    trade_id=str(item.get("traded_id") or item.get("trade_id") or item.get("order_id") or ""),
+                    order_id=str(item.get("order_id") or ""),
+                    account_id=str(payload.get("account_id") or item.get("account_id") or account_id),
+                    symbol=str(item.get("stock_code") or item.get("symbol") or ""),
+                    side=self._normalize_side(item.get("side") or item.get("order_type")),
+                    quantity=int(item.get("traded_volume", item.get("quantity", 0)) or 0),
+                    price=float(item.get("traded_price", item.get("price", 0.0)) or 0.0),
+                )
+            )
+        return trades
+
+    def place_order(self, request: PlaceOrderRequest) -> OrderSnapshot:
+        payload = self._request_json(
+            "POST",
+            "/qmt/trade/order",
+            json_payload={
+                "stock_code": request.symbol,
+                "side": request.side.lower(),
+                "quantity": request.quantity,
+                "price": request.price,
+                "price_type": "fix",
+                "strategy_name": self.settings.strategy_name,
+                "remark": request.request_id,
+            },
+        )
+        order_id = str(payload.get("order_id") or "")
+        if not order_id:
+            raise RuntimeError("Windows Gateway 下单成功但未返回 order_id")
+        try:
+            return self.get_order(request.account_id, order_id)
+        except Exception:
+            return OrderSnapshot(
+                order_id=order_id,
+                account_id=request.account_id,
+                symbol=request.symbol,
+                side=request.side,
+                quantity=request.quantity,
+                price=request.price,
+                status="PENDING",
+            )
+
+    def cancel_order(self, account_id: str, order_id: str) -> OrderSnapshot:
+        raise RuntimeError("Windows Gateway 当前未暴露撤单接口")
+
+
+class GoPlatformExecutionAdapter(WindowsProxyExecutionAdapter):
+    """通过 Linux 本地 Go 并发数据平台访问执行。"""
+
+    def __init__(self, settings: AppSettings) -> None:
+        super().__init__(settings)
+        self._go_client = GoPlatformClient(settings)
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """覆盖请求逻辑，优先使用 Go 平台，失败时对读请求 fallback 到 Windows Gateway"""
+        try:
+            if method == "GET":
+                return self._go_client.get_json(path, params=params, timeout=timeout)
+            response = self._go_client.request(method, path, params=params, json=json_payload, timeout=timeout)
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"go_platform_invalid_payload: {path}")
+            return payload
+        except Exception as exc:
+            if method == "GET":
+                logger.warning(f"go_platform_exec_fallback | GET {path} | error={exc} | falling back to windows_proxy")
+                try:
+                    result = super()._request_json(
+                        method,
+                        path,
+                        params=params,
+                        json_payload=json_payload,
+                        timeout=timeout,
+                    )
+                    if isinstance(result, dict):
+                        result["_fallback"] = True
+                        result["_fallback_reason"] = str(exc)
+                    return result
+                except Exception as fallback_exc:
+                    logger.error(f"go_platform_exec_fallback_failed | GET {path} | error={fallback_exc}")
+                    raise
+            
+            logger.error(f"go_platform_exec_error | {method} {path} | error={exc}")
+            raise
+
+
 def build_execution_adapter(mode: str, settings: AppSettings) -> ExecutionAdapter:
+    if mode == "go_platform":
+        adapter = GoPlatformExecutionAdapter(settings)
+        adapter.mode = "go_platform"
+        return adapter
     if mode == "xtquant":
         try:
             adapter = XtQuantExecutionAdapter(settings)
@@ -354,6 +676,10 @@ def build_execution_adapter(mode: str, settings: AppSettings) -> ExecutionAdapte
             adapter = MockExecutionAdapter()
             adapter.mode = "mock-fallback"
             return adapter
+    if mode == "windows_proxy":
+        adapter = WindowsProxyExecutionAdapter(settings)
+        adapter.mode = "windows_proxy"
+        return adapter
     adapter = MockExecutionAdapter()
     adapter.mode = "mock"
     return adapter

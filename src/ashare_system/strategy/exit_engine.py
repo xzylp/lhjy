@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from ..contracts import ExitContext, ExitSignal, PositionSnapshot, QuoteSnapshot, SectorProfile
+from ..contracts import ExitContext, ExitSignal, MicroSignal, PositionSnapshot, QuoteSnapshot, SectorProfile
 
 
 class ExitEngine:
@@ -16,10 +16,24 @@ class ExitEngine:
         ctx: ExitContext,
         quote: QuoteSnapshot,
         sector: SectorProfile | None,
+        micro_signal: MicroSignal | None = None,
     ) -> ExitSignal | None:
         open_failure_minutes = int(ctx.exit_params.get("open_failure_minutes", 5))
         if ctx.holding_minutes <= open_failure_minutes and ctx.relative_strength_5m < -0.02:
             return self._signal("entry_failure", pos, quote, "IMMEDIATE", 1.0, pos.cost_price)
+
+        # v1.0: 微观节奏信号 — PEAK_FADE 快速退出
+        if micro_signal is not None and micro_signal.signal_type == "PEAK_FADE" and ctx.holding_minutes < 60:
+            return self._signal("entry_failure", pos, quote, "IMMEDIATE", 1.0, pos.cost_price)
+
+        # v1.0: 微观节奏信号 — RHYTHM_BREAK 时间止损
+        if micro_signal is not None and micro_signal.signal_type == "RHYTHM_BREAK" and ctx.holding_minutes < 120:
+            return self._signal("time_stop", pos, quote, "HIGH", 1.0, pos.cost_price)
+
+        # v1.0: 微观节奏信号 — VALLEY_HOLD 波谷企稳，抑制退出
+        if micro_signal is not None and micro_signal.signal_type == "VALLEY_HOLD":
+            if ctx.intraday_drawdown_pct >= 0.025 and ctx.rebound_from_low_pct >= 0.015:
+                return None  # 假跌破回拉是加分信号，不退出
 
         if ctx.is_bomb:
             return self._signal("board_break", pos, quote, "IMMEDIATE", 1.0, pos.cost_price)

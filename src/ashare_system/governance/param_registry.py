@@ -216,6 +216,15 @@ def _default_definitions() -> list[ParameterDefinition]:
             proposed_by=["ashare-strategy", "ashare-research"],
         ),
         ParameterDefinition(
+            param_key="excluded_theme_keywords",
+            scope="strategy",
+            value_type="string",
+            default_value="",
+            effective_period_default="until_revoked",
+            proposed_by=["ashare-strategy", "ashare", "user"],
+            notes="逗号分隔的排除方向关键词，如 银行,白酒；运行时选股与执行预检共同生效。",
+        ),
+        ParameterDefinition(
             param_key="t_min_amplitude",
             scope="intraday",
             value_type="percent",
