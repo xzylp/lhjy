@@ -6,7 +6,8 @@ from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 import pandas as pd
 
-from ..runtime_compose_contracts import RuntimeComposeRequest
+from ..data.cache import KlineCache
+from ..runtime_compose_contracts import RuntimeComposeFactorSpec, RuntimeComposeRequest
 from ..runtime_config import RuntimeConfig
 from .factor_registry import FactorRegistry
 from .playbook_registry import PlaybookRegistry
@@ -23,10 +24,12 @@ class StrategyComposer:
         factor_registry: FactorRegistry, 
         playbook_registry: PlaybookRegistry,
         evaluation_ledger: EvaluationLedgerService | None = None,
+        kline_cache: KlineCache | None = None,
     ) -> None:
         self._factor_registry = factor_registry
         self._playbook_registry = playbook_registry
         self._evaluation_ledger = evaluation_ledger
+        self._kline_cache = kline_cache
 
     def build_output(
         self,
@@ -42,6 +45,7 @@ class StrategyComposer:
         top_picks = list(pipeline_payload.get("top_picks", []))
         filtered_out = self._build_filtered_out(pipeline_payload)
         learned_asset_plan = self._build_learned_asset_plan(request, learned_asset_entries or [])
+        factor_policy = dict(request.market_context.get("factor_policy") or {})
         trade_date = str(pipeline_payload.get("trade_date") or "")
         
         # 提取市场驱动因素 (R0.4)
@@ -66,12 +70,25 @@ class StrategyComposer:
             constraint_trace=constraint_trace,
             learned_asset_plan=learned_asset_plan,
             market_drivers=market_drivers,
+            factor_policy=factor_policy,
         )
         return {
             "market_summary": self._build_market_summary(pipeline_payload, market_drivers=market_drivers),
             "candidates": candidates,
             "filtered_out": filtered_out if request.output.include_filtered_reasons else [],
             "explanations": explanations,
+            "factor_policy_summary": dict(factor_policy.get("factor_policy_summary") or {}),
+            "factor_portfolio_health": dict(factor_policy.get("factor_portfolio_health") or {}),
+            "factor_mix_validation": dict(factor_policy.get("factor_mix_validation") or {}),
+            "factor_effectiveness_trace": dict(factor_policy.get("factor_effectiveness_trace") or {}),
+            "factor_auto_downgrades": [dict(item) for item in list(factor_policy.get("factor_auto_downgrades") or [])],
+            "factor_rejections": [dict(item) for item in list(factor_policy.get("factor_rejections") or [])],
+            "effectiveness_warnings": [str(item) for item in list(factor_policy.get("effectiveness_warnings") or []) if str(item).strip()],
+            "diversification_warnings": [str(item) for item in list(factor_policy.get("diversification_warnings") or []) if str(item).strip()],
+            "requested_factor_weights": dict(factor_policy.get("requested_factor_weights") or {}),
+            "adjusted_factor_weights": dict(factor_policy.get("adjusted_factor_weights") or {}),
+            "needs_review": bool(factor_policy.get("needs_review")),
+            "review_action": dict(factor_policy.get("review_action") or {}),
             "proposal_packet": {
                 "selected_symbols": [item.get("symbol", "") for item in candidates[:3]],
                 "watchlist_symbols": [item.get("symbol", "") for item in candidates[3 : request.output.max_candidates]],
@@ -81,6 +98,7 @@ class StrategyComposer:
                     "是否需要风控进一步挑反证",
                     "active learned asset 是否真的改善了当前排序与证据质量",
                     "市场驱动因素(热点/事件)是否已充分反映在排序中",
+                    "因子守门是否已提示 needs_review，以及是否需要立即重组组合",
                 ],
             },
         }
@@ -94,6 +112,20 @@ class StrategyComposer:
         """构建市场驱动偏置信息。"""
         market_profile = pipeline_payload.get("market_profile") or {}
         hot_sectors = set(market_profile.get("hot_sectors") or [])
+        sector_strength_map: dict[str, float] = {}
+        for index, sector_name in enumerate(list(market_profile.get("hot_sectors") or [])):
+            if not str(sector_name).strip():
+                continue
+            sector_strength_map[str(sector_name)] = max(0.3, 1.0 - index * 0.12)
+        for item in list(market_profile.get("sector_profiles") or []):
+            sector_name = str((item or {}).get("sector_name") or "").strip()
+            if not sector_name:
+                continue
+            strength_score = float((item or {}).get("strength_score", 0.0) or 0.0)
+            sector_strength_map[sector_name] = max(
+                sector_strength_map.get(sector_name, 0.0),
+                min(max(strength_score / 10.0, 0.0), 1.2),
+            )
         
         # 事件加成：提取正面新闻或公告
         event_bonus_map: dict[str, float] = {}
@@ -117,19 +149,26 @@ class StrategyComposer:
         
         return {
             "hot_sectors": hot_sectors,
+            "sector_strength_map": sector_strength_map,
             "event_bonus_map": event_bonus_map,
             "event_reason_map": event_reason_map,
             "monitor_bonus_map": monitor_bonus_map,
+            "event_highlights": list((event_context or {}).get("highlights") or []),
         }
 
     def _build_market_summary(self, pipeline_payload: dict[str, Any], market_drivers: dict[str, Any] | None = None) -> dict[str, Any]:
         market_profile = pipeline_payload.get("market_profile") or {}
         drivers = market_drivers or {}
+        detected_market_regime = dict(pipeline_payload.get("detected_market_regime") or {})
         return {
-            "market_regime": market_profile.get("regime", ""),
+            "market_regime": detected_market_regime.get("runtime_regime") or market_profile.get("regime", ""),
+            "market_regime_label": detected_market_regime.get("regime_label", ""),
             "hot_sectors": list(drivers.get("hot_sectors") or market_profile.get("hot_sectors") or []),
             "risk_flags": market_profile.get("market_risk_flags", []),
             "event_drive_active": bool(drivers.get("event_bonus_map")),
+            "sector_strength_map": dict(drivers.get("sector_strength_map") or {}),
+            "regime_confidence": float(detected_market_regime.get("confidence", 0.0) or 0.0),
+            "regime_mismatch_warning": str(pipeline_payload.get("regime_mismatch_warning") or ""),
         }
 
     def _build_filtered_out(self, pipeline_payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -158,6 +197,7 @@ class StrategyComposer:
         constraint_trace: dict[str, Any] | None = None,
         learned_asset_plan: dict[str, Any] | None = None,
         market_drivers: dict[str, Any] | None = None,
+        factor_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         user_preferences = request.constraints.user_preferences or {}
         factor_specs = list(request.strategy.factors)
@@ -165,6 +205,13 @@ class StrategyComposer:
         summary_lines = list((constraint_trace or {}).get("summary_lines") or [])
         learned_summary = dict((learned_asset_plan or {}).get("summary") or {})
         drivers = market_drivers or {}
+        factor_policy = factor_policy or {}
+        portfolio_health = dict(factor_policy.get("factor_portfolio_health") or {})
+        policy_summary = dict(factor_policy.get("factor_policy_summary") or {})
+        review_action = dict(factor_policy.get("review_action") or {})
+        auto_downgrades = [dict(item) for item in list(factor_policy.get("factor_auto_downgrades") or [])]
+        rejections = [dict(item) for item in list(factor_policy.get("factor_rejections") or [])]
+        regime_warning = str(request.market_context.get("regime_mismatch_warning") or "").strip()
         
         driver_summary = []
         if drivers.get("hot_sectors"):
@@ -188,11 +235,82 @@ class StrategyComposer:
                 else "排除方向: 无",
                 f"单票金额上限: {runtime_config.max_single_amount}",
                 f"股票仓位上限: {runtime_config.equity_position_limit}",
+                f"复合调整倍数配置: {getattr(runtime_config, 'composite_adjustment_multiplier', 0.0)}",
             ]
             + summary_lines,
             "market_driver_summary": driver_summary,
+            "market_regime_summary": [
+                f"服务端检测市场状态={request.market_context.get('market_regime') or 'unknown'}"
+            ] + ([regime_warning] if regime_warning else []),
             "learned_asset_summary": learned_summary,
+            "factor_policy_summary": [str(item) for item in list(policy_summary.get("summary_lines") or []) if str(item).strip()],
+            "factor_portfolio_health": portfolio_health,
+            "review_action_summary": [
+                f"review_action={review_action.get('action')} auto_dispatch_allowed={review_action.get('auto_dispatch_allowed')} auto_execution_allowed={review_action.get('auto_execution_allowed')}"
+            ]
+            if review_action
+            else [],
+            "factor_adjustment_summary": [
+                f"{item.get('factor_id')} 因 {item.get('rule')} 自动降权到 {round(float(item.get('adjusted_weight', 0.0) or 0.0), 4)}"
+                for item in auto_downgrades[:5]
+            ]
+            + [
+                f"{item.get('factor_id')} 因 {item.get('rule')} 被剔除"
+                for item in rejections[:3]
+            ],
         }
+
+    def _resolve_composite_multiplier(self, runtime_config: RuntimeConfig) -> tuple[float, dict[str, Any]]:
+        configured = float(getattr(runtime_config, "composite_adjustment_multiplier", 0.0) or 0.0)
+        if configured > 0 and abs(configured - 10.0) > 1e-9:
+            return configured, {"source": "runtime_config", "configured_value": round(configured, 4), "auto_estimate": None}
+        auto_estimate = (
+            self._evaluation_ledger.estimate_composite_multiplier()
+            if self._evaluation_ledger is not None
+            else {
+                "available": False,
+                "resolved_multiplier": 4.0,
+                "source": "conservative_fallback",
+                "reason": "evaluation_ledger_missing",
+            }
+        )
+        resolved = float(auto_estimate.get("resolved_multiplier", 4.0) or 4.0)
+        return resolved, {
+            "source": str(auto_estimate.get("source") or "conservative_fallback"),
+            "configured_value": round(configured, 4),
+            "auto_estimate": auto_estimate,
+        }
+
+    def _orthogonalize_factor_weights(
+        self,
+        factors: list[RuntimeComposeFactorSpec],
+        raw_weights: dict[str, float],
+    ) -> tuple[dict[str, float], dict[str, Any]]:
+        normalized = dict(raw_weights)
+        grouped: dict[str, list[str]] = {}
+        for factor in factors:
+            definition = self._factor_registry.get(factor.id, factor.version)
+            correlation_group = str(getattr(definition, "correlation_group", "") or "").strip()
+            if not correlation_group:
+                continue
+            grouped.setdefault(correlation_group, []).append(factor.id)
+
+        meta: dict[str, Any] = {}
+        for correlation_group, factor_ids in grouped.items():
+            group_abs_sum = sum(abs(float(raw_weights.get(factor_id, 0.0) or 0.0)) for factor_id in factor_ids)
+            group_cap = max((abs(float(raw_weights.get(factor_id, 0.0) or 0.0)) for factor_id in factor_ids), default=0.0)
+            if group_abs_sum <= group_cap or group_cap <= 0:
+                continue
+            scale = group_cap / group_abs_sum
+            for factor_id in factor_ids:
+                normalized[factor_id] = float(raw_weights.get(factor_id, 0.0) or 0.0) * scale
+            meta[correlation_group] = {
+                "factor_ids": factor_ids,
+                "raw_abs_sum": round(group_abs_sum, 4),
+                "capped_abs_sum": round(group_cap, 4),
+                "scale": round(scale, 4),
+            }
+        return normalized, meta
 
     def _build_candidates(
         self,
@@ -208,6 +326,7 @@ class StrategyComposer:
         learned_asset_plan = learned_asset_plan or {}
         drivers = market_drivers or {}
         hot_sectors = drivers.get("hot_sectors") or set()
+        sector_strength_map = dict(drivers.get("sector_strength_map") or {})
         event_bonus_map = drivers.get("event_bonus_map") or {}
         event_reason_map = drivers.get("event_reason_map") or {}
         monitor_bonus_map = drivers.get("monitor_bonus_map") or {}
@@ -221,6 +340,7 @@ class StrategyComposer:
         sector_score_bias = dict(learned_asset_plan.get("sector_score_bias") or {})
         score_bonus = float(learned_asset_plan.get("score_bonus", 0.0) or 0.0)
         active_asset_ids = list(learned_asset_plan.get("active_asset_ids") or [])
+        factor_policy = dict(request.market_context.get("factor_policy") or {})
         
         effective_playbook_weights = {
             item.id: max(item.weight + float(playbook_weight_bias.get(item.id, 0.0) or 0.0), 0.0)
@@ -230,14 +350,22 @@ class StrategyComposer:
             item.id: item.weight + float(factor_weight_bias.get(item.id, 0.0) or 0.0)
             for item in request.strategy.factors
         }
+        effective_factor_weights, orthogonalization_meta = self._orthogonalize_factor_weights(
+            request.strategy.factors,
+            effective_factor_weights,
+        )
         total_playbook_weight = sum(effective_playbook_weights.values()) or 1.0
-        factor_total_weight = sum(abs(value) for value in effective_factor_weights.values()) or 1.0
+        factor_total_weight = sum(max(abs(value), 0.0) for value in effective_factor_weights.values()) or 1.0
+        composite_multiplier, multiplier_meta = self._resolve_composite_multiplier(runtime_config)
         
         context = {
             "market_hypothesis": request.intent.market_hypothesis,
             "trade_horizon": request.intent.trade_horizon,
             "holding_symbols": request.market_context.get("holding_symbols", []),
             "hot_sectors": list(hot_sectors),
+            "focus_sectors": list(request.market_context.get("focus_topics") or []),
+            "event_highlights": list(drivers.get("event_highlights") or []),
+            "highlights": list(drivers.get("event_highlights") or []),
         }
         
         candidates: list[dict[str, Any]] = []
@@ -251,7 +379,7 @@ class StrategyComposer:
             driver_bonus = 0.0
             driver_tags = []
             if resolved_sector in hot_sectors:
-                driver_bonus += 2.0
+                driver_bonus += 1.2 + float(sector_strength_map.get(resolved_sector, 0.5) or 0.0)
                 driver_tags.append("hot_sector_hit")
             if symbol in event_bonus_map:
                 driver_bonus += event_bonus_map[symbol]
@@ -267,7 +395,7 @@ class StrategyComposer:
                     playbook.id,
                     version=playbook.version,
                     candidate=item,
-                    context=context,
+                    context={**context, "playbook_params": dict(playbook.params or {})},
                     market_adapter=market_adapter,
                     trade_date=trade_date,
                     precomputed_factors=precomputed,
@@ -286,7 +414,7 @@ class StrategyComposer:
                     factor.id,
                     version=factor.version,
                     candidate=item,
-                    context=context,
+                    context={**context, "factor_params": dict(factor.params or {})},
                     market_adapter=market_adapter,
                     trade_date=trade_date,
                     precomputed_factors=precomputed,
@@ -302,7 +430,7 @@ class StrategyComposer:
                 learned_bonus += float(sector_score_bias.get(resolved_sector, 0.0) or 0.0)
             
             # 最终复合评分计入驱动加成
-            composite_score = round(selection_score + composite_adjustment * 12.0 + learned_bonus + driver_bonus, 2)
+            composite_score = round(selection_score + composite_adjustment * composite_multiplier + learned_bonus + driver_bonus, 2)
             
             evidence = [item.get("summary", "")] if item.get("summary") else []
             if resolved_sector:
@@ -325,6 +453,9 @@ class StrategyComposer:
                 "symbol": symbol,
                 "name": item.get("name", ""),
                 "rank": item.get("rank", 0),
+                "selection_score": round(selection_score, 4),
+                "composite_adjustment": round(composite_adjustment, 4),
+                "resolved_sector": resolved_sector,
                 "action_hint": "BUY_CANDIDATE" if (item.get("action") == "BUY" or driver_bonus > 1.0) else "WATCH_CANDIDATE",
                 "composite_score": composite_score,
                 "playbook_fit": playbook_fit,
@@ -357,6 +488,27 @@ class StrategyComposer:
                     "sector_score_bonus": round(float(sector_score_bias.get(resolved_sector, 0.0) or 0.0), 4),
                     "global_score_bonus": round(score_bonus, 4),
                 },
+                "scoring_meta": {
+                    "composite_adjustment_multiplier": round(composite_multiplier, 4),
+                    "composite_adjustment_meta": multiplier_meta,
+                    "driver_bonus": round(driver_bonus, 4),
+                    "learned_bonus": round(learned_bonus, 4),
+                    "factor_orthogonalization": {
+                        "applied": bool(orthogonalization_meta),
+                        "groups": orthogonalization_meta,
+                        "effective_factor_weights": {
+                            key: round(float(value or 0.0), 4)
+                            for key, value in effective_factor_weights.items()
+                        },
+                    },
+                    "factor_policy": {
+                        "needs_review": bool(factor_policy.get("needs_review")),
+                        "health_status": str((factor_policy.get("factor_portfolio_health") or {}).get("health_status") or ""),
+                        "requested_factor_weights": dict(factor_policy.get("requested_factor_weights") or {}),
+                        "adjusted_factor_weights": dict(factor_policy.get("adjusted_factor_weights") or {}),
+                        "review_action": dict(factor_policy.get("review_action") or {}),
+                    },
+                },
                 "raw_runtime_decision": item,
             }
             candidates.append(candidate)
@@ -388,7 +540,20 @@ class StrategyComposer:
             
         try:
             # 批量获取日线数据 (取 60 日以覆盖 return_20d, rel_vol 等)
-            all_bars = market_adapter.get_bars(symbols, period="1d", count=60, end_time=trade_date)
+            all_bars = []
+            if self._kline_cache is not None:
+                for symbol in symbols:
+                    all_bars.extend(
+                        self._kline_cache.get_or_fetch(
+                            symbol,
+                            "1d",
+                            60,
+                            market_adapter,
+                            end_time=trade_date,
+                        )
+                    )
+            else:
+                all_bars = market_adapter.get_bars(symbols, period="1d", count=60, end_time=trade_date)
             if not all_bars:
                 return {}
                 
@@ -479,12 +644,29 @@ class StrategyComposer:
                     if entry_asset_id in set(rec.get("active_learned_asset_ids", []))
                 ]
                 if relevant_outcomes:
-                    # 简单逻辑：如果最近 5 次平均胜率 < 40%，衰减
-                    recent = relevant_outcomes[:5]
-                    win_rate = sum(1 for o in recent if o.get("status") == "settled") / len(recent)
-                    if win_rate < 0.4:
+                    returns: list[float] = []
+                    for record in records:
+                        if entry_asset_id not in set(record.get("active_learned_asset_ids", []) or []):
+                            continue
+                        if self._evaluation_ledger is not None:
+                            returns.append(float(self._evaluation_ledger._extract_return_metric(record)))  # type: ignore[attr-defined]
+                    positive_returns = [value for value in returns if value > 0]
+                    negative_returns = [abs(value) for value in returns if value < 0]
+                    sample_count = len(returns)
+                    win_rate = len(positive_returns) / sample_count if sample_count > 0 else 0.0
+                    avg_win = sum(positive_returns) / len(positive_returns) if positive_returns else 0.0
+                    avg_loss = sum(negative_returns) / len(negative_returns) if negative_returns else 0.0
+                    profit_loss_ratio = avg_win / max(avg_loss, 1e-9) if avg_loss > 0 else (999.0 if avg_win > 0 else 0.0)
+                    expected_value = win_rate * avg_win - (1.0 - win_rate) * avg_loss
+                    if expected_value < 0 and sample_count >= 10:
                         performance_multiplier = 0.5
-                        summary_lines.append(f"{entry_asset_id} 历史表现欠佳(胜率{win_rate:.0%})，权重已衰减 50%")
+                        summary_lines.append(
+                            f"{entry_asset_id} 期望收益为负(EV={expected_value:.4f}, 样本={sample_count})，权重已衰减 50%"
+                        )
+                    elif expected_value > 0 and win_rate < 0.4 and sample_count >= 10:
+                        summary_lines.append(
+                            f"{entry_asset_id} 低胜率但正期望(win_rate={win_rate:.0%}, 盈亏比={profit_loss_ratio:.2f})，标记 high_volatility_strategy"
+                        )
 
             content = dict(item.get("content") or {})
             generic_weights = dict(content.get("weights") or {})

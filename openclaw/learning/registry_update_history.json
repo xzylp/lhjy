@@ -58,5 +58,65 @@
       "ashare-research": 1.0,
       "ashare-risk": 1.0
     }
+  },
+  {
+    "timestamp": "2026-04-18T17:00:00.006018",
+    "old_weights": {
+      "ashare-audit": 1.0,
+      "ashare-strategy": 1.0,
+      "ashare-research": 1.0,
+      "ashare-risk": 1.0
+    },
+    "new_weights": {
+      "ashare-strategy": 1.0,
+      "ashare-audit": 1.0,
+      "ashare-research": 1.0,
+      "ashare-risk": 1.0
+    }
+  },
+  {
+    "timestamp": "2026-04-19T17:00:00.006062",
+    "old_weights": {
+      "ashare-strategy": 1.0,
+      "ashare-audit": 1.0,
+      "ashare-research": 1.0,
+      "ashare-risk": 1.0
+    },
+    "new_weights": {
+      "ashare-risk": 1.0,
+      "ashare-audit": 1.0,
+      "ashare-research": 1.0,
+      "ashare-strategy": 1.0
+    }
+  },
+  {
+    "timestamp": "2026-04-20T17:00:01.896967",
+    "old_weights": {
+      "ashare-risk": 1.0,
+      "ashare-audit": 1.0,
+      "ashare-research": 1.0,
+      "ashare-strategy": 1.0
+    },
+    "new_weights": {
+      "ashare-risk": 1.0,
+      "ashare-research": 1.0,
+      "ashare-audit": 1.0,
+      "ashare-strategy": 1.0
+    }
+  },
+  {
+    "timestamp": "2026-04-21T17:00:02.242582",
+    "old_weights": {
+      "ashare-risk": 1.0,
+      "ashare-research": 1.0,
+      "ashare-audit": 1.0,
+      "ashare-strategy": 1.0
+    },
+    "new_weights": {
+      "ashare-research": 1.0,
+      "ashare-audit": 1.0,
+      "ashare-risk": 1.0,
+      "ashare-strategy": 1.0
+    }
   }
 ]

@@ -23,6 +23,7 @@ class SellReason(str, Enum):
     TAKE_PROFIT_1 = "take_profit_1"
     TAKE_PROFIT_2 = "take_profit_2"
     RISK_GUARD = "risk_guard"
+    DAY_TRADING_HIGH_SELL = "day_trading_high_sell"
 
 
 @dataclass
@@ -92,7 +93,12 @@ class SellDecisionEngine:
     def __init__(self) -> None:
         self.exit_engine = ExitEngine()
 
-    def _resolve_params(self, playbook: str = "", regime: str = "") -> dict[str, float]:
+    def _resolve_params(
+        self,
+        playbook: str = "",
+        regime: str = "",
+        param_overrides: dict[str, float] | None = None,
+    ) -> dict[str, float]:
         """根据 playbook 和 regime 解析最终的退出参数。"""
         base = self.PLAYBOOK_EXIT_PARAMS.get(playbook, {})
         params = {
@@ -107,6 +113,9 @@ class SellDecisionEngine:
         for key, factor in modifiers.items():
             if key in params:
                 params[key] = params[key] * factor
+        for key, value in dict(param_overrides or {}).items():
+            if key in params:
+                params[key] = float(value)
         return params
 
     def evaluate(
@@ -114,12 +123,13 @@ class SellDecisionEngine:
         state: PositionState,
         playbook: str = "",
         regime: str = "",
+        param_overrides: dict[str, float] | None = None,
     ) -> SellSignal | None:
         """评估卖出信号（支持 playbook-aware 和 regime-aware 参数）。"""
         price = state.current_price
         entry = state.entry_price
         atr = state.atr
-        p = self._resolve_params(playbook, regime)
+        p = self._resolve_params(playbook, regime, param_overrides=param_overrides)
 
         # 初始止损
         initial_stop = entry - p["atr_stop_mult"] * atr
@@ -154,6 +164,9 @@ class SellDecisionEngine:
         ctx: ExitContext | None = None,
         quote: QuoteSnapshot | None = None,
         sector: SectorProfile | None = None,
+        playbook: str = "",
+        regime: str = "",
+        param_overrides: dict[str, float] | None = None,
     ) -> SellSignal | None:
         if ctx is not None and quote is not None:
             exit_signal = self.exit_engine.check(position, ctx, quote, sector)
@@ -165,7 +178,12 @@ class SellDecisionEngine:
                     current_price=exit_signal.current_price,
                     stop_price=exit_signal.reference_price,
                 )
-        return self.evaluate(state)
+        return self.evaluate(
+            state,
+            playbook=playbook,
+            regime=regime,
+            param_overrides=param_overrides,
+        )
 
     def update_trailing_stop(self, state: PositionState) -> float:
         """更新移动止损位"""

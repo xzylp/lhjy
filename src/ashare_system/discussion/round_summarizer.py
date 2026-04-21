@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from .candidate_case import CandidateCaseService
 from .contracts import (
     AGENT_DISPLAY_NAMES,
     DISCUSSION_AGENT_IDS,
@@ -204,7 +205,7 @@ def build_reason_item(case: DiscussionCaseRecord | dict) -> dict:
         "selection_score": item.runtime_snapshot.selection_score,
         "action": item.runtime_snapshot.action,
         "final_status": item.final_status,
-        "headline_reason": item.selected_reason or item.rejected_reason or item.runtime_snapshot.summary,
+        "headline_reason": CandidateCaseService.resolve_headline_reason(item),
         "selected_reason": item.selected_reason,
         "rejected_reason": item.rejected_reason,
         "risk_gate": item.risk_gate,
@@ -245,47 +246,56 @@ def round_agent_coverage(case: DiscussionCaseRecord | dict, round_number: int) -
 
 
 def round_2_has_substantive_response(case: DiscussionCaseRecord | dict) -> bool:
+    return round_has_substantive_response(case, 2)
+
+
+def round_has_substantive_response(case: DiscussionCaseRecord | dict, round_number: int) -> bool:
     item = case if isinstance(case, DiscussionCaseRecord) else DiscussionCaseRecord.model_validate(case)
-    round_2_opinions = _latest_round_opinions(item, 2)
-    if not DISCUSSION_AGENT_IDS.issubset(round_2_opinions):
+    if round_number <= 1:
+        return round_agent_coverage(item, round_number)
+    round_opinions = _latest_round_opinions(item, round_number)
+    if not DISCUSSION_AGENT_IDS.issubset(round_opinions):
         return False
-    return all(_opinion_has_substantive_round_2_response(round_2_opinions[agent_id]) for agent_id in DISCUSSION_AGENT_IDS)
+    return all(_opinion_has_substantive_round_2_response(round_opinions[agent_id]) for agent_id in DISCUSSION_AGENT_IDS)
 
 
 def derive_risk_gate(opinions: list[DiscussionOpinion]) -> RiskGate:
     if not opinions:
         return "pending"
-    # S1.2: 只有显式的 allow 且没有 reject 才放行
-    stances = {op.stance for op in opinions}
-    if "rejected" in stances:
+    latest = opinions[-1]
+    if latest.stance == "rejected":
         return "reject"
-    if any(s in {"limit", "hold", "question"} for s in stances):
+    if latest.stance in {"limit", "hold", "question", "watch", "watchlist"}:
         return "limit"
-    if "support" in stances or "selected" in stances:
-        return "allow"
-    return "pending"
+    return "allow"
 
 
 def derive_audit_gate(opinions: list[DiscussionOpinion]) -> AuditGate:
     if not opinions:
         return "pending"
-    # S1.2: 审计需要所有回合都没有 hold 或 question
-    stances = {op.stance for op in opinions}
-    if any(s in {"rejected", "hold", "question"} for s in stances):
+    latest = opinions[-1]
+    if latest.stance in {"rejected", "hold", "question"}:
         return "hold"
     return "clear"
 
 
 def pick_reason(case: DiscussionCaseRecord, status: str) -> str | None:
+    latest_round = _latest_effective_round(case)
+    latest_round_opinions = list(_latest_round_opinions(case, latest_round).values())
     if status == "selected":
-        return case.runtime_snapshot.summary or (case.round_2_summary.resolved_points or case.round_1_summary.selected_points or [None])[0]
+        latest_points = _collect_reason_points(latest_round_opinions, {"support", "selected"})
+        return (latest_points or case.round_2_summary.resolved_points or case.round_1_summary.selected_points or [case.runtime_snapshot.summary])[0]
     if status == "rejected":
-        return (case.round_2_summary.remaining_disputes or case.round_1_summary.rejected_points or [case.runtime_snapshot.summary])[0]
+        latest_points = _collect_reason_points(
+            latest_round_opinions,
+            {"question", "watch", "watchlist", "limit", "hold", "rejected"},
+        )
+        return (latest_points or case.round_2_summary.remaining_disputes or case.round_1_summary.rejected_points or [case.runtime_snapshot.summary])[0]
     return None
 
 
 def derive_final_status(case: DiscussionCaseRecord) -> FinalStatus:
-    latest_round = 2 if round_agent_coverage(case, 2) else 1
+    latest_round = _latest_effective_round(case)
     latest_opinions = _latest_round_opinions(case, latest_round)
     latest_stances = [latest_opinions[agent_id].stance for agent_id in DISCUSSION_AGENT_IDS if agent_id in latest_opinions]
     selected_votes = sum(1 for stance in latest_stances if stance in {"support", "selected"})
@@ -312,6 +322,16 @@ def derive_final_status(case: DiscussionCaseRecord) -> FinalStatus:
     return "watchlist" if case.pool_membership.focus_pool else "rejected"
 
 
+def _latest_effective_round(case: DiscussionCaseRecord) -> int:
+    rounds = sorted({int(opinion.round or 0) for opinion in case.opinions if int(opinion.round or 0) > 0})
+    if not rounds:
+        return 1
+    for round_number in reversed(rounds):
+        if round_agent_coverage(case, round_number):
+            return round_number
+    return rounds[-1]
+
+
 def _summary_item(case: DiscussionCaseRecord) -> dict:
     return {
         "case_id": case.case_id,
@@ -321,7 +341,7 @@ def _summary_item(case: DiscussionCaseRecord) -> dict:
         "selection_score": case.runtime_snapshot.selection_score,
         "risk_gate": case.risk_gate,
         "audit_gate": case.audit_gate,
-        "reason": case.selected_reason or case.rejected_reason or case.runtime_snapshot.summary,
+        "reason": CandidateCaseService.resolve_headline_reason(case),
     }
 
 
@@ -465,4 +485,3 @@ def _is_meaningful_text(value: str | None) -> bool:
     if not text:
         return False
     return text.lower() not in {"test", "todo", "n/a", "na", "none", "null"}
-

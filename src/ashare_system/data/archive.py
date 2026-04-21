@@ -222,13 +222,17 @@ class DataArchiveStore:
         return records
 
     def persist_event_context(self, trade_date: str, payload: dict) -> None:
-        self._write_json(self.layout.features_event_context_root / f"{trade_date}.json", payload)
-        self._write_json(self.layout.serving_root / "latest_event_context.json", payload)
+        normalized_payload = dict(payload)
+        normalized_payload.setdefault("trade_date", trade_date)
+        self._write_json(self.layout.features_event_context_root / f"{trade_date}.json", normalized_payload)
+        self._write_json(self.layout.serving_root / "latest_event_context.json", normalized_payload)
         self.refresh_workspace_context()
 
     def persist_market_context(self, trade_date: str, payload: dict) -> None:
-        self._write_json(self.layout.features_market_context_root / f"{trade_date}.json", payload)
-        self._write_json(self.layout.serving_root / "latest_market_context.json", payload)
+        normalized_payload = dict(payload)
+        normalized_payload.setdefault("trade_date", trade_date)
+        self._write_json(self.layout.features_market_context_root / f"{trade_date}.json", normalized_payload)
+        self._write_json(self.layout.serving_root / "latest_market_context.json", normalized_payload)
         self.refresh_workspace_context()
 
     def persist_discussion_context(self, trade_date: str, payload: dict) -> None:

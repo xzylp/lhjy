@@ -32,12 +32,18 @@ class FeishuNotifier:
         chat_id: str,
         important_chat_id: str = "",
         supervision_chat_id: str = "",
+        bot_role: str = "main",
+        bot_name: str = "",
+        bot_id: str = "",
     ) -> None:
         self.app_id = app_id
         self.app_secret = app_secret
         self.chat_id = chat_id
         self.important_chat_id = important_chat_id
         self.supervision_chat_id = supervision_chat_id
+        self.bot_role = str(bot_role or "main").strip().lower() or "main"
+        self.bot_name = str(bot_name or "").strip()
+        self.bot_id = str(bot_id or "").strip()
         self._enabled = bool(app_id and app_secret and (chat_id or important_chat_id or supervision_chat_id))
         self._token: str = ""
 
@@ -109,8 +115,19 @@ class FeishuNotifier:
             if data.get("code") != 0:
                 logger.warning("飞书推送失败: %s", data.get("msg"))
                 return False
-            logger.info("飞书消息发送成功")
+            logger.info(
+                "飞书消息发送成功: role=%s bot=%s receive_id=%s channel=%s",
+                self.bot_role,
+                self.bot_name or self.bot_id or self.app_id[:10],
+                receive_id,
+                channel,
+            )
             return True
         except Exception as e:
-            logger.warning("飞书推送异常: %s", e)
+            logger.warning(
+                "飞书推送异常: role=%s bot=%s error=%s",
+                self.bot_role,
+                self.bot_name or self.bot_id or self.app_id[:10],
+                e,
+            )
             return False

@@ -10,7 +10,8 @@ from uuid import uuid4
 
 import httpx
 
-from ..contracts import BarSnapshot, QuoteSnapshot
+from ..contracts import BarSnapshot, OrderBookLevel, OrderBookSnapshot, QuoteSnapshot
+from ..data.quality import BarQualityChecker
 from ..infra.filters import get_price_limit_ratio
 from ..settings import AppSettings
 from .filters import filter_a_share, filter_main_board
@@ -19,6 +20,7 @@ from ..logging_config import get_logger
 from .go_client import GoPlatformClient
 
 logger = get_logger("market.adapter")
+bar_quality_checker = BarQualityChecker()
 
 
 class MarketDataAdapter:
@@ -61,6 +63,9 @@ class MarketDataAdapter:
         raise NotImplementedError
 
     def search_symbols(self, query: str, limit: int = 10) -> list[dict[str, str]]:
+        raise NotImplementedError
+
+    def get_order_book_snapshots(self, symbols: list[str]) -> list[OrderBookSnapshot]:
         raise NotImplementedError
 
 
@@ -207,6 +212,39 @@ class MockMarketDataAdapter(MarketDataAdapter):
                     break
         return results
 
+    def get_order_book_snapshots(self, symbols: list[str]) -> list[OrderBookSnapshot]:
+        accepted = filter_a_share(symbols or self.get_main_board_universe())
+        snapshots: list[OrderBookSnapshot] = []
+        for index, symbol in enumerate(accepted):
+            last_price = 10.0 + index
+            captured_at = datetime.now().isoformat()
+            bid_base = 12000 + index * 500
+            ask_base = 9000 + index * 400
+            snapshots.append(
+                OrderBookSnapshot(
+                    symbol=symbol,
+                    name=self.get_symbol_name(symbol),
+                    last_price=last_price,
+                    pre_close=last_price * 0.985,
+                    total_volume=250_000 + index * 5_000,
+                    total_amount=(250_000 + index * 5_000) * last_price,
+                    bids=[
+                        OrderBookLevel(price=round(last_price - step * 0.01, 2), volume=float(bid_base - step * 900))
+                        for step in range(5)
+                    ],
+                    asks=[
+                        OrderBookLevel(price=round(last_price + (step + 1) * 0.01, 2), volume=float(ask_base + step * 600))
+                        for step in range(5)
+                    ],
+                    buy_volume=float(bid_base * 2.2),
+                    sell_volume=float(ask_base * 1.6),
+                    large_buy_volume=float(bid_base * 0.8),
+                    large_sell_volume=float(ask_base * 0.45),
+                    captured_at=captured_at,
+                )
+            )
+        return snapshots
+
 
 class XtQuantMarketDataAdapter(MarketDataAdapter):
     """XtQuant 真实行情适配器"""
@@ -316,7 +354,10 @@ class XtQuantMarketDataAdapter(MarketDataAdapter):
                     trade_time=str(trade_time),
                     pre_close=float(row.get("preClose", 0.0) or 0.0),
                 ))
-        return bars
+        cleaned, alerts = bar_quality_checker.validate_bars(bars)
+        for alert in alerts[:50]:
+            logger.warning("行情质量告警[%s] %s %s %s", alert.issue, alert.symbol, alert.trade_time, alert.detail)
+        return cleaned
 
     def get_main_board_universe(self) -> list[str]:
         return filter_main_board(self.get_a_share_universe())
@@ -353,6 +394,51 @@ class XtQuantMarketDataAdapter(MarketDataAdapter):
             )
             for s in symbols
         ]
+
+    def get_order_book_snapshots(self, symbols: list[str]) -> list[OrderBookSnapshot]:
+        accepted = filter_a_share(symbols or self.get_main_board_universe())
+        if not accepted:
+            return []
+        try:
+            raw = self.xtdata.get_full_tick(accepted)
+        except Exception:
+            raw = {}
+        snapshots: list[OrderBookSnapshot] = []
+        captured_at = datetime.now().isoformat()
+        for symbol in accepted:
+            item = dict(raw.get(symbol) or {})
+            bid_prices = item.get("bidPrice") or []
+            ask_prices = item.get("askPrice") or []
+            bid_volumes = item.get("bidVol") or item.get("bidVolume") or []
+            ask_volumes = item.get("askVol") or item.get("askVolume") or []
+            bids = [
+                OrderBookLevel(price=float(price or 0.0), volume=float((bid_volumes[idx] if idx < len(bid_volumes) else 0.0) or 0.0))
+                for idx, price in enumerate(list(bid_prices)[:5])
+                if float(price or 0.0) > 0
+            ]
+            asks = [
+                OrderBookLevel(price=float(price or 0.0), volume=float((ask_volumes[idx] if idx < len(ask_volumes) else 0.0) or 0.0))
+                for idx, price in enumerate(list(ask_prices)[:5])
+                if float(price or 0.0) > 0
+            ]
+            snapshots.append(
+                OrderBookSnapshot(
+                    symbol=symbol,
+                    name=self.get_symbol_name(symbol),
+                    last_price=float(item.get("lastPrice", 0.0) or 0.0),
+                    pre_close=float(item.get("preClose", 0.0) or 0.0),
+                    total_volume=float(item.get("volume", 0.0) or 0.0),
+                    total_amount=float(item.get("amount", 0.0) or 0.0),
+                    bids=bids,
+                    asks=asks,
+                    buy_volume=float(item.get("bidVolSum", 0.0) or sum(level.volume for level in bids)),
+                    sell_volume=float(item.get("askVolSum", 0.0) or sum(level.volume for level in asks)),
+                    large_buy_volume=float(item.get("bigBuyVolume", 0.0) or 0.0),
+                    large_sell_volume=float(item.get("bigSellVolume", 0.0) or 0.0),
+                    captured_at=captured_at,
+                )
+            )
+        return snapshots
 
     def get_symbol_name(self, symbol: str) -> str:
         cached = self._name_cache.get(symbol)
@@ -740,7 +826,10 @@ class WindowsProxyMarketDataAdapter(MarketDataAdapter):
                         pre_close=self._coerce_float(row.get("preClose") or row.get("lastClose")),
                     )
                 )
-        return result
+        cleaned, alerts = bar_quality_checker.validate_bars(result)
+        for alert in alerts[:50]:
+            logger.warning("行情质量告警[%s] %s %s %s", alert.issue, alert.symbol, alert.trade_time, alert.detail)
+        return cleaned
 
     def get_main_board_universe(self) -> list[str]:
         payload = self._request_json("GET", "/qmt/quote/universe", params={"scope": "main_board"})
@@ -818,6 +907,55 @@ class WindowsProxyMarketDataAdapter(MarketDataAdapter):
             )
             for symbol in accepted
         ]
+
+    def get_order_book_snapshots(self, symbols: list[str]) -> list[OrderBookSnapshot]:
+        accepted = filter_a_share(symbols or self.get_main_board_universe())
+        if not accepted:
+            return []
+        payload = self._request_json("GET", "/qmt/quote/tick", params={"codes": ",".join(accepted)})
+        quote_map = self._extract_symbol_map(payload)
+        captured_at = datetime.now().isoformat()
+        snapshots: list[OrderBookSnapshot] = []
+        for symbol in accepted:
+            item = dict(quote_map.get(symbol) or {})
+            bid_prices = list(item.get("bidPrice") or item.get("bid_price") or [])
+            ask_prices = list(item.get("askPrice") or item.get("ask_price") or [])
+            bid_volumes = list(item.get("bidVol") or item.get("bidVolume") or item.get("bid_volume") or [])
+            ask_volumes = list(item.get("askVol") or item.get("askVolume") or item.get("ask_volume") or [])
+            bids = [
+                OrderBookLevel(
+                    price=self._coerce_float(price),
+                    volume=self._coerce_float(bid_volumes[idx] if idx < len(bid_volumes) else 0.0),
+                )
+                for idx, price in enumerate(bid_prices[:5])
+                if self._coerce_float(price) > 0
+            ]
+            asks = [
+                OrderBookLevel(
+                    price=self._coerce_float(price),
+                    volume=self._coerce_float(ask_volumes[idx] if idx < len(ask_volumes) else 0.0),
+                )
+                for idx, price in enumerate(ask_prices[:5])
+                if self._coerce_float(price) > 0
+            ]
+            snapshots.append(
+                OrderBookSnapshot(
+                    symbol=symbol,
+                    name=str(item.get("name") or item.get("instrument_name") or self._name_cache.get(symbol) or symbol),
+                    last_price=self._coerce_float(item.get("lastPrice") or item.get("last_price")),
+                    pre_close=self._coerce_float(item.get("preClose") or item.get("lastClose") or item.get("pre_close")),
+                    total_volume=self._coerce_float(item.get("volume") or item.get("vol")),
+                    total_amount=self._coerce_float(item.get("amount") or item.get("turnover")),
+                    bids=bids,
+                    asks=asks,
+                    buy_volume=self._coerce_float(item.get("bidVolSum") or item.get("buyVolume") or sum(level.volume for level in bids)),
+                    sell_volume=self._coerce_float(item.get("askVolSum") or item.get("sellVolume") or sum(level.volume for level in asks)),
+                    large_buy_volume=self._coerce_float(item.get("bigBuyVolume") or item.get("largeBuyVolume")),
+                    large_sell_volume=self._coerce_float(item.get("bigSellVolume") or item.get("largeSellVolume")),
+                    captured_at=str(item.get("captured_at") or item.get("time") or captured_at),
+                )
+            )
+        return snapshots
 
     def get_symbol_name(self, symbol: str) -> str:
         cached = self._name_cache.get(symbol)

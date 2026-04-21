@@ -1,6 +1,6 @@
 import React from 'react';
 import { NavLink } from 'react-router-dom';
-import { Activity, Bot, ChartCandlestick, ShieldAlert, SlidersHorizontal } from 'lucide-react';
+import { Activity, Bot, ChartCandlestick, MessageSquareMore, ShieldAlert, SlidersHorizontal } from 'lucide-react';
 import { StatusBadge } from './Common';
 
 const NAV_ITEMS = [
@@ -9,6 +9,7 @@ const NAV_ITEMS = [
   { to: '/dashboard/discussion', icon: Activity, label: '机会池讨论', desc: '候选、证据、去向' },
   { to: '/dashboard/risk', icon: ShieldAlert, label: '风控围栏', desc: '阻断、预算、执行口径' },
   { to: '/dashboard/governance', icon: SlidersHorizontal, label: '调参与治理', desc: '自然语言调参与提案' },
+  { to: '/dashboard/hermes/chat', icon: MessageSquareMore, label: 'Hermes 平台', desc: '通用会话、工具、调度、业务挂载' },
 ];
 
 export const Layout = ({ children }: { children: React.ReactNode }) => {

@@ -55,6 +55,12 @@ class PlaceOrderRequest(BaseModel):
     playbook: str | None = None
     regime: str | None = None
     exit_reason: str | None = None
+    trace_id: str | None = None
+    signal_price: float | None = None
+    signal_time: str | None = None
+    order_type: str = "limit"
+    time_in_force: str = "day"
+    urgency_tag: str | None = None
 
 
 class CancelOrderRequest(BaseModel):
@@ -84,6 +90,7 @@ class ExecutionIntentPacket(BaseModel):
     idempotency_key: str
     live_execution_allowed: bool = False
     offline_only: bool = False
+    trace_id: str | None = None
     status: Literal[
         "approved",
         "claimed",
@@ -143,6 +150,27 @@ class QuoteSnapshot(BaseModel):
     ask_price: float
     volume: float
     pre_close: float = 0.0
+
+
+class OrderBookLevel(BaseModel):
+    price: float
+    volume: float = 0.0
+
+
+class OrderBookSnapshot(BaseModel):
+    symbol: str
+    name: str = ""
+    last_price: float = 0.0
+    pre_close: float = 0.0
+    total_volume: float = 0.0
+    total_amount: float = 0.0
+    bids: list[OrderBookLevel] = Field(default_factory=list)
+    asks: list[OrderBookLevel] = Field(default_factory=list)
+    buy_volume: float = 0.0
+    sell_volume: float = 0.0
+    large_buy_volume: float = 0.0
+    large_sell_volume: float = 0.0
+    captured_at: str = ""
 
 
 class BarSnapshot(BaseModel):

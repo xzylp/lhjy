@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 const api = axios.create({
-  baseURL: import.meta.env.DEV ? '' : '/', // 在生产环境下，API 与前端同源
+  baseURL: import.meta.env.DEV ? '' : '/',
 });
 
 export const fetchReadiness = async () => {
@@ -34,19 +34,61 @@ export const fetchClientBrief = async () => {
   return data;
 };
 
-export const fetchSymbolDetail = async (symbol: string) => {
-  const [research, precheck] = await Promise.all([
-    api.get(`/system/research/summary?symbol=${symbol}`),
-    api.get(`/system/discussions/execution-precheck?symbol=${symbol}`),
-  ]);
-  return {
-    research: research.data,
-    precheck: precheck.data,
-  };
+export const fetchMissionControl = async () => {
+  const { data } = await api.get('/system/dashboard/mission-control');
+  return data;
+};
+
+export const fetchOpportunityFlow = async () => {
+  const { data } = await api.get('/system/dashboard/opportunity-flow');
+  return data;
+};
+
+export const fetchPortfolioEfficiency = async () => {
+  const { data } = await api.get('/system/portfolio/efficiency');
+  return data;
+};
+
+export const fetchParameterConsistency = async () => {
+  const { data } = await api.get('/system/deployment/parameter-consistency');
+  return data;
+};
+
+export const fetchParamProposals = async () => {
+  const { data } = await api.get('/system/params/proposals');
+  return data;
+};
+
+export const fetchAgentScores = async (scoreDate?: string) => {
+  const { data } = await api.get('/system/agent-scores', {
+    params: scoreDate ? { score_date: scoreDate } : undefined,
+  });
+  return data;
+};
+
+export const fetchFeishuBots = async () => {
+  const { data } = await api.get('/system/feishu/bots');
+  return data;
+};
+
+export const fetchSymbolDeskBrief = async (symbol: string) => {
+  const { data } = await api.get(`/system/symbols/${symbol}/desk-brief`);
+  return data;
+};
+
+export const fetchSymbolDetail = async (symbol: string) => fetchSymbolDeskBrief(symbol);
+
+export const previewNaturalLanguageAdjustment = async (instruction: string) => {
+  const { data } = await api.post('/system/adjustments/natural-language', {
+    instruction,
+    apply: false,
+    preview: true,
+    notify: false,
+  });
+  return data;
 };
 
 export const fetchAuditLogs = async (limit = 20) => {
-  // 同时兼容 /system/audit 和 /system/audits
   try {
     const { data } = await api.get(`/system/audit?limit=${limit}`);
     return data;

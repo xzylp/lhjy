@@ -96,7 +96,69 @@ class NotifySettings(BaseModel):
     feishu_control_plane_base_url: str = Field(
         default_factory=lambda: _env("ASHARE_FEISHU_CONTROL_PLANE_BASE_URL", "")
     )
+    feishu_bot_role: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_BOT_ROLE", "main"))
+    feishu_bot_id: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_BOT_ID", ""))
+    feishu_bot_name: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_BOT_NAME", ""))
+    feishu_supervision_app_id: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_SUPERVISION_APP_ID", ""))
+    feishu_supervision_app_secret: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_SUPERVISION_APP_SECRET", ""))
+    feishu_supervision_bot_id: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_SUPERVISION_BOT_ID", ""))
+    feishu_supervision_bot_name: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_SUPERVISION_BOT_NAME", ""))
+    feishu_execution_app_id: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_EXECUTION_APP_ID", ""))
+    feishu_execution_app_secret: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_EXECUTION_APP_SECRET", ""))
+    feishu_execution_bot_id: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_EXECUTION_BOT_ID", ""))
+    feishu_execution_bot_name: str = Field(default_factory=lambda: _env("ASHARE_FEISHU_EXECUTION_BOT_NAME", ""))
     alerts_enabled: bool = Field(default_factory=lambda: _env_bool("ASHARE_ALERTS_ENABLED"))
+
+    def get_feishu_bot_config(self, role: str = "main") -> dict[str, str]:
+        resolved_role = str(role or "main").strip().lower()
+        if resolved_role in {"supervision", "督办", "monitor"}:
+            return {
+                "role": "supervision",
+                "app_id": self.feishu_supervision_app_id,
+                "app_secret": self.feishu_supervision_app_secret,
+                "bot_id": self.feishu_supervision_bot_id,
+                "bot_name": self.feishu_supervision_bot_name or "Hermes督办",
+                "chat_id": self.feishu_supervision_chat_id or self.feishu_chat_id,
+                "important_chat_id": self.feishu_supervision_chat_id or self.feishu_important_chat_id or self.feishu_chat_id,
+                "supervision_chat_id": self.feishu_supervision_chat_id or self.feishu_chat_id,
+            }
+        if resolved_role in {"execution", "回执", "trade"}:
+            return {
+                "role": "execution",
+                "app_id": self.feishu_execution_app_id,
+                "app_secret": self.feishu_execution_app_secret,
+                "bot_id": self.feishu_execution_bot_id,
+                "bot_name": self.feishu_execution_bot_name or "Hermes回执",
+                "chat_id": self.feishu_chat_id,
+                "important_chat_id": self.feishu_important_chat_id or self.feishu_chat_id,
+                "supervision_chat_id": self.feishu_supervision_chat_id or self.feishu_chat_id,
+            }
+        return {
+            "role": "main",
+            "app_id": self.feishu_app_id,
+            "app_secret": self.feishu_app_secret,
+            "bot_id": self.feishu_bot_id,
+            "bot_name": self.feishu_bot_name or "Hermes主控",
+            "chat_id": self.feishu_chat_id,
+            "important_chat_id": self.feishu_important_chat_id or self.feishu_chat_id,
+            "supervision_chat_id": self.feishu_supervision_chat_id or self.feishu_chat_id,
+        }
+
+    def list_feishu_bot_configs(self) -> list[dict[str, str]]:
+        configs = [
+            self.get_feishu_bot_config("main"),
+            self.get_feishu_bot_config("supervision"),
+            self.get_feishu_bot_config("execution"),
+        ]
+        deduped: list[dict[str, str]] = []
+        seen_roles: set[str] = set()
+        for item in configs:
+            role = str(item.get("role") or "").strip()
+            if not role or role in seen_roles:
+                continue
+            seen_roles.add(role)
+            deduped.append(item)
+        return deduped
 
 
 class WindowsGatewaySettings(BaseModel):
@@ -112,6 +174,27 @@ class GoPlatformSettings(BaseModel):
     base_url: str = Field(default_factory=lambda: _env("ASHARE_GO_PLATFORM_BASE_URL", "http://127.0.0.1:18793"))
     timeout_sec: float = Field(default_factory=lambda: _env_float("ASHARE_GO_PLATFORM_TIMEOUT_SEC", 15.0))
     enabled: bool = Field(default_factory=lambda: _env_bool("ASHARE_GO_PLATFORM_ENABLED", False))
+
+
+class HermesSettings(BaseModel):
+    """Hermes 控制台模型与路由配置"""
+
+    default_model: str = Field(default_factory=lambda: _env("ASHARE_HERMES_MODEL_DEFAULT", "MiniMax-M2.7"))
+    fast_model: str = Field(default_factory=lambda: _env("ASHARE_HERMES_MODEL_FAST", "MiniMax-M2.7"))
+    deep_model: str = Field(default_factory=lambda: _env("ASHARE_HERMES_MODEL_DEEP", "gpt-5.4"))
+    execution_guard_model: str = Field(default_factory=lambda: _env("ASHARE_HERMES_MODEL_EXECUTION", "gpt-5.4"))
+    minimax_provider_name: str = Field(default_factory=lambda: _env("ASHARE_HERMES_MINIMAX_PROVIDER_NAME", "MiniMax"))
+    minimax_model: str = Field(default_factory=lambda: _env("ASHARE_HERMES_MINIMAX_MODEL", "MiniMax-M2.7"))
+    minimax_base_url: str = Field(default_factory=lambda: _env("ASHARE_HERMES_MINIMAX_BASE_URL", ""))
+    minimax_api_key: str = Field(default_factory=lambda: _env("ASHARE_HERMES_MINIMAX_API_KEY", ""))
+    compat_provider_name: str = Field(default_factory=lambda: _env("ASHARE_HERMES_COMPAT_PROVIDER_NAME", "Chunfeng"))
+    compat_base_url: str = Field(default_factory=lambda: _env("ASHARE_HERMES_COMPAT_BASE_URL", ""))
+    compat_api_key: str = Field(default_factory=lambda: _env("ASHARE_HERMES_COMPAT_API_KEY", ""))
+    compat_model: str = Field(default_factory=lambda: _env("ASHARE_HERMES_COMPAT_MODEL", "gpt-5.4"))
+    routing_policy: str = Field(default_factory=lambda: _env("ASHARE_HERMES_ROUTING_POLICY", "half_minimax_half_compat"))
+    fast_roles: tuple[str, ...] = ("runtime_scout", "cron_intraday_watch", "cron_position_watch", "execution_operator")
+    deep_roles: tuple[str, ...] = ("event_researcher", "strategy_analyst", "risk_gate", "audit_recorder")
+    escalation_risk_levels: tuple[str, ...] = ("high", "critical")
 
 
 class AppSettings(BaseModel):
@@ -138,10 +221,15 @@ class AppSettings(BaseModel):
     notify: NotifySettings = Field(default_factory=NotifySettings)
     windows_gateway: WindowsGatewaySettings = Field(default_factory=WindowsGatewaySettings)
     go_platform: GoPlatformSettings = Field(default_factory=GoPlatformSettings)
+    hermes: HermesSettings = Field(default_factory=HermesSettings)
 
     # 策略参数
     strategy_name: str = Field(default_factory=lambda: _env("ASHARE_STRATEGY_NAME", "ashare-system-v2"))
     minimum_confidence: float = Field(default_factory=lambda: _env_float("ASHARE_MIN_CONFIDENCE", 0.55))
+
+    @property
+    def control_plane_db_path(self) -> Path:
+        return self.storage_root / "db" / "control_plane.sqlite3"
 
 
 def load_settings() -> AppSettings:

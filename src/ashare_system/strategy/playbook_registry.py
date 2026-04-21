@@ -19,6 +19,9 @@ class PlaybookDefinition(BaseModel):
     version: str = "v1"
     description: str = ""
     market_phases: list[str] = Field(default_factory=list)
+    applicable_regimes: list[str] = Field(default_factory=list)
+    priority_score: float = 0.5
+    probation: bool = False
     params_schema: dict[str, Any] = Field(default_factory=dict)
     evidence_schema: dict[str, Any] = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
@@ -70,6 +73,64 @@ class PlaybookRegistry:
 
     def list_all(self) -> list[PlaybookDefinition]:
         return [item.model_copy() for item in self._playbooks.values()]
+
+    def suggest_playbooks(
+        self,
+        *,
+        market_hypothesis: str = "",
+        market_regime: str = "",
+        limit: int = 6,
+    ) -> list[dict[str, Any]]:
+        text = str(market_hypothesis or "").lower()
+        ranked: list[tuple[float, PlaybookDefinition]] = []
+        for definition in self.list_all():
+            if bool(definition.probation):
+                continue
+            score = float(definition.priority_score or 0.0)
+            if market_regime and market_regime in list(definition.applicable_regimes or []):
+                score += 3.0
+            if any(tag.lower() in text for tag in list(definition.tags or [])):
+                score += 1.5
+            if any(token in text for token in ("龙头", "加速", "主升")) and definition.id in {"leader_chase", "trend_acceleration", "trend_breakout_retest"}:
+                score += 1.5
+            if any(token in text for token in ("防守", "回撤", "低吸")) and definition.id in {"defensive_low_absorb", "oversold_rebound", "position_replacement"}:
+                score += 1.5
+            if score <= 0:
+                continue
+            ranked.append((score, definition))
+        ranked.sort(key=lambda item: (item[0], item[1].priority_score, item[1].id), reverse=True)
+        return [
+            {
+                **definition.model_dump(),
+                "suggestion_score": round(score, 4),
+                "suggested_by_regime": market_regime in list(definition.applicable_regimes or []),
+            }
+            for score, definition in ranked[: max(int(limit or 0), 1)]
+        ]
+
+    def apply_priority_updates(self, updates: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        applied: list[dict[str, Any]] = []
+        for key, definition in list(self._playbooks.items()):
+            update = dict(updates.get(definition.id) or {})
+            if not update:
+                continue
+            next_priority = max(0.0, min(float(update.get("priority_score", definition.priority_score) or definition.priority_score), 1.5))
+            probation = bool(update.get("probation", False))
+            self._playbooks[key] = definition.model_copy(
+                update={
+                    "priority_score": round(next_priority, 4),
+                    "probation": probation,
+                }
+            )
+            applied.append(
+                {
+                    "playbook_id": definition.id,
+                    "priority_score": round(next_priority, 4),
+                    "probation": probation,
+                    "reason": str(update.get("reason") or ""),
+                }
+            )
+        return applied
 
     def evaluate(
         self,
@@ -225,6 +286,41 @@ def _sector_resonance_executor(
         "score": round(score, 4),
         "evidence": [definition.name, "基于热点板块命中与前排程度评估 (简化)"],
     }
+
+
+def _timeframe_resonance_executor(
+    definition: PlaybookDefinition,
+    candidate: dict[str, Any],
+    context: dict[str, Any],
+    market_adapter: Any | None = None,
+    trade_date: str | None = None,
+    precomputed_factors: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    symbol = str(candidate.get("symbol") or "")
+    if not market_adapter or not symbol:
+        return {"score": 0.0, "evidence": [definition.name, "缺少多周期行情数据"]}
+    params = dict(context.get("playbook_params") or {})
+    raw = list(params.get("timeframes") or ["5d", "20d", "60d"])
+    lookbacks: list[int] = []
+    for item in raw:
+        digits = "".join(ch for ch in str(item) if ch.isdigit())
+        if digits:
+            lookbacks.append(max(int(digits), 3))
+    lookbacks = lookbacks or [5, 20, 60]
+    bars = market_adapter.get_bars([symbol], period="1d", count=max(lookbacks) + 2, end_time=trade_date)
+    if len(bars) < max(lookbacks) + 1:
+        return {"score": 0.0, "evidence": [definition.name, "多周期样本不足"]}
+    closes = [bar.close for bar in bars]
+    scores: list[float] = []
+    evidence = [definition.name]
+    for lookback in lookbacks:
+        window = closes[-lookback:]
+        ret = (window[-1] - window[0]) / max(window[0], 1e-9)
+        evidence.append(f"{lookback}日收益={ret:.2%}")
+        scores.append(max(min(ret * 4.0, 1.0), -1.0))
+    positive_count = sum(1 for item in scores if item > 0)
+    score = max(min(sum(scores) / max(len(scores), 1) + positive_count / max(len(scores), 1) * 0.2, 1.0), 0.0)
+    return {"score": round(score, 4), "evidence": evidence[:4]}
 
 
 def _leader_chase_executor(
@@ -433,6 +529,7 @@ def _playbook_seed(
     name: str,
     description: str,
     market_phases: list[str],
+    applicable_regimes: list[str],
     tags: list[str],
 ) -> PlaybookDefinition:
     return PlaybookDefinition(
@@ -441,6 +538,7 @@ def _playbook_seed(
         version="v1",
         description=description,
         market_phases=market_phases,
+        applicable_regimes=applicable_regimes,
         params_schema=_playbook_params_schema(),
         evidence_schema=_playbook_evidence_schema(),
         tags=list(dict.fromkeys(tags)),
@@ -452,29 +550,31 @@ def _playbook_seed(
 
 def bootstrap_playbook_registry() -> None:
     seeds = [
-        _playbook_seed(playbook_id="sector_resonance", name="板块共振", description="围绕热点板块扩散与龙头映射", market_phases=["回暖", "主升"], tags=["sector", "resonance"]),
-        _playbook_seed(playbook_id="trend_acceleration", name="趋势加速", description="围绕趋势延续与突破后的加速", market_phases=["主升"], tags=["trend", "acceleration"]),
-        _playbook_seed(playbook_id="weak_to_strong_intraday", name="盘中弱转强", description="围绕分时转强与量能修复", market_phases=["回暖", "主升"], tags=["intraday", "rotation"]),
-        _playbook_seed(playbook_id="tail_close_ambush", name="尾盘潜伏", description="围绕尾盘承接与隔夜博弈", market_phases=["回暖", "震荡"], tags=["tail", "overnight"]),
-        _playbook_seed(playbook_id="position_replacement", name="持仓替换", description="围绕更优机会替换持仓", market_phases=["回暖", "主升", "震荡"], tags=["position", "replacement"]),
-        _playbook_seed(playbook_id="leader_chase", name="龙头博弈", description="追求极强势标的的连板或主升博弈", market_phases=["主升"], tags=["leader", "high_momentum"]),
-        _playbook_seed(playbook_id="oversold_rebound", name="超跌反抽", description="博弈严重偏离均值后的修复性反弹", market_phases=["普跌", "震荡"], tags=["reversion", "oversold"]),
-        _playbook_seed(playbook_id="index_enhancement", name="指数增强", description="在跟踪基准指数的基础上寻求超额收益", market_phases=["回暖", "主升"], tags=["index", "alpha"]),
-        _playbook_seed(playbook_id="statistical_arbitrage", name="统计套利", description="基于历史相关性博弈配对或组合的均值回归", market_phases=["震荡"], tags=["arbitrage", "reversion"]),
-        _playbook_seed(playbook_id="dragon_returns", name="龙回头", description="前期强势妖股回调至关键位后的反抽博弈", market_phases=["震荡", "回暖"], tags=["short_term", "reversion"]),
-        _playbook_seed(playbook_id="trend_breakout_retest", name="突破回踩再上", description="围绕突破后的回踩确认与二次加速", market_phases=["回暖", "主升"], tags=["trend", "breakout"]),
-        _playbook_seed(playbook_id="sector_rotation_relay", name="板块轮动接力", description="围绕热点板块内部的龙头切换与接力扩散", market_phases=["回暖", "主升"], tags=["sector", "rotation"]),
-        _playbook_seed(playbook_id="news_catalyst_follow", name="事件催化跟随", description="围绕政策、公告、业绩等事件催化的跟随交易", market_phases=["回暖", "主升", "震荡"], tags=["event", "follow"]),
-        _playbook_seed(playbook_id="opening_auction_pilot", name="竞价先手", description="围绕集合竞价强弱和封单质量做盘前先手", market_phases=["竞价", "回暖"], tags=["auction", "opening"]),
-        _playbook_seed(playbook_id="midday_rebound_t", name="午间回转做T", description="围绕已有持仓在午间和午后做回转与降本", market_phases=["震荡", "回暖"], tags=["midday", "t0"]),
-        _playbook_seed(playbook_id="late_session_reclaim", name="尾盘收复", description="围绕尾盘承接转强和次日预期收口", market_phases=["回暖", "震荡"], tags=["tail", "reclaim"]),
-        _playbook_seed(playbook_id="defensive_low_absorb", name="防守型低吸", description="围绕低波低估和承接韧性做防守型低吸", market_phases=["普跌", "震荡"], tags=["defensive", "low_absorb"]),
-        _playbook_seed(playbook_id="position_trim_redeploy", name="减弱换强", description="围绕持仓修剪和换仓再部署做组合优化", market_phases=["主升", "震荡", "尾盘"], tags=["position", "redeploy"]),
-        _playbook_seed(playbook_id="event_driven_reversal", name="事件反转", description="围绕利空落地、澄清公告后的情绪反转博弈", market_phases=["震荡", "普跌", "回暖"], tags=["event", "reversal"]),
-        _playbook_seed(playbook_id="swing_mean_repair", name="波段均值修复", description="围绕趋势票的中继回踩和波段均值修复", market_phases=["回暖", "震荡"], tags=["swing", "repair"]),
+        _playbook_seed(playbook_id="sector_resonance", name="板块共振", description="围绕热点板块扩散与龙头映射", market_phases=["回暖", "主升"], applicable_regimes=["strong_rotation", "sector_breakout"], tags=["sector", "resonance"]),
+        _playbook_seed(playbook_id="trend_acceleration", name="趋势加速", description="围绕趋势延续与突破后的加速", market_phases=["主升"], applicable_regimes=["sector_breakout", "index_rebound"], tags=["trend", "acceleration"]),
+        _playbook_seed(playbook_id="timeframe_resonance", name="周期共振", description="多周期同向共振时放大趋势把握", market_phases=["回暖", "主升"], applicable_regimes=["sector_breakout", "index_rebound"], tags=["timeframe", "resonance"]),
+        _playbook_seed(playbook_id="weak_to_strong_intraday", name="盘中弱转强", description="围绕分时转强与量能修复", market_phases=["回暖", "主升"], applicable_regimes=["strong_rotation", "sector_breakout"], tags=["intraday", "rotation"]),
+        _playbook_seed(playbook_id="tail_close_ambush", name="尾盘潜伏", description="围绕尾盘承接与隔夜博弈", market_phases=["回暖", "震荡"], applicable_regimes=["weak_defense", "panic_sell"], tags=["tail", "overnight"]),
+        _playbook_seed(playbook_id="position_replacement", name="持仓替换", description="围绕更优机会替换持仓", market_phases=["回暖", "主升", "震荡"], applicable_regimes=["weak_defense", "panic_sell", "strong_rotation"], tags=["position", "replacement"]),
+        _playbook_seed(playbook_id="leader_chase", name="龙头博弈", description="追求极强势标的的连板或主升博弈", market_phases=["主升"], applicable_regimes=["sector_breakout", "strong_rotation"], tags=["leader", "high_momentum"]),
+        _playbook_seed(playbook_id="oversold_rebound", name="超跌反抽", description="博弈严重偏离均值后的修复性反弹", market_phases=["普跌", "震荡"], applicable_regimes=["panic_sell", "weak_defense", "index_rebound"], tags=["reversion", "oversold"]),
+        _playbook_seed(playbook_id="index_enhancement", name="指数增强", description="在跟踪基准指数的基础上寻求超额收益", market_phases=["回暖", "主升"], applicable_regimes=["index_rebound"], tags=["index", "alpha"]),
+        _playbook_seed(playbook_id="statistical_arbitrage", name="统计套利", description="基于历史相关性博弈配对或组合的均值回归", market_phases=["震荡"], applicable_regimes=["weak_defense"], tags=["arbitrage", "reversion"]),
+        _playbook_seed(playbook_id="dragon_returns", name="龙回头", description="前期强势妖股回调至关键位后的反抽博弈", market_phases=["震荡", "回暖"], applicable_regimes=["strong_rotation", "index_rebound"], tags=["short_term", "reversion"]),
+        _playbook_seed(playbook_id="trend_breakout_retest", name="突破回踩再上", description="围绕突破后的回踩确认与二次加速", market_phases=["回暖", "主升"], applicable_regimes=["sector_breakout", "index_rebound"], tags=["trend", "breakout"]),
+        _playbook_seed(playbook_id="sector_rotation_relay", name="板块轮动接力", description="围绕热点板块内部的龙头切换与接力扩散", market_phases=["回暖", "主升"], applicable_regimes=["strong_rotation"], tags=["sector", "rotation"]),
+        _playbook_seed(playbook_id="news_catalyst_follow", name="事件催化跟随", description="围绕政策、公告、业绩等事件催化的跟随交易", market_phases=["回暖", "主升", "震荡"], applicable_regimes=["sector_breakout", "strong_rotation", "index_rebound"], tags=["event", "follow"]),
+        _playbook_seed(playbook_id="opening_auction_pilot", name="竞价先手", description="围绕集合竞价强弱和封单质量做盘前先手", market_phases=["竞价", "回暖"], applicable_regimes=["strong_rotation", "sector_breakout"], tags=["auction", "opening"]),
+        _playbook_seed(playbook_id="midday_rebound_t", name="午间回转做T", description="围绕已有持仓在午间和午后做回转与降本", market_phases=["震荡", "回暖"], applicable_regimes=["index_rebound", "weak_defense"], tags=["midday", "t0"]),
+        _playbook_seed(playbook_id="late_session_reclaim", name="尾盘收复", description="围绕尾盘承接转强和次日预期收口", market_phases=["回暖", "震荡"], applicable_regimes=["index_rebound", "weak_defense"], tags=["tail", "reclaim"]),
+        _playbook_seed(playbook_id="defensive_low_absorb", name="防守型低吸", description="围绕低波低估和承接韧性做防守型低吸", market_phases=["普跌", "震荡"], applicable_regimes=["weak_defense", "panic_sell"], tags=["defensive", "low_absorb"]),
+        _playbook_seed(playbook_id="position_trim_redeploy", name="减弱换强", description="围绕持仓修剪和换仓再部署做组合优化", market_phases=["主升", "震荡", "尾盘"], applicable_regimes=["strong_rotation", "weak_defense"], tags=["position", "redeploy"]),
+        _playbook_seed(playbook_id="event_driven_reversal", name="事件反转", description="围绕利空落地、澄清公告后的情绪反转博弈", market_phases=["震荡", "普跌", "回暖"], applicable_regimes=["panic_sell", "index_rebound"], tags=["event", "reversal"]),
+        _playbook_seed(playbook_id="swing_mean_repair", name="波段均值修复", description="围绕趋势票的中继回踩和波段均值修复", market_phases=["回暖", "震荡"], applicable_regimes=["index_rebound", "weak_defense"], tags=["swing", "repair"]),
     ]
     executors = {
         "sector_resonance": _sector_resonance_executor,
+        "timeframe_resonance": _timeframe_resonance_executor,
         "trend_acceleration": _simple_playbook_executor(
             lambda candidate, _context: _clamp(
                 (

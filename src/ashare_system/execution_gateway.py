@@ -2,19 +2,42 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 from .contracts import ExecutionIntentPacket
 from .infra.audit_store import StateStore
 
 EXECUTION_GATEWAY_PENDING_PATH = "/system/execution/gateway/intents/pending"
+TERMINAL_INTENT_STATUSES = {"filled", "canceled", "rejected", "failed", "expired"}
+INTENT_TRANSITIONS: dict[str, set[str]] = {
+    "approved": {"claimed", "expired"},
+    "claimed": {"submitted", "partial_filled", "filled", "canceled", "rejected", "failed", "expired"},
+    "submitted": {"partial_filled", "filled", "canceled", "rejected", "failed", "expired"},
+    "partial_filled": {"filled", "canceled", "failed", "expired"},
+    "filled": set(),
+    "canceled": set(),
+    "rejected": set(),
+    "failed": set(),
+    "expired": set(),
+}
+ORDER_STATUS_TO_INTENT_STATUS = {
+    "PENDING": "submitted",
+    "ACCEPTED": "submitted",
+    "PARTIAL_FILLED": "partial_filled",
+    "FILLED": "filled",
+    "CANCEL_REQUESTED": "submitted",
+    "CANCELLED": "canceled",
+    "REJECTED": "rejected",
+    "UNKNOWN": "submitted",
+}
 
 
 def resolve_execution_gateway_state_store(
     primary: StateStore | None,
     fallback: StateStore | None = None,
 ) -> StateStore | None:
+    """优先使用独立 execution_gateway_state，再回退旧状态文件。"""
     return primary or fallback
 
 
@@ -78,6 +101,7 @@ def build_execution_gateway_intent_packet(
         ),
         live_execution_allowed=bool(intent.get("live_execution_allowed", False)),
         offline_only=bool(intent.get("offline_only", False)),
+        trace_id=str(intent.get("trace_id") or request_payload.get("trace_id") or "").strip() or None,
         status=str(intent.get("status") or "approved"),
         request=request_payload,
         strategy_context=strategy_context,
@@ -155,6 +179,206 @@ def append_execution_intent_history(state_store: StateStore | None, item: dict[s
     history = get_execution_intent_history(state_store)
     history.append(_sanitize_mapping(item))
     state_store.set("execution_intent_history", history[-200:])
+
+
+def get_execution_gateway_receipt_history(state_store: StateStore | None) -> list[dict[str, Any]]:
+    if not state_store:
+        return []
+    history = state_store.get("execution_gateway_receipt_history", [])
+    if not isinstance(history, list):
+        return []
+    return [_sanitize_mapping(item) for item in history if isinstance(item, dict)]
+
+
+def append_execution_gateway_receipt(state_store: StateStore | None, receipt: Mapping[str, Any]) -> dict[str, Any]:
+    if not state_store:
+        return {}
+    sanitized = _sanitize_mapping(receipt)
+    history = get_execution_gateway_receipt_history(state_store)
+    history.append(sanitized)
+    state_store.set("latest_execution_gateway_receipt", sanitized)
+    state_store.set("execution_gateway_receipt_history", history[-500:])
+    return sanitized
+
+
+def get_receipt_audit_trail(state_store: StateStore | None) -> list[dict[str, Any]]:
+    if not state_store:
+        return []
+    items = state_store.get("receipt_audit_trail", [])
+    if not isinstance(items, list):
+        return []
+    return [_sanitize_mapping(item) for item in items if isinstance(item, dict)]
+
+
+def append_receipt_audit_event(
+    state_store: StateStore | None,
+    *,
+    intent_id: str,
+    previous_status: str,
+    next_status: str,
+    reason: str,
+    reported_at: str | None = None,
+    receipt_id: str | None = None,
+    broker_order_id: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not state_store:
+        return {}
+    event = {
+        "intent_id": str(intent_id or "").strip(),
+        "previous_status": str(previous_status or "").strip(),
+        "next_status": str(next_status or "").strip(),
+        "reason": str(reason or "").strip(),
+        "reported_at": str(reported_at or datetime.now().isoformat()),
+        "receipt_id": str(receipt_id or "").strip(),
+        "broker_order_id": str(broker_order_id or "").strip(),
+        "metadata": _sanitize_mapping(metadata),
+    }
+    history = get_receipt_audit_trail(state_store)
+    history.append(event)
+    state_store.set("receipt_audit_trail", history[-1000:])
+    return event
+
+
+def transition_execution_intent(
+    state_store: StateStore | None,
+    intent: Mapping[str, Any],
+    next_status: str,
+    *,
+    reason: str,
+    receipt: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized = _sanitize_mapping(intent)
+    current_status = str(normalized.get("status") or "approved").strip().lower() or "approved"
+    target_status = str(next_status or current_status).strip().lower() or current_status
+    if target_status == current_status:
+        return normalized
+    allowed = INTENT_TRANSITIONS.get(current_status, set())
+    if target_status not in allowed:
+        raise ValueError(f"invalid execution intent transition: {current_status} -> {target_status}")
+    updated = dict(normalized)
+    updated["status"] = target_status
+    if receipt:
+        sanitized_receipt = _sanitize_mapping(receipt)
+        updated["latest_receipt"] = sanitized_receipt
+        updated["latest_receipt_id"] = str(sanitized_receipt.get("receipt_id") or "")
+        updated["latest_gateway_source_id"] = str(sanitized_receipt.get("gateway_source_id") or "")
+        updated["latest_reported_at"] = str(
+            sanitized_receipt.get("reported_at")
+            or sanitized_receipt.get("submitted_at")
+            or datetime.now().isoformat()
+        )
+        broker_order_id = str(
+            sanitized_receipt.get("broker_order_id")
+            or ((sanitized_receipt.get("order") or {}).get("order_id"))
+            or ""
+        ).strip()
+        if broker_order_id:
+            updated["broker_order_id"] = broker_order_id
+    append_receipt_audit_event(
+        state_store,
+        intent_id=str(updated.get("intent_id") or ""),
+        previous_status=current_status,
+        next_status=target_status,
+        reason=reason,
+        reported_at=str(updated.get("latest_reported_at") or datetime.now().isoformat()),
+        receipt_id=str(updated.get("latest_receipt_id") or ""),
+        broker_order_id=str(updated.get("broker_order_id") or ""),
+        metadata=metadata,
+    )
+    return _sanitize_mapping(updated)
+
+
+def map_order_status_to_intent_status(order_status: Any) -> str:
+    return ORDER_STATUS_TO_INTENT_STATUS.get(str(order_status or "").strip().upper(), "submitted")
+
+
+def retry_stale_claimed_intents(
+    state_store: StateStore | None,
+    *,
+    now: datetime | None = None,
+    stale_after_seconds: int = 300,
+) -> dict[str, Any]:
+    if not state_store:
+        return {"checked_count": 0, "retry_count": 0, "items": []}
+    current_time = now or datetime.now()
+    pending = get_pending_execution_intents(state_store)
+    checked_count = 0
+    retry_items: list[dict[str, Any]] = []
+    mutated = False
+    for index, item in enumerate(pending):
+        if str(item.get("status") or "").strip().lower() != "claimed":
+            continue
+        checked_count += 1
+        claim = dict(item.get("claim") or {})
+        claimed_at_text = str(claim.get("claimed_at") or item.get("latest_reported_at") or "").strip()
+        claimed_at = _parse_iso_datetime(claimed_at_text)
+        if claimed_at is None:
+            continue
+        normalized_now, normalized_claimed = _normalize_datetime_pair(current_time, claimed_at)
+        if normalized_now - normalized_claimed < timedelta(seconds=max(int(stale_after_seconds), 1)):
+            continue
+        reset_item = dict(item)
+        previous_status = str(reset_item.get("status") or "claimed")
+        reset_item["status"] = "approved"
+        reset_item["claim_retry_count"] = int(reset_item.get("claim_retry_count", 0) or 0) + 1
+        reset_item["claim_retry_at"] = current_time.isoformat()
+        reset_item["claim_retry_reason"] = f"claimed_stale>{stale_after_seconds}s"
+        reset_item["claim"] = {}
+        append_receipt_audit_event(
+            state_store,
+            intent_id=str(reset_item.get("intent_id") or ""),
+            previous_status=previous_status,
+            next_status="approved",
+            reason="claimed_intent_retry",
+            reported_at=current_time.isoformat(),
+            metadata={
+                "stale_after_seconds": stale_after_seconds,
+                "claimed_at": claimed_at_text,
+                "claim_retry_count": reset_item["claim_retry_count"],
+            },
+        )
+        pending[index] = _sanitize_mapping(reset_item)
+        retry_items.append(
+            {
+                "intent_id": reset_item.get("intent_id"),
+                "claimed_at": claimed_at_text,
+                "retry_count": reset_item["claim_retry_count"],
+            }
+        )
+        mutated = True
+    if mutated:
+        save_pending_execution_intents(state_store, pending)
+        for item in retry_items:
+            matched = next(
+                (candidate for candidate in pending if str(candidate.get("intent_id") or "") == str(item.get("intent_id") or "")),
+                None,
+            )
+            if matched:
+                append_execution_intent_history(state_store, matched)
+    return {
+        "checked_count": checked_count,
+        "retry_count": len(retry_items),
+        "items": retry_items,
+    }
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _normalize_datetime_pair(left: datetime, right: datetime) -> tuple[datetime, datetime]:
+    if (left.tzinfo is None) == (right.tzinfo is None):
+        return left, right
+    if left.tzinfo is not None:
+        return left.replace(tzinfo=None), right
+    return left, right.replace(tzinfo=None)
 
 
 def _sanitize_mapping(value: Any) -> dict[str, Any]:

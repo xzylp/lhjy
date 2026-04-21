@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Any
+
+import httpx
 
 from .contracts import FreshnessMeta, StalenessLevel
 
@@ -98,3 +101,118 @@ def tag_freshness(fetched_at: str | None, now: datetime | None = None) -> str:
         return "DELAYED"
     return "STALE"
 
+
+class DataFreshnessMonitor:
+    def __init__(self, market_adapter: Any, now_factory=None) -> None:
+        self._market_adapter = market_adapter
+        self._now_factory = now_factory or datetime.now
+
+    @staticmethod
+    def _expected_latest_daily_trade_date(now: datetime) -> datetime.date:
+        current_date = now.date()
+        if now.weekday() >= 5:
+            days_back = now.weekday() - 4
+            return (now - timedelta(days=days_back)).date()
+        current_minutes = now.hour * 60 + now.minute
+        if current_minutes < 15 * 60:
+            days_back = 1
+            expected = now - timedelta(days=days_back)
+            while expected.weekday() >= 5:
+                days_back += 1
+                expected = now - timedelta(days=days_back)
+            return expected.date()
+        return current_date
+
+    def check_gateway_health(self) -> dict[str, Any]:
+        base_url = str(getattr(self._market_adapter, "_base_url", "") or "").strip()
+        if not base_url:
+            return {
+                "available": True,
+                "status": "not_applicable",
+                "adapter_type": self._market_adapter.__class__.__name__,
+                "latency_ms": None,
+            }
+        started_at = datetime.now()
+        try:
+            with httpx.Client(timeout=3.0, trust_env=False) as client:
+                response = client.get(f"{base_url}/health")
+            latency_ms = max(int((datetime.now() - started_at).total_seconds() * 1000), 0)
+            return {
+                "available": True,
+                "status": "healthy" if response.status_code < 400 else "degraded",
+                "status_code": response.status_code,
+                "latency_ms": latency_ms,
+                "base_url": base_url,
+            }
+        except Exception as exc:
+            return {
+                "available": False,
+                "status": "unreachable",
+                "latency_ms": None,
+                "base_url": base_url,
+                "error": str(exc),
+            }
+
+    def check_kline_freshness(self, symbols: list[str]) -> dict[str, Any]:
+        resolved_symbols = [str(item).strip() for item in list(symbols or []) if str(item).strip()]
+        try:
+            if not resolved_symbols:
+                resolved_symbols = list((self._market_adapter.get_main_board_universe() or [])[:5])
+        except Exception as exc:
+            return {
+                "available": False,
+                "sample_symbol_count": 0,
+                "bar_count": 0,
+                "latest_trade_time": "",
+                "lag_hours": None,
+                "status": "degraded",
+                "error": str(exc),
+            }
+        try:
+            bars = list(self._market_adapter.get_bars(resolved_symbols[:5], period="1d", count=1) or [])
+        except Exception as exc:
+            return {
+                "available": False,
+                "sample_symbol_count": len(resolved_symbols[:5]),
+                "bar_count": 0,
+                "latest_trade_time": "",
+                "lag_hours": None,
+                "status": "degraded",
+                "error": str(exc),
+            }
+        latest_time = max((str(item.trade_time) for item in bars if str(item.trade_time).strip()), default="")
+        parsed = parse_dt(latest_time)
+        lag_hours = None
+        stale = True
+        expected_trade_date = None
+        if parsed is not None:
+            now = self._now_factory()
+            if parsed.tzinfo is None:
+                current = now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now
+            else:
+                current = now.astimezone(parsed.tzinfo) if getattr(now, "tzinfo", None) else now.replace(tzinfo=parsed.tzinfo)
+            lag_hours = round(max((current - parsed).total_seconds(), 0.0) / 3600.0, 4)
+            expected_trade_date = self._expected_latest_daily_trade_date(current).isoformat()
+            stale = parsed.date() < self._expected_latest_daily_trade_date(current)
+        return {
+            "available": bool(bars),
+            "sample_symbol_count": len(resolved_symbols[:5]),
+            "bar_count": len(bars),
+            "latest_trade_time": latest_time,
+            "lag_hours": lag_hours,
+            "expected_trade_date": expected_trade_date,
+            "status": "stale" if stale else "fresh",
+        }
+
+    def check_universe_coverage(self) -> dict[str, Any]:
+        try:
+            universe = list(self._market_adapter.get_a_share_universe() or [])
+        except Exception as exc:
+            return {"available": False, "status": "degraded", "count": 0, "error": str(exc)}
+        count = len(universe)
+        return {
+            "available": True,
+            "status": "healthy" if count > 3000 else "degraded",
+            "count": count,
+            "expected_threshold": 3000,
+        }

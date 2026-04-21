@@ -18,10 +18,18 @@ class _ImmediateThread:
 
 class _ReplySender:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, str]] = []
 
     def send_text(self, text: str, *, channel: str = "default", receive_id: str = "") -> bool:
-        self.calls.append((text, receive_id))
+        self.calls.append(("text", text, receive_id))
+        return True
+
+    def send_card(self, card: dict, *, receive_id: str = "") -> bool:
+        self.calls.append(("card", str(card.get("header") or ""), receive_id))
+        return True
+
+    def send_markdown(self, title: str, markdown: str, *, receive_id: str = "") -> bool:
+        self.calls.append(("markdown", f"{title}\n{markdown}", receive_id))
         return True
 
 
@@ -38,12 +46,20 @@ class FeishuLongConnectionTests(unittest.TestCase):
             bridge = FeishuLongConnectionBridge(
                 "http://127.0.0.1:8100",
                 StateStore(Path(tmp_dir) / "feishu_longconn_state.json"),
+                bot_role="execution",
+                bot_name="Hermes回执",
+                bot_id="bot-exec-1",
             )
             payload = bridge.handle_message_event({"header": {"event_type": "im.message.receive_v1"}})
 
             self.assertTrue(payload["queued"])
             mock_post.assert_called_once()
             self.assertIn("/system/feishu/events", mock_post.call_args.args[0])
+            forwarded = mock_post.call_args.kwargs["json"]
+            self.assertEqual(forwarded["__receiver_bot_role"], "execution")
+            self.assertEqual(forwarded["__receiver_bot_name"], "Hermes回执")
+            self.assertEqual(forwarded["__receiver_bot_id"], "bot-exec-1")
+            self.assertEqual(forwarded["__receiver_bot_app_id"], "")
 
     @patch("ashare_system.feishu_longconn.threading.Thread", _ImmediateThread)
     @patch("ashare_system.feishu_longconn.httpx.post")
@@ -71,8 +87,32 @@ class FeishuLongConnectionTests(unittest.TestCase):
 
             self.assertEqual(
                 reply_sender.calls,
-                [("这是程序内部的交易主线流程入口。\n核心阶段：盘前预热、盘中发现。", "oc_test_chat")],
+                [("text", "这是程序内部的交易主线流程入口。\n核心阶段：盘前预热、盘中发现。", "oc_test_chat")],
             )
+
+    def test_send_reply_prefers_text_when_reply_mode_is_text(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            reply_sender = _ReplySender()
+            bridge = FeishuLongConnectionBridge(
+                "http://127.0.0.1:8100",
+                StateStore(Path(tmp_dir) / "feishu_longconn_state.json"),
+                reply_sender=reply_sender,
+            )
+
+            bridge._send_reply_if_needed(
+                {
+                    "reply_to_chat_id": "oc_test_chat",
+                    "reply_mode": "text",
+                    "reply_lines": ["闲聊默认直接文字回复。"],
+                    "reply_card": {
+                        "card": {
+                            "header": {"title": {"content": "不该发送"}},
+                        }
+                    },
+                }
+            )
+
+            self.assertEqual(reply_sender.calls, [("text", "闲聊默认直接文字回复。", "oc_test_chat")])
 
     @patch("ashare_system.feishu_longconn.httpx.post")
     def test_url_preview_is_forwarded_and_returns_inline(self, mock_post) -> None:

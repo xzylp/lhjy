@@ -29,6 +29,11 @@ class BacktestMetrics:
     calmar_ratio: float = 0.0
     win_rate: float = 0.0
     profit_loss_ratio: float = 0.0
+    benchmark_return: float = 0.0
+    portfolio_beta: float = 0.0
+    alpha: float = 0.0
+    tracking_error: float = 0.0
+    information_ratio: float = 0.0
     total_trades: int = 0
     winning_trades: int = 0
     losing_trades: int = 0
@@ -40,6 +45,7 @@ class BacktestMetrics:
     avg_return_by_regime: list[dict] = field(default_factory=list)
     exit_reason_distribution: list[dict] = field(default_factory=list)
     calmar_by_playbook: list[dict] = field(default_factory=list)
+    active_return_attribution: list[dict] = field(default_factory=list)
     self_improvement_inputs: dict = field(default_factory=dict)
     export_payload: dict = field(default_factory=dict)
 
@@ -59,7 +65,14 @@ class MetricsCalculator:
     TRADING_DAYS = 252
     RISK_FREE_RATE = 0.02  # 年化无风险利率
 
-    def calc(self, equity_curve: pd.Series, trades: list[dict]) -> BacktestMetrics:
+    def calc(
+        self,
+        equity_curve: pd.Series,
+        trades: list[dict],
+        *,
+        benchmark_curve: pd.Series | None = None,
+        sector_map: dict[str, str] | None = None,
+    ) -> BacktestMetrics:
         trade_results = [self._trade_result_value(item) for item in trades]
         wins = [value for value in trade_results if value > 0]
         losses = [value for value in trade_results if value <= 0]
@@ -81,6 +94,11 @@ class MetricsCalculator:
         sharpe = 0.0
         max_dd = 0.0
         calmar = 0.0
+        benchmark_return = 0.0
+        portfolio_beta = 0.0
+        alpha = 0.0
+        tracking_error = 0.0
+        information_ratio = 0.0
         win_rate = len(wins) / len(trades) if trades else 0.0
         avg_win = np.mean(wins) if wins else 0.0
         avg_loss = abs(np.mean(losses)) if losses else 1e-9
@@ -105,6 +123,29 @@ class MetricsCalculator:
             # 卡尔玛比率
             calmar = annual_return / abs(max_dd) if max_dd != 0 else 0.0
 
+            if benchmark_curve is not None and not benchmark_curve.empty:
+                benchmark = benchmark_curve.copy()
+                benchmark.index = pd.to_datetime(benchmark.index)
+                eq = equity_curve.copy()
+                eq.index = pd.to_datetime(eq.index)
+                aligned = pd.concat(
+                    [
+                        eq.pct_change().rename("portfolio"),
+                        benchmark.pct_change().rename("benchmark"),
+                    ],
+                    axis=1,
+                ).dropna()
+                if not aligned.empty:
+                    benchmark_return = float(benchmark.iloc[-1] / benchmark.iloc[0] - 1.0) if len(benchmark) >= 2 else 0.0
+                    benchmark_var = float(aligned["benchmark"].var() or 0.0)
+                    portfolio_beta = float(aligned["portfolio"].cov(aligned["benchmark"]) / benchmark_var) if benchmark_var > 0 else 0.0
+                    alpha = total_return - portfolio_beta * benchmark_return
+                    active_return = aligned["portfolio"] - aligned["benchmark"]
+                    tracking_error = float(active_return.std() * np.sqrt(self.TRADING_DAYS)) if float(active_return.std() or 0.0) > 0 else 0.0
+                    information_ratio = float(active_return.mean() / active_return.std() * np.sqrt(self.TRADING_DAYS)) if float(active_return.std() or 0.0) > 0 else 0.0
+
+        active_return_attribution = self._build_active_return_attribution(trades, sector_map or {}, benchmark_return)
+
         export_payload = {
             "metrics_scope": "offline_backtest_metrics",
             "semantics_note": OFFLINE_BACKTEST_METRICS_NOTE,
@@ -118,11 +159,17 @@ class MetricsCalculator:
                 "sharpe_ratio": round(float(sharpe), 6),
                 "max_drawdown": round(float(max_dd), 6),
                 "calmar_ratio": round(float(calmar), 6),
+                "benchmark_return": round(float(benchmark_return), 6),
+                "portfolio_beta": round(float(portfolio_beta), 6),
+                "alpha": round(float(alpha), 6),
+                "tracking_error": round(float(tracking_error), 6),
+                "information_ratio": round(float(information_ratio), 6),
             },
             "self_improvement_inputs": self_improvement_inputs,
             "by_playbook": by_playbook_metrics,
             "by_regime": by_regime_metrics,
             "by_exit_reason": by_exit_reason_metrics,
+            "active_return_attribution": active_return_attribution,
         }
 
         return BacktestMetrics(
@@ -133,6 +180,11 @@ class MetricsCalculator:
             calmar_ratio=calmar,
             win_rate=win_rate,
             profit_loss_ratio=pl_ratio,
+            benchmark_return=benchmark_return,
+            portfolio_beta=portfolio_beta,
+            alpha=alpha,
+            tracking_error=tracking_error,
+            information_ratio=information_ratio,
             total_trades=len(trades),
             winning_trades=len(wins),
             losing_trades=len(losses),
@@ -143,9 +195,35 @@ class MetricsCalculator:
             avg_return_by_regime=avg_return_by_regime,
             exit_reason_distribution=exit_reason_distribution,
             calmar_by_playbook=calmar_by_playbook,
+            active_return_attribution=active_return_attribution,
             self_improvement_inputs=self_improvement_inputs,
             export_payload=export_payload,
         )
+
+    @staticmethod
+    def _build_active_return_attribution(
+        trades: list[dict],
+        sector_map: dict[str, str],
+        benchmark_return: float,
+    ) -> list[dict]:
+        grouped: dict[str, list[float]] = {}
+        for item in trades:
+            symbol = str(item.get("symbol") or "")
+            sector = str(item.get("sector") or sector_map.get(symbol) or "unknown")
+            grouped.setdefault(sector, []).append(float(item.get("return_pct", item.get("pnl", 0.0)) or 0.0))
+        results: list[dict] = []
+        for sector, values in grouped.items():
+            avg_return = sum(values) / max(len(values), 1)
+            results.append(
+                {
+                    "sector": sector,
+                    "trade_count": len(values),
+                    "avg_return_pct": round(avg_return, 6),
+                    "active_return_pct": round(avg_return - benchmark_return, 6),
+                }
+            )
+        results.sort(key=lambda item: (-item["active_return_pct"], -item["trade_count"], item["sector"]))
+        return results
 
     def _build_dimension_metrics(
         self,

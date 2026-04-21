@@ -639,6 +639,13 @@ class MonitorExecutionBridgeHealthRecord(BaseModel):
     payload: dict = Field(default_factory=dict)
 
 
+class MonitorPositionWatchRecord(BaseModel):
+    watch_id: str
+    generated_at: str
+    trigger: str
+    payload: dict = Field(default_factory=dict)
+
+
 class MonitorStateService:
     """盯盘心跳与事件持久化服务。"""
 
@@ -735,6 +742,8 @@ class MonitorStateService:
         pool_snapshot_history = self._state_store.get("pool_snapshot_history", [])
         latest_exit_snapshot = self._state_store.get("latest_exit_snapshot")
         exit_snapshot_history = self._state_store.get("exit_snapshot_history", [])
+        latest_position_watch_snapshot = self._state_store.get("latest_position_watch_snapshot")
+        position_watch_history = self._state_store.get("position_watch_history", [])
         execution_bridge_health_history = self._state_store.get("execution_bridge_health_history", [])
         freshness = self.get_heartbeat_freshness()
         return {
@@ -745,6 +754,8 @@ class MonitorStateService:
             "latest_exit_snapshot": latest_exit_snapshot,
             "exit_snapshot_history": exit_snapshot_history[-20:],
             "exit_snapshot_trend_summary": self.get_exit_snapshot_trend_summary(),
+            "latest_position_watch_snapshot": latest_position_watch_snapshot,
+            "position_watch_history": position_watch_history[-20:],
             "latest_execution_bridge_health": self.get_latest_execution_bridge_health(),
             "execution_bridge_health_history": execution_bridge_health_history[-20:],
             "execution_bridge_health_trend_summary": self.get_execution_bridge_health_trend_summary(),
@@ -797,6 +808,51 @@ class MonitorStateService:
         self._state_store.set("latest_exit_snapshot", latest_payload)
         self._state_store.set("exit_snapshot_history", history[-200:])
         self._persist_monitor_context()
+        return latest_payload
+
+    def get_latest_position_watch_snapshot(self) -> dict:
+        latest = self._state_store.get("latest_position_watch_snapshot") or {}
+        return {
+            "watch_id": str(latest.get("watch_id") or ""),
+            "generated_at": str(latest.get("generated_at") or ""),
+            "trigger": str(latest.get("trigger") or ""),
+            "payload": dict(latest.get("payload") or {}),
+        }
+
+    def save_position_watch_snapshot(self, snapshot: dict, trigger: str = "position_watch") -> dict:
+        now = self._now_factory()
+        normalized_snapshot = dict(snapshot or {})
+        record = MonitorPositionWatchRecord(
+            watch_id=f"position-watch-{now.strftime('%Y%m%d%H%M%S')}",
+            generated_at=now.isoformat(),
+            trigger=trigger,
+            payload=normalized_snapshot,
+        )
+        latest_payload = {
+            "watch_id": record.watch_id,
+            "generated_at": record.generated_at,
+            "trigger": record.trigger,
+            "payload": record.payload,
+        }
+        history = self._state_store.get("position_watch_history", [])
+        history.append(
+            {
+                "watch_id": record.watch_id,
+                "generated_at": record.generated_at,
+                "trigger": record.trigger,
+                "trade_date": str(record.payload.get("trade_date") or ""),
+                "mode": str(record.payload.get("mode") or ""),
+                "position_count": int(record.payload.get("position_count", 0) or 0),
+                "sell_signal_count": int(record.payload.get("sell_signal_count", 0) or 0),
+                "day_trading_signal_count": int(record.payload.get("day_trading_signal_count", 0) or 0),
+                "submitted_count": int(record.payload.get("submitted_count", 0) or 0),
+                "queued_count": int(record.payload.get("queued_count", 0) or 0),
+                "preview_count": int(record.payload.get("preview_count", 0) or 0),
+            }
+        )
+        self._state_store.set("latest_position_watch_snapshot", latest_payload)
+        self._state_store.set("position_watch_history", history[-720:])
+        self._persist_monitor_context(trade_date=str(record.payload.get("trade_date") or "") or None)
         return latest_payload
 
     def get_exit_snapshot_trend_summary(self, recent_limit: int = 20) -> dict:
@@ -1560,6 +1616,8 @@ class MonitorStateService:
             "latest_exit_snapshot": state.get("latest_exit_snapshot"),
             "exit_snapshot_history": state.get("exit_snapshot_history", []),
             "exit_snapshot_trend_summary": state.get("exit_snapshot_trend_summary", {}),
+            "latest_position_watch_snapshot": state.get("latest_position_watch_snapshot"),
+            "position_watch_history": state.get("position_watch_history", []),
             "latest_execution_bridge_health": state.get("latest_execution_bridge_health"),
             "execution_bridge_health_history": state.get("execution_bridge_health_history", []),
             "execution_bridge_health_trend_summary": state.get("execution_bridge_health_trend_summary", {}),

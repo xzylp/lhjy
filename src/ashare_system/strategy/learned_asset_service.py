@@ -488,15 +488,24 @@ class LearnedAssetService:
             return []
         
         discovered_ids = []
-        # 寻找表现优异的战法 (R0.5 逻辑: 胜率 > 70% 且样本数 >= 2)
+        # 寻找表现优异的战法 (样本量保护后再自动发现)
         for bucket in getattr(report, "by_playbook", []):
-            if bucket.trade_count >= 2 and bucket.win_rate >= 0.7:
+            if (
+                bucket.trade_count >= 5
+                and bucket.win_rate >= 0.7
+                and float(getattr(bucket, "avg_next_day_close_pct", 0.0) or 0.0) > 0.005
+            ):
                 asset_id = f"auto-boost-{trade_date}-{bucket.key}"
                 if self._repository.get(asset_id) is None:
                     content = {
                         "playbook_weights": {bucket.key: 0.2}, # 给予 20% 的权重增益
                         "score_bonus": 1.0,
                         "context_note": f"自动从 {trade_date} 归因中提取，{bucket.key} 表现优异(胜率{bucket.win_rate:.0%})",
+                        "discovery_stats": {
+                            "win_rate": round(float(bucket.win_rate or 0.0), 4),
+                            "sample_count": int(bucket.trade_count or 0),
+                            "avg_return": round(float(getattr(bucket, "avg_next_day_close_pct", 0.0) or 0.0), 6),
+                        },
                     }
                     entry = self._repository.submit_learned_entry(
                         asset_id=asset_id,
@@ -546,7 +555,7 @@ class LearnedAssetService:
                 ]
                 # 过滤空回测
                 valid_bt = [m for m in asset_evals if m.get("win_rate") is not None]
-                if valid_bt and valid_bt[0].get("win_rate", 0) > 0.6:
+                if valid_bt and valid_bt[0].get("win_rate", 0) > 0.65 and int(valid_bt[0].get("trade_count", 0) or 0) >= 3:
                     try:
                         self.transition(
                             asset_id=entry.id,

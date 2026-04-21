@@ -10,8 +10,10 @@ from typing import TYPE_CHECKING, Any, Callable
 from pydantic import BaseModel, Field
 
 from ..governance.param_service import ParameterService
+from ..learning.settlement import AgentScoreSettlementService
 from ..logging_config import get_logger
-from .candidate_case import CandidateCaseService, CandidateOpinion
+from ..selection_preferences import match_excluded_theme, normalize_excluded_theme_keywords
+from .candidate_case import DISCUSSION_AGENT_IDS, CandidateCaseService, CandidateOpinion
 from .finalizer import build_finalize_bundle
 from .opinion_ingress import adapt_openclaw_opinion_payload
 from .round_summarizer import build_trade_date_summary
@@ -46,6 +48,8 @@ class DiscussionCycle(BaseModel):
     current_round: int = 0                              # 当前轮次号
     max_rounds: int = 3                                 # 最大讨论轮次
     round_history: list[dict] = Field(default_factory=list)  # 每轮汇总快照
+    discussion_settlement_key: str | None = None
+    discussion_settlement_applied_at: str | None = None
 
 
 class DiscussionCycleService:
@@ -96,14 +100,13 @@ class DiscussionCycleService:
             existing.updated_at = self._now_factory().isoformat()
             return self._upsert(existing)
         pool_state, discussion_state = DiscussionStateMachine.bootstrap()
-        focus_capacity = int(self._parameter_service.get_param_value("focus_pool_capacity")) if self._parameter_service else 15
         cycle = DiscussionCycle(
             cycle_id=f"cycle-{trade_date.replace('-', '')}",
             trade_date=trade_date,
             pool_state=pool_state,
             discussion_state=discussion_state,
             base_pool_case_ids=[item.case_id for item in cases],
-            focus_pool_case_ids=[item.case_id for item in cases[:focus_capacity]],
+            focus_pool_case_ids=self._select_focus_pool(trade_date),
             execution_pool_case_ids=execution_pool_case_ids,
             started_at=self._now_factory().isoformat(),
             summary_snapshot=summary_snapshot,
@@ -147,6 +150,27 @@ class DiscussionCycleService:
                 len(cycle.execution_pool_case_ids or []),
             )
 
+        if cycle.discussion_state == "round_1_summarized" and not self._round_1_complete(summary, cycle):
+            cycle.pool_state, cycle.discussion_state = DiscussionStateMachine.start_round(1)
+            cycle.current_round = max(int(cycle.current_round or 0), 1)
+            cycle.round_1_started_at = cycle.round_1_started_at or now
+            logger.warning("discussion cycle repaired back to round 1 running: trade_date=%s", trade_date)
+
+        if cycle.discussion_state == "final_review_ready" and not self._round_complete(trade_date, cycle, 2):
+            cycle.pool_state, cycle.discussion_state = DiscussionStateMachine.start_round(2)
+            cycle.current_round = max(int(cycle.current_round or 0), 2)
+            cycle.round_2_started_at = cycle.round_2_started_at or now
+            cycle.round_2_target_case_ids = self._expected_case_ids_for_round(cycle, 2)
+            logger.warning("discussion cycle repaired back to round 2 running: trade_date=%s", trade_date)
+
+        if cycle.discussion_state == "round_summarized" and cycle.current_round >= 3 and not self._round_complete(trade_date, cycle, cycle.current_round):
+            cycle.pool_state, cycle.discussion_state = DiscussionStateMachine.start_round(cycle.current_round)
+            logger.warning(
+                "discussion cycle repaired back to round %d running: trade_date=%s",
+                cycle.current_round,
+                trade_date,
+            )
+
         if cycle.discussion_state == "round_1_running" and self._round_1_complete(summary, cycle):
             cycle.pool_state, cycle.discussion_state = DiscussionStateMachine.complete_round(1)
             cycle.round_1_completed_at = now
@@ -159,8 +183,7 @@ class DiscussionCycleService:
 
         # v1.0: Round 3+ 完成检测
         if cycle.discussion_state == "round_running" and cycle.current_round >= 3:
-            # Round 3+ 复用 Round 2 的完成检查逻辑
-            if self._round_2_complete(trade_date, cycle):
+            if self._round_complete(trade_date, cycle, cycle.current_round):
                 cycle.pool_state, cycle.discussion_state = DiscussionStateMachine.complete_round(cycle.current_round)
                 cycle.round_history.append({"round": cycle.current_round, "completed_at": now, "summary": summary})
 
@@ -170,6 +193,9 @@ class DiscussionCycleService:
                 next_round = cycle.current_round + 1
                 cycle.pool_state, cycle.discussion_state = DiscussionStateMachine.start_round(next_round)
                 cycle.current_round = next_round
+                if next_round == 2:
+                    cycle.round_2_started_at = cycle.round_2_started_at or now
+                    cycle.round_2_target_case_ids = self._select_round_2_targets(trade_date)
                 logger.info("讨论自动续轮 (存在争议或质询): trade_date=%s round=%d", trade_date, next_round)
 
         cycle.updated_at = now
@@ -199,6 +225,13 @@ class DiscussionCycleService:
         cycle.finalized_at = self._now_factory().isoformat()
         cycle.updated_at = cycle.finalized_at
 
+        discussion_settlement = self._auto_settle_discussion_agents(cycle)
+        cycle.summary_snapshot = dict(cycle.summary_snapshot or {})
+        cycle.summary_snapshot["discussion_agent_score_settlement"] = discussion_settlement
+        if discussion_settlement.get("applied"):
+            cycle.discussion_settlement_key = str(discussion_settlement.get("settlement_key") or "")
+            cycle.discussion_settlement_applied_at = self._now_factory().isoformat()
+
         # 触发自治链: 自动发现学习产物 (R0.5)
         if self._learned_asset_service is not None:
             try:
@@ -210,13 +243,180 @@ class DiscussionCycleService:
                     ],
                     include_client_brief=True,
                 )
+                finalize_packet = (
+                    finalize_bundle.finalize_packet.model_dump()
+                    if hasattr(finalize_bundle.finalize_packet, "model_dump")
+                    else dict(finalize_bundle.finalize_packet)
+                )
                 self._learned_asset_service.auto_discover_from_discussion(
-                    trade_date, finalize_bundle.finalize_packet.model_dump()
+                    trade_date,
+                    finalize_packet,
                 )
             except Exception:
                 logger.exception("自动发现学习产物失败: trade_date=%s", trade_date)
 
         return self._upsert(cycle)
+
+    def fast_track_exit(
+        self,
+        *,
+        trade_date: str,
+        symbol: str,
+        signal_reason: str,
+        signal_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """盘中快退审批。
+
+        由 ashare-risk 直接写入 reject 立场，为秒级卖出链路提供可追溯审批依据。
+        """
+
+        resolved_symbol = str(symbol or "").strip()
+        if not trade_date or not resolved_symbol:
+            return {
+                "approved": False,
+                "reason": "invalid_fast_track_request",
+                "case_id": None,
+                "summary_lines": ["fast track exit 请求缺少 trade_date 或 symbol。"],
+            }
+        signal_payload = dict(signal_payload or {})
+        cases = self._candidate_case_service.list_cases(trade_date=trade_date, limit=500)
+        case = next((item for item in cases if item.symbol == resolved_symbol), None)
+        if case is None:
+            seeded = self._candidate_case_service.upsert_candidate_tickets(
+                trade_date,
+                [
+                    {
+                        "symbol": resolved_symbol,
+                        "name": str(signal_payload.get("name") or resolved_symbol),
+                        "source": "intraday_exit_fast_track",
+                        "source_tags": ["intraday", "fast_track_exit"],
+                        "source_role": "ashare-risk",
+                        "market_logic": f"{resolved_symbol} 进入盘中快退审批链。",
+                        "core_evidence": [
+                            f"exit_reason={signal_reason}",
+                            *(f"{key}={value}" for key, value in list(signal_payload.items())[:4]),
+                        ],
+                        "risk_points": ["盘中快退后需在盘后复盘原因与执行质量。"],
+                        "why_now": f"盘中出现明确卖出信号: {signal_reason}",
+                        "trigger_type": "fast_track_exit",
+                        "trigger_time": self._now_factory().isoformat(),
+                        "recommended_action": "允许卖出",
+                        "submitted_by": "ashare-risk",
+                        "selection_score": 0.0,
+                        "action": "WATCH",
+                    }
+                ],
+            )
+            case = seeded[0] if seeded else None
+        if case is None:
+            return {
+                "approved": False,
+                "reason": "case_seed_failed",
+                "case_id": None,
+                "summary_lines": [f"{resolved_symbol} 无法建立 fast track case。"],
+            }
+        cycle = self.get_cycle(trade_date)
+        round_number = max(int(getattr(cycle, "current_round", 0) or 0), 1)
+        recorded_at = self._now_factory().isoformat()
+        evidence_lines = [
+            f"signal_reason={signal_reason}",
+            *(f"{key}={value}" for key, value in list(signal_payload.items())[:6]),
+        ]
+        opinion = CandidateOpinion(
+            round=round_number,
+            agent_id="ashare-risk",
+            stance="rejected",
+            confidence="high",
+            reasons=[
+                f"盘中快退审批通过: {signal_reason}",
+                "风险代理已确认该持仓不应继续暴露。",
+            ],
+            evidence_refs=[f"fast_track_exit:{trade_date}:{resolved_symbol}"],
+            thesis=f"{resolved_symbol} 触发盘中退出条件，需立即进入卖出执行链。",
+            key_evidence=evidence_lines,
+            evidence_gaps=[],
+            questions_to_others=["盘后需复盘该退出信号属于趋势反转还是瞬时波动。"],
+            recorded_at=recorded_at,
+        )
+        self._candidate_case_service.record_opinions_batch([(case.case_id, opinion)])
+        rebuilt = self._candidate_case_service.rebuild_case(case.case_id)
+        refreshed_cycle = self.get_cycle(trade_date)
+        if refreshed_cycle is not None:
+            refreshed_cycle.summary_snapshot = self.build_summary_snapshot(trade_date)
+            refreshed_cycle.updated_at = recorded_at
+            self._upsert(refreshed_cycle)
+        summary_lines = [
+            f"{resolved_symbol} fast-track exit 已写入 ashare-risk reject 立场。",
+            f"risk_gate={rebuilt.risk_gate} audit_gate={rebuilt.audit_gate} final_status={rebuilt.final_status}",
+            f"理由: {rebuilt.rejected_reason or signal_reason}",
+        ]
+        return {
+            "approved": rebuilt.risk_gate == "reject",
+            "reason": "risk_agent_rejected_position",
+            "case_id": rebuilt.case_id,
+            "round": round_number,
+            "risk_gate": rebuilt.risk_gate,
+            "audit_gate": rebuilt.audit_gate,
+            "final_status": rebuilt.final_status,
+            "headline_reason": rebuilt.rejected_reason or rebuilt.selected_reason or signal_reason,
+            "summary_lines": summary_lines,
+        }
+
+    def _auto_settle_discussion_agents(self, cycle: DiscussionCycle) -> dict[str, Any]:
+        trade_date = cycle.trade_date
+        if self._agent_score_service is None:
+            return {"available": False, "applied": False, "reason": "agent_score_service_missing"}
+        settlement_key = f"{trade_date}:discussion_finalize_v2"
+        if str(getattr(cycle, "discussion_settlement_key", "") or "") == settlement_key:
+            return {
+                "available": True,
+                "applied": False,
+                "reason": "already_applied",
+                "settlement_key": settlement_key,
+                "score_date": trade_date,
+                "agent_count": 0,
+            }
+
+        cases = self._candidate_case_service.list_cases(trade_date=trade_date, limit=500)
+        if not cases:
+            return {"available": False, "applied": False, "reason": "missing_cases", "settlement_key": settlement_key}
+        settlement_results = AgentScoreSettlementService().settle_discussion(cases)
+        if not settlement_results:
+            return {"available": False, "applied": False, "reason": "empty_settlement_results", "settlement_key": settlement_key}
+
+        persisted_states = self._agent_score_service.run_daily_settlement(
+            settlement_results=[
+                {
+                    "agent_id": item.agent_id,
+                    "governance_score_delta": item.governance_score_delta,
+                    "cases_evaluated": item.cases_evaluated,
+                    "confidence_tier": item.confidence_tier,
+                    "settlement_key": settlement_key,
+                }
+                for item in settlement_results
+            ],
+            trade_date=trade_date,
+        )
+        return {
+            "available": True,
+            "applied": True,
+            "reason": "discussion_finalize",
+            "settlement_key": settlement_key,
+            "score_date": trade_date,
+            "agent_count": len(settlement_results),
+            "state_count": len(persisted_states),
+            "results": [
+                {
+                    "agent_id": item.agent_id,
+                    "governance_score_delta": item.governance_score_delta,
+                    "cases_evaluated": item.cases_evaluated,
+                    "confidence_tier": item.confidence_tier,
+                    "sample_count": item.sample_count,
+                    "insufficient_sample": item.insufficient_sample,
+                }
+                for item in settlement_results
+            ],
+        }
 
     def build_summary_snapshot(self, trade_date: str, use_helper: bool = True) -> dict:
         """最小 helper 接入点。
@@ -544,6 +744,15 @@ class DiscussionCycleService:
         if not result["ok"]:
             return response
         writeback_items = list(result.get("writeback_items") or [])
+        writeback_items.extend(
+            self._build_fallback_strategy_watch_items(
+                trade_date=trade_date,
+                round_number=int(result["round"] or 1),
+                agent_id=str(result["agent_id"] or expected_agent_id).strip() or expected_agent_id,
+                covered_case_ids=[case_id for case_id, _ in writeback_items],
+                trace_id=str(result.get("trace_id") or "").strip() or None,
+            )
+        )
         updated = self._candidate_case_service.record_opinions_batch(writeback_items)
         written_case_ids = list(dict.fromkeys(case_id for case_id, _ in writeback_items))
         rebuilt_case_ids: list[str] = []
@@ -1501,7 +1710,13 @@ class DiscussionCycleService:
     def _select_focus_pool(self, trade_date: str) -> list[str]:
         focus_capacity = int(self._parameter_service.get_param_value("focus_pool_capacity")) if self._parameter_service else 15
         cases = self._candidate_case_service.list_cases(trade_date=trade_date, limit=500)
-        return [item.case_id for item in cases[:focus_capacity]]
+        filtered_cases: list = []
+        for item in cases:
+            if self._case_matches_excluded_theme(item):
+                continue
+            filtered_cases.append(item)
+        selected = filtered_cases if filtered_cases else cases
+        return [item.case_id for item in selected[:focus_capacity]]
 
     def _select_round_2_targets(self, trade_date: str) -> list[str]:
         cases = self._candidate_case_service.list_cases(trade_date=trade_date, limit=500)
@@ -1514,12 +1729,38 @@ class DiscussionCycleService:
     def _select_execution_pool(self, trade_date: str) -> list[str]:
         cap = int(self._parameter_service.get_param_value("execution_pool_capacity")) if self._parameter_service else 3
         cases = self._candidate_case_service.list_cases(trade_date=trade_date, limit=500)
-        selected = [
-            item.case_id
+        selected_cases = [
+            item
             for item in cases
             if item.final_status == "selected" and item.risk_gate != "reject" and item.audit_gate != "hold"
         ]
-        return selected[:cap]
+        selected_cases.sort(
+            key=lambda item: (
+                *self._strategy_execution_priority(item),
+                -float(getattr(item.runtime_snapshot, "selection_score", 0.0) or 0.0),
+                -int(getattr(item.runtime_snapshot, "rank", 999) or 999),
+            ),
+            reverse=True,
+        )
+        return [item.case_id for item in selected_cases[:cap]]
+
+    @staticmethod
+    def _strategy_execution_priority(case: Any) -> tuple[int, int, int]:
+        confidence_priority = {"low": 0, "medium": 1, "high": 2}
+        stance_priority = {"watch": 0, "support": 1, "selected": 2}
+        opinions = [
+            item
+            for item in list(getattr(case, "opinions", []) or [])
+            if str(getattr(item, "agent_id", "") or "").strip() == "ashare-strategy"
+        ]
+        if not opinions:
+            return (0, 0, 0)
+        latest = opinions[-1]
+        return (
+            stance_priority.get(str(getattr(latest, "stance", "") or "").strip(), 0),
+            confidence_priority.get(str(getattr(latest, "confidence", "") or "").strip(), 0),
+            int(getattr(latest, "round", 0) or 0),
+        )
 
     @staticmethod
     def _derive_blockers(summary: dict, execution_pool_case_ids: list[str] | None = None) -> list[str]:
@@ -1545,18 +1786,35 @@ class DiscussionCycleService:
         case_count = len(cycle.focus_pool_case_ids) or summary.get("case_count", 0)
         return summary.get("round_coverage", {}).get("round_1_ready", 0) >= min(case_count, summary.get("case_count", 0))
 
-    def _round_2_complete(self, trade_date: str, cycle: DiscussionCycle) -> bool:
-        if not cycle.round_2_target_case_ids:
+    @staticmethod
+    def _expected_case_ids_for_round(cycle: DiscussionCycle, round_number: int) -> list[str]:
+        if round_number <= 1:
+            return list(cycle.focus_pool_case_ids or cycle.base_pool_case_ids or [])
+        return list(cycle.round_2_target_case_ids or cycle.focus_pool_case_ids or [])
+
+    def _round_complete(self, trade_date: str, cycle: DiscussionCycle, round_number: int) -> bool:
+        expected_case_ids = self._expected_case_ids_for_round(cycle, round_number)
+        if not expected_case_ids:
             return True
         cases = self._candidate_case_service.list_cases(trade_date=trade_date, limit=500)
         case_map = {item.case_id: item for item in cases}
-        for case_id in cycle.round_2_target_case_ids:
+        for case_id in expected_case_ids:
             item = case_map.get(case_id)
             if item is None:
                 continue
-            if not self._candidate_case_service.round_2_has_substantive_response(item):
+            covered_agents = {
+                opinion.agent_id
+                for opinion in list(item.opinions or [])
+                if int(opinion.round or 0) == round_number
+            }
+            if DISCUSSION_AGENT_IDS - covered_agents:
+                return False
+            if round_number >= 2 and not self._candidate_case_service.round_has_substantive_response(item, round_number):
                 return False
         return True
+
+    def _round_2_complete(self, trade_date: str, cycle: DiscussionCycle) -> bool:
+        return self._round_complete(trade_date, cycle, 2)
 
     @staticmethod
     def can_finalize(cycle: DiscussionCycle) -> bool:
@@ -1586,6 +1844,97 @@ class DiscussionCycleService:
         self._write_cycles(items)
         logger.info("discussion cycle updated: %s -> %s/%s", cycle.trade_date, cycle.pool_state, cycle.discussion_state)
         return cycle
+
+    def _build_fallback_strategy_watch_items(
+        self,
+        *,
+        trade_date: str,
+        round_number: int,
+        agent_id: str,
+        covered_case_ids: list[str],
+        trace_id: str | None,
+    ) -> list[tuple[str, CandidateOpinion]]:
+        cycle = self.get_cycle(trade_date)
+        if cycle is None:
+            return []
+        if round_number <= 1:
+            expected_case_ids = list(cycle.focus_pool_case_ids or cycle.base_pool_case_ids or [])
+        else:
+            expected_case_ids = list(cycle.round_2_target_case_ids or cycle.focus_pool_case_ids or [])
+        if not expected_case_ids:
+            return []
+        covered = set(str(case_id).strip() for case_id in covered_case_ids if str(case_id).strip())
+        cases = self._candidate_case_service.list_cases(trade_date=trade_date, limit=500)
+        case_map = {item.case_id: item for item in cases}
+        recorded_at = self._now_factory().isoformat()
+        writeback_items: list[tuple[str, CandidateOpinion]] = []
+        for case_id in expected_case_ids:
+            if case_id in covered:
+                continue
+            case = case_map.get(case_id)
+            if case is None:
+                continue
+            matched_theme = self._match_excluded_theme(case)
+            omitted_reason = "未纳入本轮 compose 覆盖范围，按当前战法与约束先保留观察"
+            if matched_theme is not None:
+                omitted_reason = (
+                    f"命中排除方向「{matched_theme['keyword']}」，本轮 compose 不纳入优先候选，先保留观察"
+                )
+            evidence_refs = [f"compose_trace:{trace_id}"] if trace_id else []
+            evidence_refs.append("compose_scope:omitted")
+            opinion = CandidateOpinion(
+                round=round_number,
+                agent_id=agent_id,
+                stance="watch",
+                confidence="medium",
+                reasons=[omitted_reason],
+                evidence_refs=evidence_refs,
+                thesis=(
+                    f"{case.symbol} {case.name or case.symbol} 未进入本轮策略优先编排范围，"
+                    "策略侧暂不支持直接进入执行池。"
+                ),
+                key_evidence=[],
+                evidence_gaps=["如需继续推进，需要补充新的市场证据或调整约束后重跑 compose"],
+                questions_to_others=[],
+                recorded_at=recorded_at,
+            )
+            writeback_items.append((case_id, opinion))
+        return writeback_items
+
+    def _resolve_excluded_theme_keywords(self) -> list[str]:
+        if self._parameter_service is None:
+            return []
+        try:
+            raw = self._parameter_service.get_param_value("excluded_theme_keywords")
+        except Exception:
+            return []
+        return normalize_excluded_theme_keywords(raw)
+
+    def _match_excluded_theme(self, case) -> dict[str, str] | None:
+        keywords = self._resolve_excluded_theme_keywords()
+        if not keywords:
+            return None
+        sector_profile = dict(getattr(case.runtime_snapshot, "sector_profile", {}) or {})
+        source_detail = dict(getattr(case.runtime_snapshot, "source_detail", {}) or {})
+        extra_texts = [
+            str(getattr(case.runtime_snapshot, "summary", "") or "").strip(),
+            str(source_detail.get("resolved_sector") or "").strip(),
+            str(sector_profile.get("resolved_sector") or "").strip(),
+            str(sector_profile.get("sector_name") or "").strip(),
+        ]
+        extra_texts.extend(str(item).strip() for item in list(sector_profile.get("tags") or []) if str(item).strip())
+        return match_excluded_theme(
+            keywords,
+            name=str(getattr(case, "name", "") or "").strip(),
+            resolved_sector=(
+                str(sector_profile.get("resolved_sector") or "").strip()
+                or str(source_detail.get("resolved_sector") or "").strip()
+            ),
+            extra_texts=extra_texts,
+        )
+
+    def _case_matches_excluded_theme(self, case) -> bool:
+        return self._match_excluded_theme(case) is not None
 
     def _read_cycles(self) -> list[DiscussionCycle]:
         if not self._storage_path.exists():

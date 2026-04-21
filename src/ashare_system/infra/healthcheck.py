@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
+
 from .adapters import build_execution_adapter
 from .market_adapter import build_market_adapter
 from ..settings import AppSettings
@@ -33,6 +35,8 @@ class EnvironmentHealthcheck:
         checks.append(self._path_check("storage_root", self.settings.storage_root))
         checks.append(self._path_check("xtquant_root", self.settings.xtquant.root, required=xtquant_paths_required))
         checks.append(self._path_check("xtquantservice_root", self.settings.xtquant.service_root, required=xtquant_paths_required))
+        if self.settings.go_platform.enabled:
+            checks.append(self._go_platform_reachability_check())
 
         if self.settings.run_mode == "live":
             checks.append(
@@ -67,7 +71,7 @@ class EnvironmentHealthcheck:
         if not required:
             return {
                 "name": name,
-                "status": "ok",
+                "status": "warning",
                 "detail": str(path) if exists else f"{path} (当前执行平面未使用，已跳过)",
             }
         return {
@@ -94,6 +98,37 @@ class EnvironmentHealthcheck:
                 "name": name,
                 "status": "invalid",
                 "detail": str(exc),
+            }
+
+    def _go_platform_reachability_check(self) -> dict[str, str]:
+        base_url = str(self.settings.go_platform.base_url or "").strip().rstrip("/")
+        if not base_url:
+            return {
+                "name": "go_platform_health",
+                "status": "missing",
+                "detail": "go_platform.enabled=true 但未配置 base_url",
+            }
+        health_url = f"{base_url}/health"
+        try:
+            with httpx.Client(timeout=min(max(float(self.settings.go_platform.timeout_sec or 2.0), 1.0), 5.0)) as client:
+                response = client.get(health_url)
+            if response.status_code >= 400:
+                return {
+                    "name": "go_platform_health",
+                    "status": "invalid",
+                    "detail": f"{health_url} status={response.status_code}",
+                }
+            return {
+                "name": "go_platform_health",
+                "status": "ok",
+                "detail": health_url,
+            }
+        except Exception as exc:
+            logger.warning("go_platform healthcheck failed: %s", exc)
+            return {
+                "name": "go_platform_health",
+                "status": "invalid",
+                "detail": f"{health_url} error={exc}",
             }
 
 

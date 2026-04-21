@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
+from .execution.quality_tracker import ExecutionQualityTracker
 from .infra.adapters import ExecutionAdapter
 from .infra.audit_store import StateStore
 
@@ -16,10 +18,12 @@ class ExecutionReconciliationService:
         self,
         execution_adapter: ExecutionAdapter,
         state_store: StateStore,
+        quality_tracker: ExecutionQualityTracker | None = None,
         now_factory: Callable[[], datetime] | None = None,
     ) -> None:
         self._execution_adapter = execution_adapter
         self._state_store = state_store
+        self._quality_tracker = quality_tracker
         self._now_factory = now_factory or datetime.now
 
     def reconcile(self, account_id: str, persist: bool = True) -> dict:
@@ -81,6 +85,15 @@ class ExecutionReconciliationService:
             record["last_trade_at"] = (now.isoformat() if grouped_trades else record.get("last_trade_at"))
             if filled_quantity > 0:
                 filled_order_count += 1
+                if self._quality_tracker is not None:
+                    self._quality_tracker.record_fill(
+                        order_id=str(order_id),
+                        fill_price=avg_fill_price,
+                        fill_time=now.isoformat(),
+                        filled_quantity=filled_quantity,
+                        filled_value=round(filled_value, 4),
+                        status=str(new_status or ""),
+                    )
             reconciliation_items.append(
                 {
                     "order_id": order_id,

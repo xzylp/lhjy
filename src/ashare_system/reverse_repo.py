@@ -109,13 +109,20 @@ class ReverseRepoService:
             runtime_config,
             default=70000.0,
         )
+        stock_position_limit_ratio = (
+            float(self._parameter_service.get_param_value("equity_position_limit"))
+            if self._parameter_service
+            else float(getattr(runtime_config, "equity_position_limit", 0.3) or 0.3)
+        )
 
         buckets = summarize_position_buckets(positions)
         budget = build_test_trading_budget(
+            float(getattr(balance, "total_asset", 0.0) or 0.0),
             buckets.equity_value,
             buckets.reverse_repo_value,
             minimum_total_invested_amount=minimum_total_invested_amount,
             reverse_repo_reserved_amount=reverse_repo_reserved_amount,
+            stock_position_limit_ratio=stock_position_limit_ratio,
         )
         reverse_repo_gap_value = budget.reverse_repo_gap_value
         pending_orders = [

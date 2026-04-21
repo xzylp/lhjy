@@ -59,6 +59,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=30)
     parser.add_argument("--symbols", nargs="*", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--bot-role", default=None)
     args = parser.parse_args()
 
     settings = load_settings()
@@ -110,7 +111,7 @@ def main() -> None:
         return
 
     if args.command == "feishu-longconn":
-        run_feishu_long_connection(settings)
+        run_feishu_long_connection(settings, bot_role=args.bot_role)
         return
 
     # serve 模式: 先启动 QMT，再启动 FastAPI

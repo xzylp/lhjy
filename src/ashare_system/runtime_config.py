@@ -71,6 +71,11 @@ class RuntimeConfig(BaseModel):
     equity_position_limit: float = 0.2  # 测试阶段股票仓位上限 (不含逆回购)
     max_single_position: float = 0.25   # 单票最高仓位 (0-1)
     max_single_amount: float = 50000.0  # 单票最高金额 (元)
+    position_sizing_mode: str = "half_kelly"  # fixed_pct | half_kelly | volatility_target
+    target_position_volatility: float = 0.02  # volatility_target 模式目标波动
+    portfolio_sector_concentration_limit: float = 0.40  # 单板块集中度上限
+    daily_new_exposure_limit: float = 0.30  # 单日新增敞口上限
+    composite_adjustment_multiplier: float = 0.0  # 因子/战法复合调整倍数，0 表示按历史账本自动估算
     reverse_repo_target_ratio: float = 0.7  # 逆回购目标占比
     minimum_total_invested_amount: float = 100000.0  # 测试期总持仓基线
     reverse_repo_reserved_amount: float = 70000.0  # 测试期逆回购保留金额
@@ -85,6 +90,11 @@ class RuntimeConfig(BaseModel):
     # 风控
     daily_loss_limit: float = 0.05      # 日亏损上限
     execution_price_deviation_pct: float = 0.02  # 实盘下单价偏离盘口阈值
+    max_single_loss_pct: float = 0.05  # 单票浮亏止损阈值
+    high_volatility_threshold: float = 0.035  # 高波动阈值
+    volatility_position_scale: float = 0.6  # 高波动时的仓位压缩系数
+    max_position_correlation: float = 0.7  # 与现有持仓相关性上限
+    min_daily_turnover_amount: float = 10000000.0  # 最低日成交额
     pending_order_warn_seconds: int = 300  # 未决订单告警时长阈值
     pending_order_auto_action: str = "alert_only"  # alert_only | cancel
     pending_order_cancel_after_seconds: int = 900  # 超时后自动撤单阈值

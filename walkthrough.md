@@ -1,3 +1,271 @@
+# 2026-04-19 正式上线实测记录
+
+> 实测时间: 2026-04-19
+> 实测目标: 按正式上线要求核验控制面、数据面、监督面、Runtime Compose 与上线准入状态
+
+---
+
+## 2026-04-19 修复后复测结论
+
+在完成本轮代码修复并重启 `ashare-system-v2.service` 后，四项阻断已连续收口：
+
+1. `go-live gate` 已从 `BLOCKED` 变为 `READY`
+2. 全量自动化测试已通过，结果为 `162/162 OK`
+3. `system/readiness` 已恢复可用，`service-recovery-readiness` 对历史交易日检查返回 `ready`
+4. `compose-from-brief` 在正式环境下的同类请求实测耗时约 `13.72s`，已低于此前 `20s` 超时表现
+
+修复后关键结果：
+
+- `scripts/check_go_live_gate.sh` 输出：`READY`
+- `./.venv/bin/python -m unittest discover -s tests` 输出：`Ran 162 tests ... OK`
+- `GET /system/deployment/service-recovery-readiness?trade_date=2026-04-17` 输出：`status=ready`
+- `POST /runtime/jobs/compose-from-brief` 实测：
+  - `elapsed_seconds=13.72`
+  - `ok=true`
+  - `trace_id=compose-runtime-2021b87d16`
+
+本轮修复覆盖点：
+
+- 默认 `trade_date` 解析补上兜底，监督面与执行摘要不再因空 candidate 场景抛错
+- 健康检查中“当前执行平面未使用”的 xtquant 路径改为 `warning`
+- 监督任务 prompt 补齐“自己组织参数”，并修复重复派发节流与“有新活动但未对齐目标”场景
+- `/runtime/factors` 与 `/runtime/playbooks` 改为返回 seed 目录，冻结公开契约
+- 飞书机会票回复改回 `机会票概览`
+- `create_app()` 在非 `live` 模式下不再后台抢刷账户状态，消除测试期缓存竞态
+- `readiness` 会自修复过期/错误的 startup recovery 记录
+- `service-recovery-readiness` 对历史交易日不再错误按“当前时钟新鲜度”阻断
+- `check_go_live_gate.sh` 会自动解析参考交易日，并在非当日场景放宽交易时段约束
+- compose 在有板块白名单/黑名单时会先收缩 universe，再跑 pipeline，减少全市场扫描开销
+
+最终判断：
+
+本轮四件事已经一起完成，并经过实测闭环验证。当前仓库状态已从“服务在线但上线阻断”推进到“测试通过、准入门放行、关键接口可用”。
+
+---
+
+## 一、实测范围
+
+- 服务与端口在线状态
+- 健康巡检与 go-live gate
+- 全量自动化测试
+- Runtime 策略仓库与评估账本
+- `POST /runtime/jobs/compose-from-brief` 自定义编排能力
+- `GET /system/agents/supervision-board` 监督质量信号
+- `GET /system/readiness` 与 `GET /system/deployment/service-recovery-readiness`
+
+## 二、实测结论
+
+### 总结论
+
+当前系统**不满足正式上线要求**。
+
+原因不是“服务起不来”，而是“系统在线但准入仍 blocked，且关键链路仍有稳定性与回归问题”：
+
+1. 控制面、Go 数据平台、长连接与相关 systemd 服务都在线。
+2. Runtime 因子/战法仓库规模已达标，实测为 `64` 个因子、`20` 个战法。
+3. 自定义 `compose-from-brief` 可以在正式运行环境完成执行并写入 evaluation ledger。
+4. 但正式上线准入脚本 `check_go_live_gate.sh` 结果仍为 `BLOCKED`。
+5. `system/readiness` 与 `service-recovery-readiness` 也都返回 `blocked`。
+6. 全量自动化测试仍失败，且失败点集中在监督链路、默认场景和契约漂移。
+7. `compose-from-brief` 在正式环境下首次 20 秒超时，第二次放宽到 60 秒后才返回，说明响应时延不稳定。
+
+## 三、实测结果对账
+
+### 1. 服务在线与健康巡检
+
+- `127.0.0.1:8100` 控制面在线
+- `127.0.0.1:18793` Go Data Platform 在线
+- `/health` 返回 `{"status":"ok","service":"ashare-system-v2","mode":"live","environment":"dev"}`
+- `scripts/health_check.sh` 结果整体通过
+
+说明：
+
+- 这代表“服务在线”，不代表“达到上线准入”
+- 健康巡检更偏进程、端口、HTTP 存活检查
+
+### 2. go-live gate
+
+执行 `scripts/check_go_live_gate.sh` 后，结果为 `BLOCKED`。
+
+关键阻断项：
+
+- `准入1_linux_services: NO`
+- `准入2_windows_bridge: NO`
+- `准入3_apply_closed_loop: NO`
+- `准入4_agent_chain: NO`
+
+关键摘要：
+
+- `service_recovery=blocked`
+- `discussion status=blocked cycle=round_1_running cases=138`
+- `2026-04-19 尚无执行派发回执`
+- `latest receipt ... status=failed`
+
+这意味着当前不是“可谨慎上线”，而是“准入门本身明确未通过”。
+
+### 3. 全量自动化测试
+
+执行：
+
+```bash
+./.venv/bin/python -m unittest discover -s tests
+```
+
+结果：
+
+- `Ran 162 tests in 49.536s`
+- `FAILED (failures=6, errors=7)`
+
+本轮主要失败点：
+
+- 监督看板依赖默认 `trade_date` 推导，空场景仍会抛错
+- 健康检查里未启用的 xtquant 路径状态仍返回 `ok`，与测试期望 `warning` 不一致
+- `account-state` 缓存接口行为回归
+- Agent 任务 prompt 缺少“自己组织参数”要求
+- 同阶段重复派发节流失效
+- 飞书机会票紧凑回复格式不符合测试预期
+- `/runtime/factors` 对外暴露数量超过 64，契约发生漂移
+
+### 4. Runtime 仓库与账本
+
+实测接口：
+
+- `GET /runtime/strategy-repository`
+- `GET /runtime/evaluations?limit=5`
+
+结果：
+
+- 仓库统计：`factor=64`，`playbook=20`
+- `governance_summary.observe_only_count=84`
+- Evaluation Ledger 可正常读到最新 trace
+
+本次实测生成了以下 trace：
+
+- `compose-runtime-0cf7896d8f` 对应 `formal-prod-check-20260419-001`
+- `compose-runtime-7aa8725bbf` 对应 `formal-prod-check-20260419-002`
+
+说明：
+
+- 因子/战法规模目标已达第一阶段要求
+- 账本落盘能力可用
+- 但治理建议几乎全部仍停留在 `observe_only`
+
+### 5. 自定义 Compose Brief 实测
+
+实测接口：
+
+```text
+POST /runtime/jobs/compose-from-brief
+```
+
+验证内容：
+
+- 自定义 `intent_mode=news_catalyst_scan`
+- 自定义 `playbooks=[trend_acceleration, sector_resonance]`
+- 自定义 `factors=[momentum_slope, sector_heat_score]`
+- 自定义权重、行业排除、regime 约束、风险约束
+
+结果：
+
+- 第一次请求 `formal-prod-check-20260419-001` 在 `20s` 超时，但后台最终仍完成并写入 ledger
+- 第二次请求 `formal-prod-check-20260419-002` 在更长超时窗口内成功返回
+- 返回体包含：
+  - `composition_manifest`
+  - `applied_constraints`
+  - `evaluation_trace`
+  - `repository.used_assets`
+  - `brief_execution`
+
+但本次结果也暴露出正式环境问题：
+
+- 返回候选数为 `0`
+- `filtered_out` 中 3 个候选都被 `market_regime_not_allowed:chaos` 拦截
+- 首次请求响应时延超过 20 秒，不适合作为稳定上线表现
+
+说明：
+
+- Compose 功能“能跑”
+- 但线上数据环境下可用性与响应稳定性还不够
+
+### 6. 监督面与恢复面
+
+实测接口：
+
+- `GET /system/agents/supervision-board?trade_date=2026-04-17&overdue_after_seconds=180`
+- `GET /system/readiness`
+- `GET /system/deployment/service-recovery-readiness?trade_date=2026-04-17`
+
+结果：
+
+- 监督看板能返回 `quality_state`、`quality_reason`、`activity_signals`
+- 监督面能识别出：
+  - `ashare-strategy` 为 `overdue + blocked`
+  - `ashare` 为 `overdue + blocked`
+  - `ashare-executor` 为 `needs_work + low`
+- `system/readiness.status=blocked`
+- `service-recovery-readiness.status=blocked`
+
+服务恢复未通过项：
+
+- `readiness`
+- `workspace_context`
+- `recovery_signal_freshness`
+
+结论：
+
+- 监督能力“有内容”
+- 但监督内容本身正在证明系统尚未恢复到可上线状态
+
+## 四、上线阻断清单
+
+按正式上线标准，当前至少还有以下阻断项：
+
+1. `go-live gate` 直接返回 `BLOCKED`
+2. `system/readiness` 返回 `blocked`
+3. `service-recovery-readiness` 返回 `blocked`
+4. 全量测试仍有 `6 failures / 7 errors`
+5. Compose 在线请求存在明显时延不稳定
+6. 执行闭环未完成，最新 gateway receipt 为 `failed`
+7. 监督主线仍停在 `round_1_running`，总协调与策略岗位处于超时阻塞态
+
+## 五、建议修复顺序
+
+### P0：先解除上线阻断
+
+- 修复 `readiness` 与 `service-recovery-readiness` 的阻断项
+- 补齐 `workspace_context` 与恢复信号新鲜度
+- 查清 `latest receipt status=failed` 的根因
+- 把 `go-live gate` 跑到非 `BLOCKED`
+
+### P1：修复正式环境稳定性
+
+- 优先处理 `compose-from-brief` 的响应时延
+- 明确首次请求为何会超 20 秒
+- 对慢链路增加更清晰的阶段日志与超时保护
+
+### P2：消灭当前测试回归
+
+- 修默认 `trade_date` 空场景
+- 修健康检查状态语义
+- 修监督 prompt 与派发节流
+- 冻结 `/runtime/factors` 对外数量契约
+- 修复 `account-state` 缓存行为
+
+## 六、最终判断
+
+本次实测证明：
+
+- 系统已经具备较完整的运行骨架
+- 正式运行环境中的核心服务大多在线
+- Runtime Compose、监督看板、仓库账本都不是空壳
+
+但同样明确证明：
+
+- **它现在还不具备正式上线条件**
+- 当前状态更接近“上线前联调/准生产演练”，不是“可直接放行”
+
+---
+
 # ashare-system-v2 框架代码工程交接文档
 
 > 交接日期: 2026-04-12

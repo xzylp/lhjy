@@ -11,6 +11,10 @@ class StorageLayout:
     """统一数据目录布局。"""
 
     root: Path
+    db_root: Path
+    lake_root: Path
+    state_root: Path
+    reports_root: Path
     raw_root: Path
     normalized_root: Path
     features_root: Path
@@ -43,6 +47,10 @@ class StorageLayout:
     def _all_directories(self) -> tuple[Path, ...]:
         return (
             self.root,
+            self.db_root,
+            self.lake_root,
+            self.state_root,
+            self.reports_root,
             self.raw_root,
             self.normalized_root,
             self.features_root,
@@ -70,6 +78,10 @@ class StorageLayout:
 
 
 def build_storage_layout(storage_root: Path) -> StorageLayout:
+    db_root = storage_root / "db"
+    lake_root = storage_root / "lake"
+    state_root = storage_root / "state"
+    reports_root = storage_root / "reports"
     raw_root = storage_root / "raw"
     normalized_root = storage_root / "normalized"
     features_root = storage_root / "features"
@@ -77,6 +89,10 @@ def build_storage_layout(storage_root: Path) -> StorageLayout:
     cache_root = storage_root / "cache"
     return StorageLayout(
         root=storage_root,
+        db_root=db_root,
+        lake_root=lake_root,
+        state_root=state_root,
+        reports_root=reports_root,
         raw_root=raw_root,
         normalized_root=normalized_root,
         features_root=features_root,

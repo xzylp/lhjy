@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import importlib
 import json
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -170,126 +173,127 @@ class CandidateCaseService:
         if not job_id or not top_picks:
             return []
 
-        payload = self._read_payload()
-        if payload.get("last_synced_job_id") == job_id:
-            return self._read_cases()
+        with self._payload_lock():
+            payload = self._read_payload_unlocked()
+            if payload.get("last_synced_job_id") == job_id:
+                return self._load_cases_from_payload(payload)
 
-        cases_by_id = {item.case_id: item for item in self._read_cases()}
-        generated_at = report.get("generated_at") or self._now_factory().isoformat()
-        trade_date = datetime.fromisoformat(generated_at).date().isoformat()
-        synced: list[CandidateCase] = []
+            cases_by_id = {item.case_id: item for item in self._load_cases_from_payload(payload)}
+            generated_at = report.get("generated_at") or self._now_factory().isoformat()
+            trade_date = datetime.fromisoformat(generated_at).date().isoformat()
+            synced: list[CandidateCase] = []
 
-        for item in top_picks:
-            symbol = item["symbol"]
-            rank = int(item.get("rank", 0) or 0)
-            case_id = f"case-{trade_date.replace('-', '')}-{symbol.replace('.', '-')}"
-            existing = cases_by_id.get(case_id)
-            primary_source = self._normalize_candidate_source(item.get("source") or report.get("source"))
-            source_tags = self._normalize_candidate_source_tags(
-                [
-                    item.get("source"),
-                    report.get("source"),
-                    *(list(item.get("source_tags") or []) if isinstance(item.get("source_tags"), list) else []),
-                    *(list(existing.runtime_snapshot.source_tags) if existing else []),
-                ]
-            )
-            source_detail = self._as_dict(item.get("source_detail")) or self._existing_runtime_dict(existing, "source_detail")
-            playbook_context = self._as_dict(item.get("playbook_context")) or self._existing_runtime_dict(
-                existing, "playbook_context"
-            )
-            playbook_match_score = self._as_dict(item.get("playbook_match_score")) or self._as_dict(
-                playbook_context.get("playbook_match_score")
-            ) or self._existing_runtime_dict(existing, "playbook_match_score")
-            behavior_profile = self._as_dict(item.get("behavior_profile")) or self._as_dict(
-                playbook_context.get("behavior_profile")
-            ) or self._existing_runtime_dict(existing, "behavior_profile")
-            sector_profile = self._as_dict(item.get("sector_profile")) or self._existing_runtime_dict(existing, "sector_profile")
-            market_profile = self._as_dict(item.get("market_profile")) or self._as_dict(
-                report.get("market_profile")
-            ) or self._existing_runtime_dict(existing, "market_profile")
-            leader_rank = self._as_dict(item.get("leader_rank")) or self._derive_leader_rank_payload(
-                playbook_context=playbook_context,
-                playbook_match_score=playbook_match_score,
-                behavior_profile=behavior_profile,
-                existing=existing,
-            )
-            bull_case, bear_case, uncertainty = self._build_case_evidence(
-                symbol=symbol,
-                top_pick=item,
-                playbook_context=playbook_context,
-                playbook_match_score=playbook_match_score,
-                behavior_profile=behavior_profile,
-                sector_profile=sector_profile,
-                market_profile=market_profile,
-                leader_rank=leader_rank,
-                existing=existing,
-            )
-            must_answer_questions = self._build_must_answer_questions(
-                symbol=symbol,
-                bull_case=bull_case,
-                bear_case=bear_case,
-                uncertainty=uncertainty,
-            )
-            derived_status = self._derive_status(rank, item.get("action", "HOLD"), execution_pool_capacity, focus_pool_capacity)
-            pool_membership = PoolMembership(
-                base_pool=True,
-                focus_pool=rank <= focus_pool_capacity,
-                execution_pool=rank <= execution_pool_capacity and item.get("action") == "BUY",
-                watchlist=derived_status == "watchlist",
-            )
-            candidate = CandidateCase(
-                case_id=case_id,
-                trade_date=trade_date,
-                symbol=symbol,
-                name=item.get("name", existing.name if existing else ""),
-                pool_membership=pool_membership,
-                runtime_snapshot=CandidateRuntimeSnapshot(
-                    rank=rank,
-                    selection_score=float(item.get("selection_score", 0.0)),
-                    action=item.get("action", "HOLD"),
-                    source=primary_source,
-                    source_tags=source_tags,
-                    source_detail=source_detail,
-                    score_breakdown=item.get("score_breakdown", {}),
-                    summary=item.get("summary", ""),
-                    market_snapshot=item.get("market_snapshot", {}),
-                    runtime_report_ref=job_id,
+            for item in top_picks:
+                symbol = item["symbol"]
+                rank = int(item.get("rank", 0) or 0)
+                case_id = f"case-{trade_date.replace('-', '')}-{symbol.replace('.', '-')}"
+                existing = cases_by_id.get(case_id)
+                primary_source = self._normalize_candidate_source(item.get("source") or report.get("source"))
+                source_tags = self._normalize_candidate_source_tags(
+                    [
+                        item.get("source"),
+                        report.get("source"),
+                        *(list(item.get("source_tags") or []) if isinstance(item.get("source_tags"), list) else []),
+                        *(list(existing.runtime_snapshot.source_tags) if existing else []),
+                    ]
+                )
+                source_detail = self._as_dict(item.get("source_detail")) or self._existing_runtime_dict(existing, "source_detail")
+                playbook_context = self._as_dict(item.get("playbook_context")) or self._existing_runtime_dict(
+                    existing, "playbook_context"
+                )
+                playbook_match_score = self._as_dict(item.get("playbook_match_score")) or self._as_dict(
+                    playbook_context.get("playbook_match_score")
+                ) or self._existing_runtime_dict(existing, "playbook_match_score")
+                behavior_profile = self._as_dict(item.get("behavior_profile")) or self._as_dict(
+                    playbook_context.get("behavior_profile")
+                ) or self._existing_runtime_dict(existing, "behavior_profile")
+                sector_profile = self._as_dict(item.get("sector_profile")) or self._existing_runtime_dict(existing, "sector_profile")
+                market_profile = self._as_dict(item.get("market_profile")) or self._as_dict(
+                    report.get("market_profile")
+                ) or self._existing_runtime_dict(existing, "market_profile")
+                leader_rank = self._as_dict(item.get("leader_rank")) or self._derive_leader_rank_payload(
+                    playbook_context=playbook_context,
+                    playbook_match_score=playbook_match_score,
+                    behavior_profile=behavior_profile,
+                    existing=existing,
+                )
+                bull_case, bear_case, uncertainty = self._build_case_evidence(
+                    symbol=symbol,
+                    top_pick=item,
                     playbook_context=playbook_context,
                     playbook_match_score=playbook_match_score,
                     behavior_profile=behavior_profile,
                     sector_profile=sector_profile,
                     market_profile=market_profile,
                     leader_rank=leader_rank,
-                ),
-                opinions=existing.opinions if existing else [],
-                round_1_summary=existing.round_1_summary if existing else CandidateRoundSummary(),
-                round_2_summary=existing.round_2_summary if existing else CandidateRoundSummary(),
-                risk_gate=existing.risk_gate if existing else "pending",
-                audit_gate=existing.audit_gate if existing else "pending",
-                final_status=existing.final_status if existing and existing.opinions else derived_status,
-                selected_reason=(existing.selected_reason if existing else None) or (item.get("summary") if derived_status == "selected" else None),
-                rejected_reason=(existing.rejected_reason if existing else None) or (item.get("summary") if derived_status == "rejected" else None),
-                intraday_state=existing.intraday_state if existing else "observing",
-                bull_case=bull_case,
-                bear_case=bear_case,
-                uncertainty=uncertainty,
-                contradictions=existing.contradictions if existing else [],
-                contradiction_summary_lines=existing.contradiction_summary_lines if existing else [],
-                must_answer_questions=must_answer_questions,
-                updated_at=self._now_factory().isoformat(),
-            )
-            cases_by_id[case_id] = candidate
-            synced.append(candidate)
+                    existing=existing,
+                )
+                must_answer_questions = self._build_must_answer_questions(
+                    symbol=symbol,
+                    bull_case=bull_case,
+                    bear_case=bear_case,
+                    uncertainty=uncertainty,
+                )
+                derived_status = self._derive_status(rank, item.get("action", "HOLD"), execution_pool_capacity, focus_pool_capacity)
+                pool_membership = PoolMembership(
+                    base_pool=True,
+                    focus_pool=rank <= focus_pool_capacity,
+                    execution_pool=rank <= execution_pool_capacity and item.get("action") == "BUY",
+                    watchlist=derived_status == "watchlist",
+                )
+                candidate = CandidateCase(
+                    case_id=case_id,
+                    trade_date=trade_date,
+                    symbol=symbol,
+                    name=item.get("name", existing.name if existing else ""),
+                    pool_membership=pool_membership,
+                    runtime_snapshot=CandidateRuntimeSnapshot(
+                        rank=rank,
+                        selection_score=float(item.get("selection_score", 0.0)),
+                        action=item.get("action", "HOLD"),
+                        source=primary_source,
+                        source_tags=source_tags,
+                        source_detail=source_detail,
+                        score_breakdown=item.get("score_breakdown", {}),
+                        summary=item.get("summary", ""),
+                        market_snapshot=item.get("market_snapshot", {}),
+                        runtime_report_ref=job_id,
+                        playbook_context=playbook_context,
+                        playbook_match_score=playbook_match_score,
+                        behavior_profile=behavior_profile,
+                        sector_profile=sector_profile,
+                        market_profile=market_profile,
+                        leader_rank=leader_rank,
+                    ),
+                    opinions=existing.opinions if existing else [],
+                    round_1_summary=existing.round_1_summary if existing else CandidateRoundSummary(),
+                    round_2_summary=existing.round_2_summary if existing else CandidateRoundSummary(),
+                    risk_gate=existing.risk_gate if existing else "pending",
+                    audit_gate=existing.audit_gate if existing else "pending",
+                    final_status=existing.final_status if existing and existing.opinions else derived_status,
+                    selected_reason=(existing.selected_reason if existing else None) or (item.get("summary") if derived_status == "selected" else None),
+                    rejected_reason=(existing.rejected_reason if existing else None) or (item.get("summary") if derived_status == "rejected" else None),
+                    intraday_state=existing.intraday_state if existing else "observing",
+                    bull_case=bull_case,
+                    bear_case=bear_case,
+                    uncertainty=uncertainty,
+                    contradictions=existing.contradictions if existing else [],
+                    contradiction_summary_lines=existing.contradiction_summary_lines if existing else [],
+                    must_answer_questions=must_answer_questions,
+                    updated_at=self._now_factory().isoformat(),
+                )
+                cases_by_id[case_id] = candidate
+                synced.append(candidate)
 
-        self._write_payload(
-            {
-                "last_synced_job_id": job_id,
-                "cases": [
-                    item.model_dump()
-                    for item in sorted(cases_by_id.values(), key=lambda case: (case.trade_date, case.runtime_snapshot.rank, case.symbol))
-                ],
-            }
-        )
+            self._write_payload_unlocked(
+                {
+                    "last_synced_job_id": job_id,
+                    "cases": [
+                        item.model_dump()
+                        for item in sorted(cases_by_id.values(), key=lambda case: (case.trade_date, case.runtime_snapshot.rank, case.symbol))
+                    ],
+                }
+            )
         logger.info("同步 candidate_case: %s (%d)", job_id, len(synced))
         return synced
 
@@ -837,7 +841,7 @@ class CandidateCaseService:
             "source": case.runtime_snapshot.source,
             "source_tags": list(case.runtime_snapshot.source_tags),
             "source_detail": dict(case.runtime_snapshot.source_detail),
-            "reason": case.selected_reason or case.rejected_reason or case.runtime_snapshot.summary,
+            "reason": CandidateCaseService.resolve_headline_reason(case),
             "bull_case": dict(case.bull_case),
             "bear_case": dict(case.bear_case),
             "uncertainty": dict(case.uncertainty),
@@ -858,7 +862,7 @@ class CandidateCaseService:
             "source_tags": list(case.runtime_snapshot.source_tags),
             "risk_gate": case.risk_gate,
             "audit_gate": case.audit_gate,
-            "reason": case.selected_reason or case.rejected_reason or case.runtime_snapshot.summary,
+            "reason": CandidateCaseService.resolve_headline_reason(case),
             "bull_case": dict(case.bull_case),
             "bear_case": dict(case.bear_case),
             "uncertainty": dict(case.uncertainty),
@@ -887,7 +891,7 @@ class CandidateCaseService:
             "selection_score": case.runtime_snapshot.selection_score,
             "action": case.runtime_snapshot.action,
             "final_status": case.final_status,
-            "headline_reason": case.selected_reason or case.rejected_reason or case.runtime_snapshot.summary,
+            "headline_reason": CandidateCaseService.resolve_headline_reason(case),
             "selected_reason": case.selected_reason,
             "rejected_reason": case.rejected_reason,
             "risk_gate": case.risk_gate,
@@ -947,12 +951,13 @@ class CandidateCaseService:
         reason_item = cls._reason_item(case)
         opinion_items = [cls._opinion_item(item) for item in case.opinions]
         rounds = {}
-        for round_number in (1, 2):
+        max_round = max(2, max((int(item.round or 0) for item in case.opinions), default=0))
+        for round_number in range(1, max_round + 1):
             round_items = [item for item in opinion_items if item["round"] == round_number]
             rounds[f"round_{round_number}"] = {
                 "round": round_number,
                 "complete": cls._round_agent_coverage(case, round_number),
-                "substantive_ready": cls.round_2_has_substantive_response(case) if round_number == 2 else None,
+                "substantive_ready": cls.round_has_substantive_response(case, round_number) if round_number >= 2 else None,
                 "items": round_items,
                 "lines": [item["line"] for item in round_items],
             }
@@ -1099,10 +1104,16 @@ class CandidateCaseService:
 
     @classmethod
     def round_2_has_substantive_response(cls, case: CandidateCase) -> bool:
-        round_2_opinions = cls._latest_round_opinions(case, 2)
-        if not DISCUSSION_AGENT_IDS.issubset(round_2_opinions):
+        return cls.round_has_substantive_response(case, 2)
+
+    @classmethod
+    def round_has_substantive_response(cls, case: CandidateCase, round_number: int) -> bool:
+        if round_number <= 1:
+            return cls._round_agent_coverage(case, round_number)
+        round_opinions = cls._latest_round_opinions(case, round_number)
+        if not DISCUSSION_AGENT_IDS.issubset(round_opinions):
             return False
-        return all(cls._opinion_has_substantive_round_2_response(round_2_opinions[agent_id]) for agent_id in DISCUSSION_AGENT_IDS)
+        return all(cls._opinion_has_substantive_round_2_response(round_opinions[agent_id]) for agent_id in DISCUSSION_AGENT_IDS)
 
     @classmethod
     def _build_discussion_digest_lines(cls, item: dict) -> list[str]:
@@ -1115,15 +1126,42 @@ class CandidateCaseService:
 
     def _read_cases(self) -> list[CandidateCase]:
         payload = self._read_payload()
-        return [CandidateCase(**self._normalize_case_payload(item)) for item in payload.get("cases", [])]
+        return self._load_cases_from_payload(payload)
 
     def _read_payload(self) -> dict:
+        with self._payload_lock():
+            return self._read_payload_unlocked()
+
+    def _read_payload_unlocked(self) -> dict:
         if not self._storage_path.exists():
             return {"cases": []}
-        return json.loads(self._storage_path.read_text(encoding="utf-8"))
+        raw = self._storage_path.read_text(encoding="utf-8")
+        if not raw.strip():
+            return {"cases": []}
+        return json.loads(raw)
 
     def _write_payload(self, payload: dict) -> None:
-        self._storage_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._payload_lock():
+            self._write_payload_unlocked(payload)
+
+    def _write_payload_unlocked(self, payload: dict) -> None:
+        tmp_path = self._storage_path.with_name(f".{self._storage_path.name}.{uuid4().hex}.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(self._storage_path)
+
+    def _load_cases_from_payload(self, payload: dict) -> list[CandidateCase]:
+        return [CandidateCase(**self._normalize_case_payload(item)) for item in payload.get("cases", [])]
+
+    @contextmanager
+    def _payload_lock(self):
+        lock_path = self._storage_path.with_name(f"{self._storage_path.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     @classmethod
     def _normalize_case_payload(cls, payload: dict) -> dict:
@@ -1886,15 +1924,54 @@ class CandidateCaseService:
 
     @staticmethod
     def _pick_reason(case: CandidateCase, status: str) -> str | None:
+        latest_round = CandidateCaseService._latest_effective_round(case)
+        latest_round_opinions = list(CandidateCaseService._latest_round_opinions(case, latest_round).values())
         if status == "selected":
-            return case.runtime_snapshot.summary or (case.round_2_summary.resolved_points or case.round_1_summary.selected_points or [None])[0]
+            latest_points = CandidateCaseService._collect_reason_points(latest_round_opinions, {"support", "selected"})
+            # 讨论结论优先于 runtime 粗筛文案，避免"基础样本池"占位文案覆盖真实分析
+            return (latest_points or case.round_2_summary.resolved_points or case.round_1_summary.selected_points or [case.runtime_snapshot.summary])[0]
         if status == "rejected":
-            return (case.round_2_summary.remaining_disputes or case.round_1_summary.rejected_points or [case.runtime_snapshot.summary])[0]
+            latest_points = CandidateCaseService._collect_reason_points(
+                latest_round_opinions,
+                {"question", "watch", "watchlist", "limit", "hold", "rejected"},
+            )
+            return (latest_points or case.round_2_summary.remaining_disputes or case.round_1_summary.rejected_points or [case.runtime_snapshot.summary])[0]
         return None
 
     @staticmethod
+    def resolve_headline_reason(case: CandidateCase) -> str:
+        """统一计算 headline_reason 的唯一入口。
+
+        优先级链：
+        1. 最新轮次的 Agent 讨论结论（support/selected 方向）
+        2. selected_reason（经 _pick_reason 处理后的结论）
+        3. rejected_reason
+        4. round_2 resolved_points
+        5. round_1 selected_points
+        6. runtime_snapshot.summary（基础粗筛兜底）
+        """
+        # 1. 尝试从最新一轮讨论中提取
+        latest_round = CandidateCaseService._latest_effective_round(case)
+        latest_opinions = list(CandidateCaseService._latest_round_opinions(case, latest_round).values())
+        latest_support = CandidateCaseService._collect_reason_points(latest_opinions, {"support", "selected"})
+        if latest_support:
+            return latest_support[0]
+        # 2. 尝试已聚合的 selected/rejected reason
+        if case.selected_reason:
+            return case.selected_reason
+        if case.rejected_reason:
+            return case.rejected_reason
+        # 3. 讨论轮次摘要
+        if case.round_2_summary.resolved_points:
+            return case.round_2_summary.resolved_points[0]
+        if case.round_1_summary.selected_points:
+            return case.round_1_summary.selected_points[0]
+        # 4. 兜底 runtime 粗筛
+        return case.runtime_snapshot.summary or "暂无结论"
+
+    @staticmethod
     def _derive_final_status(case: CandidateCase) -> FinalStatus:
-        latest_round = 2 if CandidateCaseService._round_agent_coverage(case, 2) else 1
+        latest_round = CandidateCaseService._latest_effective_round(case)
         latest_opinions = CandidateCaseService._latest_round_opinions(case, latest_round)
         latest_stances = [
             latest_opinions[agent_id].stance
@@ -1923,6 +2000,16 @@ class CandidateCaseService:
         if question_votes >= 2 and selected_votes == 0:
             return "rejected"
         return "watchlist" if case.pool_membership.focus_pool else "rejected"
+
+    @staticmethod
+    def _latest_effective_round(case: CandidateCase) -> int:
+        rounds = sorted({int(item.round or 0) for item in case.opinions if int(item.round or 0) > 0})
+        if not rounds:
+            return 1
+        for round_number in reversed(rounds):
+            if CandidateCaseService._round_agent_coverage(case, round_number):
+                return round_number
+        return rounds[-1]
 
     @staticmethod
     def _round_agent_coverage(case: CandidateCase, round_number: int) -> bool:

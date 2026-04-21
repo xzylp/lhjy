@@ -17,10 +17,18 @@ class TradeCost:
 class CostModel:
     """A股交易成本模型"""
 
-    COMMISSION_RATE = 0.0003    # 佣金 0.03%，最低5元
-    STAMP_DUTY_RATE = 0.0005     # 印花税 0.05% (仅卖出, 2023年8月下调)
-    TRANSFER_FEE_RATE = 0.00002 # 过户费 0.002%
-    SLIPPAGE_RATE = 0.001       # 滑点 0.1%
+    def __init__(
+        self,
+        *,
+        commission_rate: float = 0.0003,
+        stamp_duty_rate: float = 0.0005,
+        transfer_fee_rate: float = 0.00002,
+        slippage_rate: float = 0.001,
+    ) -> None:
+        self.COMMISSION_RATE = commission_rate
+        self.STAMP_DUTY_RATE = stamp_duty_rate
+        self.TRANSFER_FEE_RATE = transfer_fee_rate
+        self.SLIPPAGE_RATE = slippage_rate
 
     def calc(self, price: float, quantity: int, side: str) -> TradeCost:
         value = price * quantity

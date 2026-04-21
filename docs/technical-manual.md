@@ -1,208 +1,177 @@
 # ashare-system-v2 技术手册
 
-> 版本: 0.3.0  
-> 更新日期: 2026-04-06
+> 版本：2026-04-18 当前框架版  
+> 用途：作为本仓库的技术档案，描述当前真实架构、代码完成度、关键模块、运行链路与剩余代码差距。  
+> 口径：本手册以仓库当前代码和 `task.md` 为准，不以早期设想文档为准。
 
-## 一、系统定位
+## 1. 项目定位
 
-`ashare-system-v2` 是 A 股量化运行中台，负责向 OpenClaw 量化团队提供统一的运行、研究、策略、风控、执行、审计和讨论治理数据面。
+`ashare-system-v2` 不是一个单纯的选股脚本，也不是一个只会跑 pipeline 的 FastAPI 服务。
 
-系统目标不是让前台 agent 直接“懂所有量化细节”，而是把量化能力沉淀为稳定 API，再由 OpenClaw 的 `main -> ashare -> ashare子团队` 协作链进行编排。
+当前它的正式定位是：
 
-## 二、当前正式架构
+- Agent 驱动的 A 股量化交易控制面
+- runtime 原子策略仓库
+- 讨论、监督、治理、执行电子围栏与审计留痕中枢
 
-### 2.1 顶层职责
+职责边界如下：
 
-```text
-Feishu / WebChat
-  -> OpenClaw Gateway
-  -> main
-  -> ashare
-  -> ashare-runtime / ashare-research / ashare-strategy / ashare-risk / ashare-executor / ashare-audit
-  -> ashare-system-v2 FastAPI
-  -> QMT / XtQuant / state / reports / audits
-  -> main 汇总后对外回复
-```
+- Agent 负责：
+  - 理解市场
+  - 组织候选发现
+  - 选择或组合工具
+  - 发起讨论与质询
+  - 形成提案与执行建议
+- 程序负责：
+  - 数据获取与 serving
+  - factor / playbook / compose 执行
+  - 风控与执行预检
+  - 讨论状态机
+  - 审计、治理、评分与学习闭环
+  - 飞书问答、监督和状态输出
 
-### 2.2 OpenClaw 职责边界
+## 2. 当前总体架构
 
-| Agent | 定位 | 主要职责 |
-|------|------|----------|
-| `main` | 唯一前台入口 | 判断任务类型、路由专业团队、统一对外回复 |
-| `ashare` | 量化中台总调度 | 承接股票与量化问题，拆分给量化子角色并汇总 |
-| `ashare-runtime` | 运行面 | 健康检查、pipeline、intraday、运行报告 |
-| `ashare-research` | 研究面 | 研究同步、新闻/公告入库、研究摘要 |
-| `ashare-strategy` | 策略面 | 候选股解释、排序依据、策略比较、观察名单 |
-| `ashare-risk` | 风控闸门 | allow / limit / reject、账户与配置约束检查 |
-| `ashare-executor` | 执行面 | 账户、持仓、订单、成交、已放行执行意图落地 |
-| `ashare-audit` | 审计复核 | 审计、会议、运行报告、研究摘要复盘 |
-
-### 2.3 正式路由原则
-
-- `main` 是唯一前台入口，飞书与 webchat 不再直连 `ashare`。
-- `ashare` 不是前台客服，而是量化域总调度。
-- `ashare` 默认先分流，再汇总，不越权替代子角色。
-- 最终用户可见回复始终由 `main` 输出。
-
-## 三、系统源码结构
+### 2.1 顶层拓扑
 
 ```text
-ashare-system-v2/
-├── src/ashare_system/
-│   ├── apps/              # FastAPI 路由层
-│   ├── strategy/          # 选股、决策、仓位
-│   ├── risk/              # 规则、守卫、情绪保护
-│   ├── data/              # 数据获取、清洗、缓存
-│   ├── factors/           # 因子计算与筛选
-│   ├── ai/                # 模型推理与训练框架
-│   ├── report/            # 运行与盘后报告
-│   ├── notify/            # 飞书消息
-│   ├── learning/          # 学习与复盘
-│   ├── infra/             # XtQuant/QMT/状态/Audit 基础设施
-│   ├── scheduler.py       # 定时调度
-│   ├── container.py       # 依赖注入
-│   └── run.py             # CLI 入口
-├── scripts/
-├── docs/
-├── openclaw/
-└── tests/
+Feishu / Web / Operator
+  -> ashare-system-v2 FastAPI control plane
+  -> runtime / discussion / supervision / governance / reports
+  -> Go data platform / Windows execution gateway / state stores
 ```
 
-## 四、OpenClaw 与程序的连接方式
+如果按正式部署口径展开：
 
-### 4.1 正式连接方式
+```text
+Linux control plane
+  ├─ ashare-system-v2 API
+  ├─ scheduler
+  ├─ go-data-platform
+  ├─ feishu-longconn
+  └─ openclaw-gateway
 
-- OpenClaw 子角色读取和调用 `ashare-system-v2` 的 FastAPI。
-- Windows 侧 FastAPI 启动后会写入 `.ashare_state/service_endpoints.json`。
-- WSL 侧通过 `scripts/ashare_api.sh` 先读 manifest，再动态探测并访问 Windows 服务。
-- `start_unattended.ps1` 只负责 Windows 侧 FastAPI + scheduler，不再管理 gateway。
-- gateway 由 `scripts/start_openclaw_gateway.sh` 单独启动和重启。
+Windows execution side
+  ├─ windows execution gateway
+  └─ QMT
+```
 
-### 4.2 设计原则
+本文重点只看代码框架，不讨论 QMT 接线是否可用。
 
-- 不把 gateway 生命周期和量化服务生命周期耦合在同一脚本里。
-- 不让前台 `main` 直接背负运行、研究、执行等量化职责。
-- 不依赖旧 session、旧 memory 或旧 prompt 去“猜”量化入口。
-- 用清晰路由和 WSL 直连代替隐式包装和历史会话补丁。
-- 配置变更默认通过新会话生效，保留历史会话用于追溯，不把清历史当成上线前提。
+### 2.2 五层结构
 
-### 4.3 未来生产部署目标
+当前主线已经不是“固定 runtime 流程”，而是五层结构：
 
-当前文档描述的正式运行链路以开发机 `WSL + Windows` 联调为基础；未来生产部署目标改为：
+#### L1 市场理解层
 
-- Linux 服务器运行：
-  - `OpenClaw Gateway`
-  - `main / ashare / ashare 子团队`
-  - `ashare-system-v2 FastAPI`
-- Windows 虚拟机运行：
-  - `Windows Execution Gateway`
-  - `QMT / XtQuant`
+- 主体：Agent
+- 目标：给出市场阶段、主线方向、风险偏好、持仓动作
+- 主要输入：
+  - `workspace-context`
+  - `market-context`
+  - `event-context`
+  - `account-state`
+  - `execution-precheck`
 
-目标拓扑见：
+#### L2 候选发现层
 
-- [openclaw-linux-qmt-deployment-v1.md](/mnt/d/Coding/lhjy/ashare-system-v2/docs/implementation-drafts/openclaw-linux-qmt-deployment-v1.md)
+- 主体：程序提供入口，Agent 自主选择
+- 当前候选入口已包含：
+  - 全市场扫描
+  - 板块热点
+  - 新闻催化
+  - 持仓监控
+  - 日内做 T
+  - 尾盘潜伏
+  - Agent 自提机会票
 
-### 4.4 执行边界
+#### L3 Compose 编排层
 
-- Agent 可以生成候选、讨论观点、execution intent 和 review 结论。
-- Agent 不直接持有 QMT 下单权。
-- 真正调用 QMT 的唯一写口应是 `Windows Execution Gateway`。
-- Linux 控制面只输出：
-  - `approved execution_intents`
-  - 审批状态
-  - 熔断状态
-  - 审计链
+- 主体：Agent 输出 brief，runtime 执行
+- 当前已落：
+  - `POST /runtime/jobs/compose`
+  - `POST /runtime/jobs/compose-from-brief`
+  - `GET /runtime/capabilities`
+  - `GET /runtime/strategy-repository`
 
-### 4.5 自我进化边界
+#### L4 风控与执行层
 
-- 自我进化只允许进入：
-  - prompt
-  - routing
-  - 离线回测
-  - attribution / metrics / review 研究闭环
-- 自我进化不允许直接进入：
-  - live 执行权限
-  - QMT 下单链
-  - 风控阈值自动放宽
-  - 自动部署到生产
-- 任何“进化结果”都必须经过：
-  - offline validation
-  - paper / supervised replay
-  - human review
-  - 再进入生产
+- 主体：程序
+- 当前已落：
+  - 执行预检
+  - execution intents
+  - dispatch / preview / submitted / blocked
+  - 电子围栏
+  - 执行回执与对账
 
-## 五、V2 当前可供 OpenClaw 使用的核心接口
+#### L5 学习与治理层
 
-### 5.1 Runtime
+- 主体：程序，供 Agent 消费
+- 当前已落：
+  - agent score
+  - outcome ledger
+  - learned asset
+  - advice queue
+  - review board
+  - nightly sandbox
+
+## 3. 当前主链
+
+### 3.1 盘前到盘后主链
+
+```text
+调度 / 手动触发
+  -> runtime pipeline / intraday / event fetch
+  -> candidate cases
+  -> discussion cycle bootstrap
+  -> round 1
+  -> refresh
+  -> round 2 / finalize
+  -> execution precheck
+  -> execution intents
+  -> dispatch preview / submitted
+  -> execution reconciliation
+  -> review board
+  -> nightly sandbox
+  -> settlement / learning / governance
+```
+
+### 3.2 当前主要状态载体
+
+- `workspace_context`
+- `runtime_context`
+- `discussion_context`
+- `monitor_context`
+- `client_brief`
+- `execution_precheck`
+- `execution_dispatch_latest`
+- `latest_execution_reconciliation`
+- `latest_review_board`
+- `latest_nightly_sandbox`
+
+### 3.3 当前关键 API 入口
+
+#### runtime / strategy
 
 - `GET /runtime/health`
+- `GET /runtime/capabilities`
+- `GET /runtime/strategy-repository`
+- `GET /runtime/strategy-repository/panel`
 - `POST /runtime/jobs/pipeline`
 - `POST /runtime/jobs/intraday`
-- `POST /runtime/jobs/autotrade`
-- `GET /runtime/reports/latest`
+- `POST /runtime/jobs/compose`
+- `POST /runtime/jobs/compose-from-brief`
+- `POST /runtime/learned-assets/transition`
+- `GET /runtime/learned-assets/panel`
+- `GET /runtime/learned-assets/advice`
+- `POST /runtime/learned-assets/advice/resolve`
 
-### 5.2 Research
+#### discussion / execution
 
-- `GET /research/health`
-- `POST /research/sync`
-- `POST /research/events/news`
-- `POST /research/events/announcements`
-- `GET /research/summary`
-
-### 5.3 Strategy
-
-- `GET /strategy/strategies`
-- `POST /strategy/screen`
-
-### 5.4 Market
-
-- `GET /market/health`
-- `GET /market/universe`
-- `GET /market/snapshots`
-- `GET /market/bars`
-- `GET /market/sectors`
-
-### 5.5 Execution
-
-- `GET /execution/health`
-- `GET /execution/balance/{account_id}`
-- `GET /execution/positions/{account_id}`
-- `GET /execution/orders/{account_id}`
-- `GET /execution/trades/{account_id}`
-- `POST /execution/orders`
-
-### 5.6 System / Audit / Governance
-
-- `GET /system/health`
-- `GET /system/home`
-- `GET /system/overview`
-- `GET /system/operations/components`
-- `GET /system/audits`
-- `GET /system/audits/by-decision`
-- `GET /system/audits/by-experiment`
-- `GET /system/research/summary`
-- `GET /system/reports/runtime`
-- `GET /system/reports/postclose-master`
-- `GET /system/reports/postclose-master-template`
-- `POST /system/meetings/record`
-- `GET /system/meetings/latest`
-- `GET /system/config`
-- `GET /system/params`
-- `POST /system/params/proposals`
-- `GET /system/params/proposals`
-- `GET /system/cases`
-- `GET /system/cases/{case_id}`
-- `POST /system/discussions/opinions/batch`
-- `POST /system/cases/{case_id}/rebuild`
-- `POST /system/cases/rebuild`
-- `GET /system/discussions/summary`
-- `GET /system/discussions/reason-board`
-- `GET /system/discussions/agent-packets`
-- `GET /system/discussions/reply-pack`
-- `GET /system/discussions/final-brief`
 - `GET /system/discussions/client-brief`
 - `GET /system/discussions/meeting-context`
-- `GET /system/discussions/cycles`
+- `GET /system/discussions/reply-pack`
+- `GET /system/discussions/final-brief`
 - `GET /system/discussions/cycles/{trade_date}`
 - `POST /system/discussions/cycles/bootstrap`
 - `POST /system/discussions/cycles/{trade_date}/rounds/{round}/start`
@@ -212,118 +181,285 @@ ashare-system-v2/
 - `GET /system/discussions/execution-intents`
 - `POST /system/discussions/execution-intents/dispatch`
 - `GET /system/discussions/execution-dispatch/latest`
-- `GET /system/agent-scores`
-- `POST /system/agent-scores/settlements`
 
-## 六、v0.9 讨论流程骨架
+#### supervision / feishu / ops
 
-### 6.1 最小状态链
+- `GET /system/workspace-context`
+- `GET /system/monitoring/cadence`
+- `GET /system/agents/supervision-board`
+- `POST /system/agents/supervision/check`
+- `POST /system/feishu/ask`
+- `POST /system/feishu/events`
+- `GET /system/feishu/briefing`
+- `GET /system/feishu/longconn/status`
+- `POST /system/startup-recovery/run`
+- `POST /system/execution-reconciliation/run`
+- `GET /system/deployment/service-recovery-readiness`
+- `GET /system/deployment/controlled-apply-readiness`
+
+## 4. 源码结构与职责
+
+### 4.1 目录结构
 
 ```text
-runtime pipeline
-  -> candidate_case sync
-  -> discussion cycle bootstrap
-  -> round_1_running
-  -> round_1_summarized
-  -> round_2_running
-  -> final_review_ready
-  -> final_selection_ready / final_selection_blocked
+src/ashare_system/
+├── apps/                 # API 路由层，system/runtime/research/market/execution
+├── data/                 # archive、serving、event bus、auction、workspace 聚合
+├── discussion/           # case、cycle、summary、brief、packet、finalize
+├── infra/                # adapter、go client、audit、healthcheck、state
+├── learning/             # score、settlement、attribution、prompt patch、registry update
+├── monitor/              # cadence、heartbeat、event watch、polling state
+├── notify/               # 飞书模板、推送、变化通知
+├── risk/                 # execution guard、规则与电子围栏
+├── strategy/             # factor/playbook/composer/repository/nightly sandbox
+├── scheduler.py          # 调度总入口
+├── container.py          # 依赖装配
+└── run.py                # CLI
 ```
 
-### 6.2 协作要求
+### 4.2 关键模块
 
-- `ashare-runtime` 先触发 pipeline，并返回 `trade_date` 与候选摘要。
-- `ashare` 用 `trade_date` 初始化 cycle，不直接假设当日状态已存在。
-- `ashare-research`、`ashare-strategy`、`ashare-risk`、`ashare-audit` 两轮都返回 opinion 数组。
-- Round 2 只针对 `round_2_target_case_ids`，不再对全部 focus_pool 重跑。
-- `ashare` 统一调用 `POST /system/discussions/opinions/batch` 归档，不允许子代理直接改写 case。
-- Round 2 opinion 不能只重复结论；至少要包含“被谁质疑 / 回应了什么 / 是否改判 / 剩余争议”中的一个结构化字段，否则后端不会把该票视为二轮完成。
-- `GET /system/discussions/summary`、`GET /system/discussions/agent-packets` 与 `GET /system/discussions/meeting-context` 会显式提供 `controversy_summary_lines`、`round_2_guidance`、`round_coverage`、`substantive_gap_case_ids`，供 `ashare` 在二轮前转给子角色。
-- 终审必须经过 `POST /system/discussions/cycles/{trade_date}/finalize`。
-- 若讨论尚未达到 `final_review_ready`，`finalize` 会返回 `finalize_skipped=true` 且原因为 `discussion_not_ready`，表示应先补齐二轮实质回应，而不是执行层故障。
-- 只有 `final_selection_ready` 且存在 `execution_pool_case_ids` 时，才允许委派 `ashare-executor`。
-- `finalize` 响应应直接携带 `client_brief`，供 `ashare` 和 `main` 复用，减少重复查询。
-- 执行预演或执行提交统一走 `POST /system/discussions/execution-intents/dispatch`，不再由子代理自行拼接“执行结果”文本。
-- 若需要回看最近一次执行预演或提交结果，统一读 `GET /system/discussions/execution-dispatch/latest`。
+#### `apps/system_api.py`
 
-## 七、运行原则
+- 控制面主路由
+- 负责：
+  - 讨论态
+  - 执行态
+  - supervision
+  - 飞书问答
+  - readiness / deployment 检查
+  - startup recovery / reconciliation
 
-### 6.1 运行与研究
+#### `apps/runtime_api.py`
 
-- `ashare-runtime` 负责“跑”和“读”，不负责放行和下单。
-- `ashare-research` 负责把新闻、公告、事件整理成可审计输入。
-- `ashare-strategy` 负责解释和排序，不直接下单。
+- runtime 工具库入口
+- 负责：
+  - pipeline / intraday / compose
+  - capabilities
+  - strategy repository
+  - learned assets
 
-### 6.2 风控与执行
+#### `strategy/factor_registry.py`
 
-- `ashare-risk` 是执行前闸门，没有 allow 不进入执行。
-- `ashare-executor` 只接受字段完整、已放行的执行意图。
-- `ashare-executor` 的正式职责是消费、编排和回看执行意图，不直接等价于“调用 QMT 下单”。
-- 面向未来生产部署时，`ashare-executor` 的落地动作应通过 `Windows Execution Gateway` 转译到 QMT。
-- 默认执行模式仍以 paper / supervised 为主，不默认推动 live。
+- 当前第一批因子库注册表
+- 不是早期 README 中那种“150+ 因子”的状态
+- 当前真实口径应理解为：
+  - 已完成第一批核心因子落地
+  - 还没到“完整 Alpha Factory 工业规模”
 
-### 6.3 审计与回放
+#### `strategy/playbook_registry.py`
 
-- 运行结果、研究摘要、会议纪要、系统审计都应能被 `ashare-audit` 读取和归纳。
-- 用户面向的总结由 `main` 输出，但底层证据链由 `ashare-system-v2` 和 `ashare-audit` 维护。
+- 当前第一批战法注册表
+- 已从“写死策略模板”转为“原子战法 + 统一 evaluate 接口”
 
-## 八、当前重点风险
+#### `strategy/strategy_composer.py`
 
-### 7.1 非代码类风险
+- 当前 runtime 编排核心
+- 负责：
+  - 组合 factor / playbook
+  - 处理约束
+  - 形成候选解释
+  - 接 learned asset 偏置
 
-- 若当前配置、workspace 指令和仓库文档发生漂移，模型可能被旧工作流重新拉偏。
-- 仓库内旧 8-agent 资料若不清理，会持续制造维护歧义。
-- WSL 与 Windows 的 8100 可达性必须以实际探测为准，不能只凭旧会话判断。
-- 常规验证应保留历史会话，靠新增 run 的时间戳或唯一标记确认链路，不把 reset 当成默认操作。
+#### `discussion/`
 
-### 7.2 本轮不处理的能力缺口
+- 当前多 Agent 讨论协议与状态机核心
+- 包含：
+  - case
+  - cycle
+  - round 推进
+  - final brief / reply pack / meeting context
 
-- 150+ 因子尚未补齐。
-- AI 模型训练和上线未完成。
-- live 自动执行的治理接口仍需进一步细化。
-- Linux 控制面与 Windows VM 执行面的跨机 intent / receipt 协议尚未正式固化。
-- 自我进化 proposal 到上线审批的自动化闭环尚未落地。
+#### `scheduler.py`
 
-## 九、推荐启动与验证
+- 当前所有自动任务的总编排入口
+- 已接：
+  - 竞价
+  - 微观巡检
+  - 事件扫描
+  - review board
+  - nightly sandbox
+  - settlement
+  - 增量训练
 
-### 8.1 Windows 侧
+## 5. 代码面完成度
 
-```powershell
-cd D:\Coding\lhjy\ashare-system-v2
-.\scripts\start_unattended.ps1
+### 5.1 已完成部分
+
+按 `task.md` 当前统计：
+
+- 功能模块 A-H 完成度：`47 / 47 = 100%`
+- 集合竞价、盘中微观、波峰波谷出场、事件响应、多 Agent 论证、归因自进化、夜间沙盘、数据链整固均已落地
+
+主框架层面已完成：
+
+- Agent 中心化改造骨架
+- runtime 工具库化
+- strategy repository
+- learned asset 状态流转第一版
+- discussion cycle 泛化
+- supervision 任务派发与质量口径
+- 飞书交易台化问答
+- Linux 控制面运行与健康检查
+
+### 5.2 部分完成部分
+
+以下条目已做出主体，但还没完全收口：
+
+#### R0.6 因子仓库
+
+现状：
+
+- 第一批核心因子已落地并可运行
+- 已接真实 `market_adapter`
+
+未收口：
+
+- 因子规模、分层、赛马密度还不够
+- 还不能视为完整 Alpha Factory
+
+#### R0.7 战法插件层
+
+现状：
+
+- 第一批经典战法已落地
+- 已统一接入 registry / evaluate
+
+未收口：
+
+- 战法覆盖面还不够广
+- 版本赛马还未完全成体系
+
+#### R0.10 评估层
+
+现状：
+
+- 已有 compose 评估账本
+- 已接离线回测与 Rank IC 分析
+
+未收口：
+
+- 真实结果驱动的评价面还需继续收紧
+- 账本到治理建议的自动收口仍不完整
+
+#### R0.11 runtime 仓库生产化
+
+现状：
+
+- 资产注册、查询、版本视图、runtime mode、panel、治理建议已在
+
+未收口：
+
+- 灰度发布编排不完整
+- 批量切流未完成
+- 自动切流未完成
+
+#### R0.13 / R0.14 学习产物治理
+
+现状：
+
+- `draft / review_required / active / archived / rejected` 状态模型已在
+- advice ingest / resolve / 可选 transition 已在
+
+未收口：
+
+- 审批评估链不完整
+- 自动联动不足
+- 更广的正式对象反查未完成
+
+#### S1.3.3 监督消费闭环
+
+现状：
+
+- 写回观点后已能标记完成并 refresh cycle
+
+未收口：
+
+- 研究摘要
+- 执行回执
+- 盘后学习
+- 更广义产物自动消费
+
+#### S1.3.5 / 3.6 / 3.7 监督续发
+
+现状：
+
+- 已支持四岗材料齐备后的自动续发
+- 已接仓位语境和执行结果语境
+
+未收口：
+
+- 满仓替换
+- 真实成交后学习归因
+- 盘后参数调整
+- 更细粒度持仓管理
+
+## 6. 距离“代码面完全上线”还差什么
+
+如果只回答“服务能不能跑”，答案是：能。  
+如果回答“代码面是否已经完全生产化”，答案是：还没有。
+
+当前剩余差距不是原子功能缺失，而是以下四类收口：
+
+### 6.1 监督自动推进链收口
+
+还需要让更多真实产物自动推动主线，而不只靠观点写回推进 round。
+
+### 6.2 学习产物治理闭环收口
+
+还需要让 learned asset 从建议、审批、转正、复盘之间形成更完整的自动链。
+
+### 6.3 runtime 仓库治理收口
+
+还需要把“可注册、可查看、可建议”推进到“更完整的灰度治理和版本切流”。
+
+### 6.4 交易台输出收口
+
+还需要继续压缩“能答但不够像交易台”的边角场景，确保飞书、前端、briefing、client brief 输出口径统一。
+
+## 7. 实际可运行状态
+
+结合当前 `task.md`：
+
+- Linux 控制面已实际通过健康检查
+- Go 数据平台、调度器、飞书长连接、OpenClaw Gateway 均可在线
+- 上一交易日 `2026-04-17` 的正式准入口径已实测全绿
+
+对应记录见：
+
+- [task.md](/srv/projects/ashare-system-v2/task.md)
+
+因此，代码面现在更准确的判断是：
+
+```text
+已经具备上线运行条件，但还没到“所有自治闭环全部收官”的状态。
 ```
 
-### 8.2 WSL 侧
+## 8. 推荐阅读顺序
 
-```bash
-cd /mnt/d/Coding/lhjy/ashare-system-v2
-./scripts/start_openclaw_gateway.sh
-```
+### 如果你想看总体框架
 
-### 8.3 验证
+- [README](/srv/projects/ashare-system-v2/README.md)
+- [Agent 自主编排与 101 因子库实施细则](/srv/projects/ashare-system-v2/docs/agent_autonomy_factor_library_plan_20260417.md)
 
-```bash
-./scripts/ashare_api.sh probe
-curl http://127.0.0.1:18789/health
-./scripts/ashare_api.sh GET /health
-./scripts/ashare_api.sh GET /runtime/health
-./scripts/ashare_api.sh GET /system/overview
-./scripts/smoke_discussion_flow.sh 5
-./scripts/smoke_v09_cycle.sh 5
-./scripts/smoke_quant_joint.sh 10 8890130545
-./scripts/verify_openclaw_chain.sh runtime
-./scripts/verify_openclaw_chain.sh research
-```
+### 如果你想看主流程
 
-### 8.4 quant 联调补充
+- [Agent 接口与机器人主线流程](/srv/projects/ashare-system-v2/docs/agent_robot_mainline_workflow.md)
+- [runtime Agent 协议草案](/srv/projects/ashare-system-v2/docs/runtime_agent_protocol_draft_20260415.md)
+- [多 Agent 讨论协议 v1](/srv/projects/ashare-system-v2/docs/multi-agent-deliberation-protocol-v1.md)
 
-- `smoke_quant_joint.sh` 只做只读和预演，不提交真实订单。
-- 该脚本覆盖：
-  - `quant` profile 状态
-  - `runtime pipeline`
-  - `execution-precheck`
-  - `execution-intents`
-  - `dispatch apply=false`
-  - `execution-dispatch/latest`
-  - `client-brief / final-brief`
-- 若 `execution-intents` 为空，优先检查当日是否无 `selected` 或被资金/仓位/时段阻断，不要先判定为网关故障。
+### 如果你想看当前真实进度
+
+- [task.md](/srv/projects/ashare-system-v2/task.md)
+
+### 如果你想看飞书侧操作
+
+- [飞书三权与机器人主线操作手册](/srv/projects/ashare-system-v2/docs/feishu_operator_manual_20260416.md)
+
+## 9. 维护原则
+
+后续更新本手册时，统一遵守这三个原则：
+
+- 只写当前代码和任务进度已经成立的事实
+- 不再沿用早期 README 中明显过时的“150+ 因子、三大策略、固定漏斗”叙事
+- “可运行”和“完全收官”必须分开写，避免误导

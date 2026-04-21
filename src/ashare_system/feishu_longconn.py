@@ -34,6 +34,10 @@ class FeishuLongConnectionBridge:
     message_timeout_sec: float = 40.0
     heartbeat_interval_sec: float = 15.0
     reply_sender: FeishuNotifier | None = None
+    bot_role: str = "main"
+    bot_name: str = ""
+    bot_id: str = ""
+    bot_app_id: str = ""
 
     def __post_init__(self) -> None:
         self.control_plane_base_url = self.control_plane_base_url.rstrip("/")
@@ -122,9 +126,14 @@ class FeishuLongConnectionBridge:
         raise RuntimeError(f"不支持的飞书长连接负载类型: {type(payload)!r}")
 
     def _forward_to_control_plane(self, payload: dict[str, Any], *, timeout_sec: float) -> dict[str, Any]:
+        enriched_payload = dict(payload)
+        enriched_payload.setdefault("__receiver_bot_role", self.bot_role)
+        enriched_payload.setdefault("__receiver_bot_name", self.bot_name)
+        enriched_payload.setdefault("__receiver_bot_id", self.bot_id)
+        enriched_payload.setdefault("__receiver_bot_app_id", self.bot_app_id)
         response = httpx.post(
             f"{self.control_plane_base_url}/system/feishu/events",
-            json=payload,
+            json=enriched_payload,
             timeout=timeout_sec,
         )
         response.raise_for_status()
@@ -138,11 +147,17 @@ class FeishuLongConnectionBridge:
             return
         receive_id = str(forwarded.get("reply_to_chat_id") or "").strip()
         reply_lines = forwarded.get("reply_lines") or []
+        reply_mode = str(forwarded.get("reply_mode") or "").strip().lower()
         if not receive_id:
             return
         reply_card = dict(forwarded.get("reply_card") or {})
         dispatched = False
-        if isinstance(reply_card.get("card"), dict) and reply_card.get("card"):
+        if reply_mode == "text" and isinstance(reply_lines, list):
+            text = "\n".join(str(line or "").strip() for line in reply_lines if str(line or "").strip())
+            if not text:
+                return
+            dispatched = self.reply_sender.send_text(text, receive_id=receive_id)
+        elif isinstance(reply_card.get("card"), dict) and reply_card.get("card"):
             dispatched = self.reply_sender.send_card(
                 dict(reply_card.get("card") or {}),
                 receive_id=receive_id,
@@ -243,29 +258,39 @@ def _require_lark_sdk():
     return lark, P2URLPreviewGetResponse
 
 
-def run_feishu_long_connection(settings) -> None:
+def run_feishu_long_connection(settings, bot_role: str | None = None) -> None:
     lark, P2URLPreviewGetResponse = _require_lark_sdk()
 
-    app_id = str(settings.notify.feishu_app_id or "").strip()
-    app_secret = str(settings.notify.feishu_app_secret or "").strip()
+    resolved_role = str(bot_role or settings.notify.feishu_bot_role or "main").strip().lower() or "main"
+    bot_config = settings.notify.get_feishu_bot_config(resolved_role)
+    app_id = str(bot_config.get("app_id") or "").strip()
+    app_secret = str(bot_config.get("app_secret") or "").strip()
     if not app_id or not app_secret:
-        raise RuntimeError("飞书长连接启动失败: 缺少 ASHARE_FEISHU_APP_ID 或 ASHARE_FEISHU_APP_SECRET")
+        raise RuntimeError(f"飞书长连接启动失败: bot_role={resolved_role} 缺少 app_id 或 app_secret")
 
+    state_name = "feishu_longconn_state.json" if resolved_role == "main" else f"feishu_longconn_{resolved_role}_state.json"
     bridge = FeishuLongConnectionBridge(
         control_plane_base_url=_normalize_local_base_url(
             settings.notify.feishu_control_plane_base_url,
             settings.service.port,
         ),
-        state_store=StateStore(settings.storage_root / "feishu_longconn_state.json"),
+        state_store=StateStore(settings.storage_root / state_name),
         timeout_sec=max(float(settings.service.probe_timeout_sec or 3.0), 3.0),
         message_timeout_sec=max(float(settings.service.probe_timeout_sec or 3.0), 40.0),
         reply_sender=FeishuNotifier(
             app_id,
             app_secret,
-            str(settings.notify.feishu_chat_id or "").strip(),
-            important_chat_id=str(settings.notify.feishu_important_chat_id or "").strip(),
-            supervision_chat_id=str(settings.notify.feishu_supervision_chat_id or "").strip(),
+            str(bot_config.get("chat_id") or "").strip(),
+            important_chat_id=str(bot_config.get("important_chat_id") or "").strip(),
+            supervision_chat_id=str(bot_config.get("supervision_chat_id") or "").strip(),
+            bot_role=resolved_role,
+            bot_name=str(bot_config.get("bot_name") or "").strip(),
+            bot_id=str(bot_config.get("bot_id") or "").strip(),
         ),
+        bot_role=resolved_role,
+        bot_name=str(bot_config.get("bot_name") or "").strip(),
+        bot_id=str(bot_config.get("bot_id") or "").strip(),
+        bot_app_id=app_id,
     )
     bridge.mark_worker_started()
     bridge.start_heartbeat()
@@ -279,17 +304,21 @@ def run_feishu_long_connection(settings) -> None:
         forwarded = bridge.handle_url_preview(payload)
         return P2URLPreviewGetResponse(forwarded)
 
-    event_handler = (
-        lark.EventDispatcherHandler.builder("", "")
-        .register_p2_im_message_receive_v1(do_p2_im_message_receive_v1)
-        .register_p2_url_preview_get(do_p2_url_preview_get)
-        .build()
+    handler_builder = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(
+        do_p2_im_message_receive_v1
     )
+    preview_enabled = resolved_role == "main"
+    if preview_enabled:
+        handler_builder = handler_builder.register_p2_url_preview_get(do_p2_url_preview_get)
+    event_handler = handler_builder.build()
 
     logger.info(
-        "飞书长连接启动: control_plane_base_url=%s app_id=%s",
+        "飞书长连接启动: role=%s bot=%s control_plane_base_url=%s app_id=%s preview_enabled=%s",
+        resolved_role,
+        bridge.bot_name or bridge.bot_id or app_id[:10],
         bridge.control_plane_base_url,
         app_id,
+        preview_enabled,
     )
     cli = MonitoringWSClient(
         lark.ws.Client,

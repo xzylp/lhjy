@@ -52,6 +52,29 @@ check_user_unit_active() {
     fi
 }
 
+check_unit_active_any_scope() {
+    local label="$1"
+    shift
+    local candidates=("$@")
+    local scope
+    local unit
+    local state
+    for candidate in "${candidates[@]}"; do
+        scope="${candidate%%:*}"
+        unit="${candidate#*:}"
+        if [[ "${scope}" == "user" ]]; then
+            state="$(systemctl --user is-active "${unit}" 2>/dev/null || true)"
+        else
+            state="$(systemctl is-active "${unit}" 2>/dev/null || true)"
+        fi
+        if [[ "${state}" == "active" ]]; then
+            report_check "${label}" "OK" "${scope}:${unit}"
+            return 0
+        fi
+    done
+    report_check "${label}" "NO" "$(printf '%s ' "${candidates[@]}")"
+}
+
 check_http_json() {
     local label="$1"
     local url="$2"
@@ -101,12 +124,12 @@ check_single_process() {
 
 echo "[ashare-v2] 用户级统一栈检查:"
 check_user_unit_active "ashare-stack.target"
-check_user_unit_active "ashare-system-v2.service"
-check_user_unit_active "ashare-scheduler.service"
-check_user_unit_active "ashare-go-data-platform.service"
-check_user_unit_active "ashare-feishu-longconn.service"
+check_unit_active_any_scope "systemd:control-plane" "user:ashare-system-v2.service" "system:ashare-system-v2.service"
+check_unit_active_any_scope "systemd:scheduler" "user:ashare-scheduler.service" "system:ashare-system-v2-scheduler.service"
+check_unit_active_any_scope "systemd:go-data" "user:ashare-go-data-platform.service" "system:ashare-go-data-platform.service"
+check_unit_active_any_scope "systemd:feishu" "user:ashare-feishu-longconn.service" "system:ashare-feishu-longconn.service"
 check_user_unit_active "hermes-gateway-ashare-backup.service"
-check_user_unit_active "openclaw-gateway.service"
+check_unit_active_any_scope "systemd:openclaw" "user:openclaw-gateway.service" "system:openclaw-gateway.service"
 
 echo "[ashare-v2] 端口监听检查:"
 check_listener "listener:8100" "${SERVICE_PORT}"

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 import json
 import math
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter
@@ -15,12 +16,20 @@ from pydantic import BaseModel, Field
 
 from ..contracts import MarketProfile, SectorProfile, StockBehaviorProfile
 from ..data.archive import DataArchiveStore
+from ..data.cache import KlineCache
+from ..data.catalog_service import CatalogService
+from ..data.control_db import ControlPlaneDB
+from ..data.freshness import DataFreshnessMonitor
+from ..data.history_ingest import HistoryIngestService
+from ..data.history_store import HistoryStore
 from ..data.serving import ServingStore
 from ..discussion.candidate_case import CandidateCaseService
 from ..governance.param_service import ParameterService
 from ..infra.audit_store import AuditStore, StateStore
 from ..infra.adapters import ExecutionAdapter
+from ..infra.circuit_breaker import CircuitBreakerRegistry
 from ..infra.market_adapter import MarketDataAdapter
+from ..infra.trace import TradeTraceService
 from ..monitor.stock_pool import StockPoolManager
 from ..monitor.persistence import MonitorStateService
 from ..notify.dispatcher import MessageDispatcher
@@ -29,6 +38,7 @@ from ..precompute import DossierPrecomputeService
 from ..runtime_compose_contracts import RuntimeComposeBriefRequest, RuntimeComposeRequest
 from ..runtime_config import RuntimeConfig, RuntimeConfigManager
 from ..selection_preferences import match_excluded_theme, normalize_excluded_theme_keywords
+from ..market.regime_detector import detect_market_regime, detect_regime_transition
 from ..sentiment.calculator import SentimentCalculator
 from ..settings import AppSettings
 from ..strategy.registry import StrategyRegistry
@@ -40,17 +50,35 @@ from ..strategy.atomic_repository import (
     strategy_atomic_repository,
 )
 from ..strategy.constraint_pack import apply_constraint_pack, resolve_constraint_pack
+from ..strategy.compose_factor_policy import (
+    build_factor_selection_policy_contract,
+    evaluate_compose_factor_policy,
+)
 from ..strategy.evaluation_ledger import EvaluationLedgerService
 from ..strategy.factor_registry import bootstrap_factor_registry, factor_registry
+from ..strategy.factor_monitor import FactorMonitor
 from ..strategy.learned_asset_service import LearnedAssetService
 from ..strategy.nightly_sandbox import NightlySandbox
 from ..strategy.playbook_registry import bootstrap_playbook_registry, playbook_registry
 from ..strategy.strategy_composer import StrategyComposer
 from ..strategy.router import StrategyRouter
 from ..strategy.screener import StockScreener
+from ..strategy.default_runtime_strategy import (
+    apply_market_alignment_order as apply_default_market_alignment_order,
+    apply_playbook_order as apply_default_playbook_order,
+    build_leader_ranks as build_default_leader_ranks,
+    build_routing_market_profile as build_default_routing_market_profile,
+    infer_behavior_profiles as infer_default_behavior_profiles,
+    infer_sector_profiles as infer_default_sector_profiles,
+    resolve_symbol_sector_map as resolve_default_symbol_sector_map,
+    score_runtime_snapshot,
+)
 from ..learning.attribution import TradeAttributionService
+from ..learning.failure_journal import FailureJournalService
+from ..learning.market_memory import MarketMemoryService
 from ..learning.registry_updater import RegistryUpdater
 from ..learning.score_state import AgentScoreService
+from ..learning.strategy_lifecycle import StrategyLifecycleService
 
 
 class RuntimeJobRequest(BaseModel):
@@ -74,6 +102,7 @@ def build_router(
     audit_store: AuditStore,
     runtime_state_store: StateStore,
     meeting_state_store: StateStore | None = None,
+    research_state_store: StateStore | None = None,
     config_mgr: RuntimeConfigManager | None = None,
     parameter_service: ParameterService | None = None,
     candidate_case_service: CandidateCaseService | None = None,
@@ -88,6 +117,15 @@ def build_router(
     latest_report = reports_dir / "runtime_latest.json"
     archive_store = DataArchiveStore(settings.storage_root)
     serving_store = ServingStore(settings.storage_root)
+    history_catalog = CatalogService(ControlPlaneDB(settings.control_plane_db_path))
+    history_store = HistoryStore(settings.storage_root, history_catalog.db, history_catalog)
+    history_ingest_service = HistoryIngestService(
+        market_adapter=market_adapter,
+        history_store=history_store,
+        catalog_service=history_catalog,
+        research_state_store=research_state_store,
+        audit_store=audit_store,
+    )
     sentiment_calculator = SentimentCalculator()
     strategy_router = StrategyRouter()
     leader_ranker = LeaderRanker()
@@ -119,8 +157,21 @@ def build_router(
     strategy_composer = StrategyComposer(
         factor_registry, 
         playbook_registry, 
-        evaluation_ledger=evaluation_ledger_service
+        evaluation_ledger=evaluation_ledger_service,
+        kline_cache=KlineCache(settings.storage_root / "cache" / "kline"),
     )
+    kline_cache = strategy_composer._kline_cache
+    factor_monitor = FactorMonitor(
+        factor_registry,
+        market_adapter,
+        state_store=runtime_state_store,
+    )
+    freshness_monitor = DataFreshnessMonitor(market_adapter)
+    market_memory_service = MarketMemoryService(settings.storage_root / "learning" / "market_memory.json")
+    failure_journal_service = FailureJournalService(settings.storage_root / "learning" / "failure_journal.json")
+    strategy_lifecycle_service = StrategyLifecycleService(settings.storage_root / "learning" / "strategy_lifecycle.json")
+    circuit_breaker = CircuitBreakerRegistry(settings.storage_root / "infra" / "circuit_breakers.json")
+    trace_service = TradeTraceService(settings.storage_root / "infra" / "trade_traces.json")
 
     def _pick_universe(request: RuntimeJobRequest) -> list[str]:
         if request.symbols:
@@ -128,6 +179,57 @@ def build_router(
         if request.universe_scope == "a-share":
             return market_adapter.get_a_share_universe()
         return market_adapter.get_main_board_universe()
+
+    def _resolve_compose_pipeline_symbols(request: RuntimeComposeRequest) -> list[str]:
+        explicit_symbols = [str(symbol).strip() for symbol in list(request.universe.symbol_pool or []) if str(symbol).strip()]
+        if explicit_symbols:
+            return list(dict.fromkeys(explicit_symbols))
+
+        whitelist = [str(item).strip() for item in list(request.universe.sector_whitelist or []) if str(item).strip()]
+        blacklist = {str(item).strip() for item in list(request.universe.sector_blacklist or []) if str(item).strip()}
+        if not whitelist and not blacklist:
+            return []
+
+        resolved_symbols: list[str] = []
+        blocked_symbols: set[str] = set()
+        if blacklist:
+            for sector_name in blacklist:
+                try:
+                    blocked_symbols.update(str(symbol).strip() for symbol in market_adapter.get_sector_symbols(sector_name))
+                except Exception:
+                    continue
+
+        if whitelist:
+            for sector_name in whitelist:
+                try:
+                    resolved_symbols.extend(
+                        str(symbol).strip()
+                        for symbol in market_adapter.get_sector_symbols(sector_name)
+                        if str(symbol).strip()
+                    )
+                except Exception:
+                    continue
+        else:
+            base_universe = (
+                market_adapter.get_a_share_universe()
+                if request.universe.scope == "a-share"
+                else market_adapter.get_main_board_universe()
+            )
+            resolved_symbols.extend(str(symbol).strip() for symbol in base_universe if str(symbol).strip())
+
+        unique_symbols: list[str] = []
+        for symbol in resolved_symbols:
+            if symbol and symbol not in blocked_symbols and symbol not in unique_symbols:
+                unique_symbols.append(symbol)
+        return unique_symbols
+
+    def _seed_runtime_assets(items: list[Any], expected_source_prefix: str) -> list[Any]:
+        filtered = []
+        for item in items:
+            source = str(getattr(item, "source", "") or "").strip()
+            if source.startswith(expected_source_prefix):
+                filtered.append(item)
+        return filtered or items
 
     def _runtime_config() -> RuntimeConfig:
         return config_mgr.get() if config_mgr else RuntimeConfig()
@@ -173,6 +275,191 @@ def build_router(
             else:
                 merged[key] = value
         return merged
+
+    def _load_factor_effectiveness_snapshot(*, allow_compute: bool = False) -> dict[str, Any]:
+        cached = runtime_state_store.get("factor_effectiveness:latest", {})
+        if isinstance(cached, dict) and cached.get("items") is not None:
+            return cached
+        if not allow_compute:
+            return {
+                "generated_at": None,
+                "trade_date": None,
+                "items": [],
+                "status": "not_ready",
+                "note": "尚无缓存的因子有效性快照，请调用 /runtime/factor-effectiveness 触发计算。",
+            }
+        breaker_state = circuit_breaker.check("factor_monitor")
+        if not breaker_state.get("available", True):
+            fallback = dict(breaker_state.get("cached_result") or cached or {})
+            if fallback:
+                fallback["circuit_breaker"] = {"subsystem": "factor_monitor", "status": breaker_state.get("status")}
+                return fallback
+        try:
+            snapshot = factor_monitor.build_effectiveness_snapshot()
+            circuit_breaker.record_success("factor_monitor", snapshot)
+            return snapshot
+        except Exception as exc:
+            circuit_breaker.record_failure("factor_monitor", str(exc), cached_result=(cached if isinstance(cached, dict) else None))
+            return {
+                "generated_at": datetime.now().isoformat(),
+                "items": [],
+                "error": str(exc),
+            }
+
+    def _resolve_compose_policy_regime(request: RuntimeComposeRequest) -> str:
+        explicit_market_context_regime = str(request.market_context.get("market_regime") or "").strip().lower()
+        if explicit_market_context_regime:
+            return explicit_market_context_regime
+        allowed_regimes = [
+            str(item).strip().lower()
+            for item in list((request.constraints.market_rules or {}).get("allowed_regimes") or [])
+            if str(item).strip()
+        ]
+        if len(allowed_regimes) == 1:
+            return allowed_regimes[0]
+        hypothesis_regimes = _infer_hypothesis_regime_bias(
+            " ".join(
+                [
+                    str(request.intent.market_hypothesis or ""),
+                    str(request.intent.objective or ""),
+                ]
+            )
+        )
+        if hypothesis_regimes:
+            return str(hypothesis_regimes[0]).strip().lower()
+        return ""
+
+    def _build_factor_review_action(factor_policy_trace: dict[str, Any]) -> dict[str, Any]:
+        health = dict(factor_policy_trace.get("factor_portfolio_health") or {})
+        mix_validation = dict(factor_policy_trace.get("factor_mix_validation") or {})
+        health_status = str(health.get("health_status") or "unknown")
+        hard_reject = bool(factor_policy_trace.get("hard_reject"))
+        needs_review = bool(factor_policy_trace.get("needs_review"))
+        position_size_multiplier = 1.0
+        severity = "none"
+        next_step = "可继续进入 discussion / execution-precheck。"
+        if hard_reject:
+            severity = "block"
+            position_size_multiplier = 0.0
+            next_step = "当前组合已被执行层阻断，需先重组因子与战法。"
+        elif needs_review:
+            severity = "manual_review"
+            position_size_multiplier = 0.5 if health_status in {"concentrated", "noise_heavy"} else 0.7
+            next_step = "当前组合禁止自动派发与自动执行，必须先进入 discussion 或 execution-precheck。"
+        return {
+            "required": bool(hard_reject or needs_review),
+            "severity": severity,
+            "action": "blocked" if hard_reject else ("manual_review_required" if needs_review else "pass"),
+            "health_status": health_status,
+            "passed": bool(mix_validation.get("passed", not hard_reject)),
+            "auto_dispatch_allowed": not bool(hard_reject or needs_review),
+            "auto_execution_allowed": not bool(hard_reject or needs_review),
+            "position_size_multiplier": round(position_size_multiplier, 4),
+            "next_step": next_step,
+        }
+
+    def _inject_latest_event_context(market_context_payload: dict[str, Any] | None) -> dict[str, Any]:
+        merged = dict(market_context_payload or {})
+        latest_event_context = dict(serving_store.get_latest_event_context() or {})
+        highlights = [dict(item) for item in list(latest_event_context.get("highlights") or []) if isinstance(item, dict)]
+        if highlights:
+            merged["event_highlights"] = highlights
+            merged["highlights"] = highlights
+        generated_at = str(latest_event_context.get("generated_at") or "").strip()
+        if generated_at:
+            merged["event_context_generated_at"] = generated_at
+        return merged
+
+    def _build_detected_market_regime(market_context_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        latest_runtime_context = dict(serving_store.get_latest_runtime_context() or {})
+        latest_monitor_context = dict(serving_store.get_latest_monitor_context() or {})
+        breaker_state = circuit_breaker.check("regime_detector")
+        if not breaker_state.get("available", True):
+            detected = dict(breaker_state.get("cached_result") or runtime_state_store.get("latest_market_regime", {}) or {})
+        else:
+            try:
+                detected = detect_market_regime(
+                    market_context=dict(market_context_payload or {}),
+                    runtime_context=latest_runtime_context,
+                    monitor_context=latest_monitor_context,
+                )
+                circuit_breaker.record_success("regime_detector", detected)
+            except Exception as exc:
+                circuit_breaker.record_failure(
+                    "regime_detector",
+                    str(exc),
+                    cached_result=(runtime_state_store.get("latest_market_regime", {}) or {}),
+                )
+                detected = dict(runtime_state_store.get("latest_market_regime", {}) or {})
+                detected["error"] = str(exc)
+        detected["runtime_context_generated_at"] = str(latest_runtime_context.get("generated_at") or "")
+        detected["monitor_context_generated_at"] = str(latest_monitor_context.get("generated_at") or "")
+        previous_regime = dict(runtime_state_store.get("latest_market_regime", {}) or {})
+        detected["transition"] = detect_regime_transition(
+            previous_regime=previous_regime,
+            current_regime=detected,
+        )
+        runtime_state_store.set("latest_market_regime", detected)
+        return detected
+
+    def _apply_compose_factor_policy(
+        request: RuntimeComposeRequest,
+        *,
+        policy_source: str,
+    ) -> dict[str, Any]:
+        existing_policy = dict(request.market_context.get("factor_policy") or {})
+        requested_override = {
+            str(item_id).strip(): float(value or 0.0)
+            for item_id, value in dict(existing_policy.get("requested_factor_weights") or {}).items()
+            if str(item_id).strip()
+        }
+        governance_adjustment = {}
+        score_date = str(request.market_context.get("trade_date") or datetime.now().date().isoformat())
+        agent_profiles = {
+            item.agent_id: item
+            for item in agent_score_service.list_scores(score_date)
+        }
+        agent_profile = agent_profiles.get(str(request.agent.agent_id or "").strip())
+        governance_multiplier = 1.0
+        governance_score = None
+        if agent_profile is not None:
+            governance_score = round(float(agent_profile.new_score or 0.0) / 20.0, 4)
+            if governance_score <= 0.3:
+                governance_multiplier = 0.5
+            elif governance_score >= 0.7:
+                governance_multiplier = 1.2
+            if governance_multiplier != 1.0:
+                for factor in list(request.strategy.factors):
+                    base_weight = requested_override.get(factor.id, float(factor.weight or 0.0))
+                    requested_override[factor.id] = round(base_weight * governance_multiplier, 4)
+                governance_adjustment = {
+                    "agent_id": agent_profile.agent_id,
+                    "score_date": score_date,
+                    "governance_score": governance_score,
+                    "multiplier": governance_multiplier,
+                    "reason": "agent_governance_weight_adjustment",
+                }
+        policy_result = evaluate_compose_factor_policy(
+            list(request.strategy.factors),
+            factor_registry=factor_registry,
+            effectiveness_snapshot=_load_factor_effectiveness_snapshot(),
+            requested_weights_override=requested_override or None,
+            regime=_resolve_compose_policy_regime(request),
+        )
+        request.strategy.factors = list(policy_result["factors"])
+        policy_trace = {
+            key: value
+            for key, value in policy_result.items()
+            if key != "factors"
+        }
+        policy_trace["review_action"] = _build_factor_review_action(policy_trace)
+        policy_trace["policy_source"] = policy_source
+        policy_trace["governance_adjustment"] = governance_adjustment
+        policy_trace["generated_at"] = datetime.now().isoformat()
+        market_context_payload = dict(request.market_context or {})
+        market_context_payload["factor_policy"] = policy_trace
+        request.market_context = market_context_payload
+        return policy_trace
 
     def _resolve_repository_strategy_entry(
         *,
@@ -395,12 +682,105 @@ def build_router(
             },
             dict(brief.market_context or {}),
         )
+        market_context_payload = _inject_latest_event_context(market_context_payload)
+        detected_market_regime = _build_detected_market_regime(market_context_payload)
+        market_context_payload["detected_market_regime"] = detected_market_regime
+        market_context_payload["market_regime"] = str(detected_market_regime.get("runtime_regime") or "")
+        market_context_payload["hot_sector_chain"] = list(detected_market_regime.get("hot_sector_chain") or [])
+        market_context_payload["sector_strength_rank"] = list(detected_market_regime.get("sector_strength_rank") or [])
+        market_context_payload["money_flow_signal"] = dict(detected_market_regime.get("money_flow_signal") or {})
+        market_context_payload["regime_confidence"] = float(detected_market_regime.get("confidence", 0.0) or 0.0)
+        selected_sectors = [
+            str(item).strip()
+            for item in list(brief.focus_sectors or [])
+            if str(item).strip()
+        ] or [str(item).strip() for item in list(detected_market_regime.get("hot_sector_chain") or [])[:3] if str(item).strip()]
+        market_memory_context = market_memory_service.build_compose_context(
+            regime_label=str(detected_market_regime.get("regime_label") or "unknown"),
+            playbooks=selected_playbooks,
+            sectors=selected_sectors,
+        )
+        if market_memory_context.get("available"):
+            market_context_payload["market_memory"] = market_memory_context
+            if market_memory_context.get("avoid_pattern"):
+                market_context_payload["avoid_pattern"] = list(market_memory_context.get("avoid_pattern") or [])
+        history_context_symbols = list(
+            dict.fromkeys(
+                [
+                    *[str(item).strip().upper() for item in list(brief.holding_symbols or []) if str(item).strip()],
+                    *[str(item).strip().upper() for item in list(brief.symbol_pool or []) if str(item).strip()],
+                ]
+            )
+        )
+        if not history_context_symbols:
+            for sector_name in selected_sectors[:2]:
+                try:
+                    history_context_symbols.extend(
+                        [
+                            str(item).strip().upper()
+                            for item in list(market_adapter.get_sector_symbols(sector_name)[:5])
+                            if str(item).strip()
+                        ]
+                    )
+                except Exception:
+                    continue
+                if history_context_symbols:
+                    break
+        history_context_symbols = list(dict.fromkeys(history_context_symbols))[:12]
+        history_context = history_store.build_history_context(
+            symbols=history_context_symbols,
+            trade_date=str(market_context_payload.get("trade_date") or "").strip() or None,
+            daily_limit=60,
+            minute_limit=120,
+        )
+        if history_context.get("available"):
+            market_context_payload["history_context"] = history_context
+        failure_warning = failure_journal_service.build_pattern_warning(
+            playbooks=selected_playbooks,
+            regime_label=str(detected_market_regime.get("regime_label") or "unknown"),
+            sectors=selected_sectors,
+            review_tags=[
+                str(item).strip()
+                for item in list(brief.notes or [])
+                if str(item).strip()
+            ],
+        )
+        if failure_warning.get("available"):
+            market_context_payload["failure_journal"] = failure_warning
+            market_context_payload["pattern_recurrence_warning"] = list(failure_warning.get("dominant_failure_patterns") or [])
+            market_context_payload["pattern_warning_level"] = str(failure_warning.get("warning_level") or "none")
+        lifecycle_caps = {
+            item_id: strategy_lifecycle_service.get_cap(playbook=item_id)
+            for item_id in selected_playbooks
+        }
+        lifecycle_position_caps = [
+            float(item.get("max_position_fraction", 0.0) or 0.0)
+            for item in lifecycle_caps.values()
+            if float(item.get("max_position_fraction", 0.0) or 0.0) > 0
+        ]
+        if lifecycle_caps:
+            market_context_payload["strategy_lifecycle"] = lifecycle_caps
+        if lifecycle_position_caps:
+            lifecycle_cap = min(lifecycle_position_caps)
+            existing_cap = constraints_payload.get("risk_rules", {}).get("max_single_position")
+            constraints_payload.setdefault("risk_rules", {})
+            constraints_payload["risk_rules"]["max_single_position"] = (
+                lifecycle_cap
+                if existing_cap in {None, 0, 0.0}
+                else min(float(existing_cap or lifecycle_cap), lifecycle_cap)
+            )
+        hypothesis_regimes = _infer_hypothesis_regime_bias(brief.market_hypothesis)
+        observed_runtime_regime = str(detected_market_regime.get("runtime_regime") or "").strip().lower()
+        if hypothesis_regimes and observed_runtime_regime and observed_runtime_regime not in hypothesis_regimes:
+            market_context_payload["regime_mismatch_warning"] = (
+                f"Agent 假设偏向 {','.join(hypothesis_regimes)}，但服务端检测市场更接近 {observed_runtime_regime}"
+            )
         ranking_secondary_keys = [
             str(item).strip()
             for item in list(brief.ranking_secondary_keys or [])
             if str(item).strip()
         ] or selected_factors[:2]
-        return RuntimeComposeRequest.model_validate(
+        compose_request = RuntimeComposeRequest.model_validate(
             {
                 "request_id": brief.request_id,
                 "account_id": brief.account_id,
@@ -461,6 +841,8 @@ def build_router(
                 },
             }
         )
+        _apply_compose_factor_policy(compose_request, policy_source="compose_from_brief_builder")
+        return compose_request
 
     def _infer_pipeline_source_from_compose_request(request: RuntimeComposeRequest) -> str:
         intent_mode = str(request.intent.mode or "").strip().lower()
@@ -939,6 +1321,7 @@ def build_router(
                 "weight_summary": [str(item) for item in list(explanations.get("weight_summary") or []) if str(item).strip()],
                 "constraint_summary": [str(item) for item in list(explanations.get("constraint_summary") or []) if str(item).strip()],
                 "market_driver_summary": [str(item) for item in list(explanations.get("market_driver_summary") or []) if str(item).strip()],
+                "factor_policy_summary": [str(item) for item in list((compose_output.get("factor_policy_summary") or {}).get("summary_lines") or []) if str(item).strip()],
                 "candidate_evidence_preview": [
                     {
                         "symbol": str(item.get("symbol") or ""),
@@ -948,6 +1331,14 @@ def build_router(
                     for item in top_candidates[:3]
                 ],
             },
+            "factor_policy": {
+                "requested_factor_weights": dict(compose_output.get("requested_factor_weights") or {}),
+                "adjusted_factor_weights": dict(compose_output.get("adjusted_factor_weights") or {}),
+                "factor_portfolio_health": dict(compose_output.get("factor_portfolio_health") or {}),
+                "factor_mix_validation": dict(compose_output.get("factor_mix_validation") or {}),
+                "needs_review": bool(compose_output.get("needs_review")),
+                "review_action": dict(compose_output.get("review_action") or {}),
+            },
             "proposal_packet": dict(compose_output.get("proposal_packet") or {}),
         }
 
@@ -955,6 +1346,7 @@ def build_router(
         brief: RuntimeComposeBriefRequest,
         compose_request: RuntimeComposeRequest,
     ) -> dict[str, Any]:
+        factor_policy = dict(compose_request.market_context.get("factor_policy") or {})
         return {
             "custom_profile_independent": True,
             "used_reference_profile": False,
@@ -968,10 +1360,280 @@ def build_router(
                 for key, value in compose_request.constraints.model_dump().items()
                 if value not in ({}, [], None, "")
             ],
+            "factor_policy_applied": bool(factor_policy),
+            "factor_health_status": str((factor_policy.get("factor_portfolio_health") or {}).get("health_status") or ""),
+            "needs_review": bool(factor_policy.get("needs_review")),
+            "review_action": dict(factor_policy.get("review_action") or {}),
             "market_context_keys": sorted(
                 [str(key) for key, value in dict(brief.market_context or {}).items() if value not in (None, "", [], {})]
             ),
         }
+
+    def _infer_hypothesis_regime_bias(market_hypothesis: str) -> list[str]:
+        text = str(market_hypothesis or "").strip().lower()
+        if not text:
+            return []
+        regime_keywords = {
+            "trend": ("主升", "趋势", "加速", "突破", "龙头", "加仓"),
+            "rotation": ("轮动", "切换", "接力", "扩散", "回流"),
+            "defensive": ("防守", "避险", "高股息", "低吸", "承接"),
+            "chaos": ("混沌", "震荡", "分歧", "博弈", "拉锯"),
+        }
+        matched: list[str] = []
+        for regime, keywords in regime_keywords.items():
+            if any(keyword.lower() in text for keyword in keywords):
+                matched.append(regime)
+        return matched
+
+    def _pick_registered_playbooks(preferred_ids: list[str], fallback_ids: list[str]) -> list[str]:
+        selected: list[str] = []
+        for playbook_id in [*preferred_ids, *fallback_ids]:
+            normalized = str(playbook_id or "").strip()
+            if not normalized or normalized in selected:
+                continue
+            if playbook_registry.get(normalized, "v1") is None:
+                continue
+            selected.append(normalized)
+        return selected[:4]
+
+    def _pick_registered_factors(preferred_ids: list[str], fallback_ids: list[str]) -> list[str]:
+        selected: list[str] = []
+        for factor_id in [*preferred_ids, *fallback_ids]:
+            normalized = str(factor_id or "").strip()
+            if not normalized or normalized in selected:
+                continue
+            if factor_registry.get(normalized, "v1") is None:
+                continue
+            selected.append(normalized)
+        return selected[:5]
+
+    def _equal_weight_map(ids: list[str]) -> dict[str, float]:
+        normalized = [str(item).strip() for item in ids if str(item).strip()]
+        if not normalized:
+            return {}
+        weight = round(1.0 / len(normalized), 4)
+        return {item_id: weight for item_id in normalized}
+
+    def _build_autonomy_retry_plan(
+        request: RuntimeComposeRequest,
+        *,
+        market_summary: dict[str, Any],
+        filtered_out: list[dict[str, Any]],
+        pipeline_payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        market_hypothesis = str(request.intent.market_hypothesis or "").strip()
+        observed_regime = str((market_summary or {}).get("market_regime") or "").strip().lower()
+        filtered_items = [dict(item) for item in list(filtered_out or []) if isinstance(item, dict)]
+        filtered_reasons = [str(item.get("reason") or "").strip() for item in filtered_items if str(item.get("reason") or "").strip()]
+        candidate_count = len(list(pipeline_payload.get("top_picks") or []))
+        filtered_stage_counts = Counter(
+            str(item.get("stage") or "").strip() or "unknown"
+            for item in filtered_items
+        )
+        reason_codes: list[str] = []
+        if candidate_count <= 0:
+            reason_codes.append("zero_candidates")
+        if any("market_regime_not_allowed" in reason for reason in filtered_reasons):
+            reason_codes.append("market_regime_mismatch")
+        if candidate_count <= 0 and filtered_stage_counts:
+            dominant_stage, dominant_count = filtered_stage_counts.most_common(1)[0]
+            if dominant_stage in {"position_rules", "risk_rules", "hard_filters", "market_rules"} and dominant_count >= max(len(filtered_items) // 2, 1):
+                reason_codes.append(f"dominant_filter:{dominant_stage}")
+        allowed_regimes = [
+            str(item).strip().lower()
+            for item in list((request.constraints.market_rules or {}).get("allowed_regimes") or [])
+            if str(item).strip()
+        ]
+        if observed_regime and allowed_regimes and observed_regime not in allowed_regimes:
+            if "market_regime_mismatch" not in reason_codes:
+                reason_codes.append("market_regime_mismatch")
+        hypothesis_regimes = _infer_hypothesis_regime_bias(market_hypothesis)
+        hypothesis_matches = None
+        if observed_regime and hypothesis_regimes:
+            hypothesis_matches = observed_regime in hypothesis_regimes
+            if not hypothesis_matches and "market_regime_mismatch" not in reason_codes:
+                reason_codes.append("hypothesis_regime_mismatch")
+        reason_codes = list(dict.fromkeys(reason_codes))
+
+        retry_required = bool(reason_codes)
+        if not retry_required:
+            return (
+                {
+                    "market_hypothesis_present": bool(market_hypothesis),
+                    "market_regime": observed_regime,
+                    "candidate_count": candidate_count,
+                    "filtered_count": len(filtered_items),
+                    "allowed_regimes": allowed_regimes,
+                    "hypothesis_regime_bias": hypothesis_regimes,
+                    "hypothesis_matches_market_regime": hypothesis_matches,
+                    "retry_required": False,
+                    "retry_generated": False,
+                    "retry_reason_codes": [],
+                    "agent_proposed_scope": str(request.universe.source or "").strip() == "agent_proposed",
+                },
+                {
+                    "triggered": False,
+                    "reason_codes": [],
+                    "reason_summary": "",
+                    "observed_market_regime": observed_regime,
+                    "generated_at": str(pipeline_payload.get("generated_at") or datetime.now().isoformat()),
+                },
+            )
+
+        regime_playbook_map = {
+            "trend": ["trend_acceleration", "sector_resonance", "trend_breakout_retest", "leader_chase"],
+            "rotation": ["sector_rotation_relay", "weak_to_strong_intraday", "news_catalyst_follow", "position_replacement"],
+            "defensive": ["defensive_low_absorb", "tail_close_ambush", "oversold_rebound", "position_replacement"],
+            "chaos": ["tail_close_ambush", "position_replacement", "weak_to_strong_intraday", "swing_mean_repair"],
+        }
+        regime_factor_map = {
+            "trend": ["momentum_slope", "breakout_quality", "acceleration_burst_score", "sector_leader_drive"],
+            "rotation": ["sector_heat_score", "theme_rotation_speed", "peer_follow_strength", "intraday_capital_reflow"],
+            "defensive": ["price_drawdown_20d", "oversold_bounce_strength", "liquidity_risk_penalty", "correlation_hedge_score"],
+            "chaos": ["volatility_20d", "liquidity_risk_penalty", "support_reclaim_score", "replacement_priority_score"],
+        }
+        current_playbooks = [str(item.id).strip() for item in request.strategy.playbooks if str(item.id).strip()]
+        current_factors = [str(item.id).strip() for item in request.strategy.factors if str(item.id).strip()]
+        target_regime = observed_regime if observed_regime in regime_playbook_map else ("rotation" if "market_regime_mismatch" in reason_codes else "chaos")
+        next_playbooks = _pick_registered_playbooks(current_playbooks, regime_playbook_map.get(target_regime, []))
+        next_factors = _pick_registered_factors(current_factors, regime_factor_map.get(target_regime, []))
+        current_symbol_pool = [str(item).strip() for item in list(request.universe.symbol_pool or []) if str(item).strip()]
+        next_symbol_pool = list(current_symbol_pool)
+        universe_action = "keep_current_universe"
+        if current_symbol_pool and len(current_symbol_pool) <= 3 and any(code.startswith("dominant_filter:") for code in reason_codes):
+            next_symbol_pool = []
+            universe_action = "broaden_universe_scope"
+        next_allowed_regimes = list(dict.fromkeys([*allowed_regimes, target_regime] if target_regime else allowed_regimes))
+        next_intent_mode = str(request.intent.mode or "").strip() or "opportunity_scan"
+        if target_regime in {"defensive", "chaos"} and list(request.market_context.get("holding_symbols") or []):
+            next_intent_mode = "replacement_review"
+        elif target_regime in {"defensive", "chaos"}:
+            next_intent_mode = "tail_ambush_scan"
+        elif target_regime == "rotation":
+            next_intent_mode = "sector_heat_scan"
+        revised_market_hypothesis = (
+            f"上一轮假设未能产出有效候选，当前市场更接近 {target_regime or observed_regime or '当前观测'}。"
+            f" 第二轮改为优先使用 {','.join(next_playbooks[:3]) or '替代战法'}，并重排 {','.join(next_factors[:4]) or '关键因子'}。"
+        )
+        replan_notes = [
+            "上一轮 compose 无法沉淀有效候选，已自动生成第二轮重编排建议。",
+            f"观测到的市场 regime={observed_regime or 'unknown'}。",
+        ]
+        if market_hypothesis:
+            replan_notes.append(f"原市场假设：{market_hypothesis}")
+        if filtered_stage_counts:
+            stage_text = " / ".join(f"{stage}={count}" for stage, count in filtered_stage_counts.most_common(3))
+            replan_notes.append(f"主要过滤阶段：{stage_text}")
+        if universe_action == "broaden_universe_scope":
+            replan_notes.append("第二轮建议放宽 symbol_pool，优先扩大到 sector/scope 级别再验证。")
+        if next_allowed_regimes and target_regime in next_allowed_regimes:
+            replan_notes.append(f"第二轮已把 allowed_regimes 对齐到 {target_regime}。")
+        next_compose_brief = {
+            "request_id": (request.request_id or f"compose-{uuid4().hex[:8]}") + "-retry-1",
+            "intent_mode": next_intent_mode,
+            "objective": str(request.intent.objective or "").strip() or "对失败后的 compose 做第二轮重编排",
+            "market_hypothesis": revised_market_hypothesis,
+            "trade_horizon": str(request.intent.trade_horizon or "").strip(),
+            "universe_scope": str(request.universe.scope or "main-board").strip() or "main-board",
+            "symbol_pool": next_symbol_pool,
+            "focus_sectors": [str(item).strip() for item in list(request.universe.sector_whitelist or []) if str(item).strip()],
+            "avoid_sectors": [str(item).strip() for item in list(request.universe.sector_blacklist or []) if str(item).strip()],
+            "playbooks": next_playbooks,
+            "factors": next_factors,
+            "weights": {
+                "playbooks": _equal_weight_map(next_playbooks),
+                "factors": _equal_weight_map(next_factors),
+            },
+            "allowed_regimes": next_allowed_regimes,
+            "blocked_regimes": [
+                str(item).strip()
+                for item in list((request.constraints.market_rules or {}).get("blocked_regimes") or [])
+                if str(item).strip()
+            ],
+            "blocked_symbols": [
+                str(item).strip()
+                for item in list((request.constraints.risk_rules or {}).get("blocked_symbols") or [])
+                if str(item).strip()
+            ],
+            "holding_symbols": [
+                str(item).strip()
+                for item in list(request.market_context.get("holding_symbols") or [])
+                if str(item).strip()
+            ],
+            "notes": replan_notes,
+        }
+        next_request_payload = request.model_dump()
+        next_request_payload["request_id"] = next_compose_brief["request_id"]
+        next_request_payload["intent"]["mode"] = next_intent_mode
+        next_request_payload["intent"]["market_hypothesis"] = revised_market_hypothesis
+        next_request_payload["universe"]["symbol_pool"] = next_symbol_pool
+        next_request_payload["strategy"]["playbooks"] = [
+            {"id": item_id, "version": "v1", "weight": weight, "params": {}}
+            for item_id, weight in next_compose_brief["weights"]["playbooks"].items()
+        ]
+        next_request_payload["strategy"]["factors"] = [
+            {
+                "id": item_id,
+                "group": str(factor_registry.get(item_id, "v1").group if factor_registry.get(item_id, "v1") is not None else ""),
+                "version": "v1",
+                "weight": weight,
+                "params": {},
+            }
+            for item_id, weight in next_compose_brief["weights"]["factors"].items()
+        ]
+        next_request_payload.setdefault("constraints", {}).setdefault("market_rules", {})
+        next_request_payload["constraints"]["market_rules"]["allowed_regimes"] = next_allowed_regimes
+        next_request_payload.setdefault("market_context", {})
+        next_request_payload["market_context"]["compose_replan"] = {
+            "triggered_by": reason_codes,
+            "previous_market_hypothesis": market_hypothesis,
+            "observed_market_regime": observed_regime,
+        }
+        reason_summary = "；".join(
+            [
+                "上一轮 compose 无候选"
+                if "zero_candidates" in reason_codes
+                else "",
+                "市场假设与观测 regime 不匹配"
+                if any(code in reason_codes for code in ("market_regime_mismatch", "hypothesis_regime_mismatch"))
+                else "",
+                f"主要被 {filtered_stage_counts.most_common(1)[0][0]} 拦截"
+                if filtered_stage_counts
+                else "",
+            ]
+        ).strip("；")
+        return (
+            {
+                "market_hypothesis_present": bool(market_hypothesis),
+                "market_regime": observed_regime,
+                "candidate_count": candidate_count,
+                "filtered_count": len(filtered_items),
+                "allowed_regimes": next_allowed_regimes if next_allowed_regimes else allowed_regimes,
+                "hypothesis_regime_bias": hypothesis_regimes,
+                "hypothesis_matches_market_regime": hypothesis_matches,
+                "retry_required": True,
+                "retry_generated": True,
+                "retry_reason_codes": reason_codes,
+                "agent_proposed_scope": str(request.universe.source or "").strip() == "agent_proposed",
+                "dominant_filter_stage": filtered_stage_counts.most_common(1)[0][0] if filtered_stage_counts else "",
+            },
+            {
+                "triggered": True,
+                "reason_codes": reason_codes,
+                "reason_summary": reason_summary,
+                "observed_market_regime": observed_regime,
+                "revised_market_hypothesis": revised_market_hypothesis,
+                "generated_at": str(pipeline_payload.get("generated_at") or datetime.now().isoformat()),
+                "actions": {
+                    "universe_action": universe_action,
+                    "strategy_action": "switch_playbooks_and_factors",
+                    "constraint_action": "align_allowed_regimes" if next_allowed_regimes else "keep_constraints",
+                },
+                "replan_notes": replan_notes,
+                "next_compose_brief": next_compose_brief,
+                "next_compose_request": next_request_payload,
+            },
+        )
 
     def _filter_top_picks_by_preferences(
         decisions: list[dict],
@@ -1026,6 +1688,38 @@ def build_router(
                 updated["resolved_sector"] = resolved_sector
             filtered.append(updated)
         return filtered, excluded, keywords
+
+    def _build_historical_sector_hints(symbols: list[str]) -> list[dict[str, Any]]:
+        pending = {str(symbol).strip() for symbol in symbols if str(symbol).strip()}
+        if not pending:
+            return []
+
+        hints: dict[str, str] = {}
+
+        latest_runtime_context = serving_store.get_latest_runtime_context() or {}
+        for item in list(latest_runtime_context.get("top_picks") or []):
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "").strip()
+            resolved_sector = str(item.get("resolved_sector") or "").strip()
+            if symbol in pending and resolved_sector and symbol not in hints:
+                hints[symbol] = resolved_sector
+
+        latest_dossier_pack = serving_store.get_latest_dossier_pack() or {}
+        for item in list(latest_dossier_pack.get("items") or []):
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "").strip()
+            resolved_sector = str(
+                item.get("resolved_sector")
+                or item.get("sector")
+                or item.get("sector_name")
+                or ""
+            ).strip()
+            if symbol in pending and resolved_sector and symbol not in hints:
+                hints[symbol] = resolved_sector
+
+        return [{"symbol": symbol, "resolved_sector": sector} for symbol, sector in hints.items()]
 
     monitor_change_notifier = (
         MonitorChangeNotifier(monitor_state_service, message_dispatcher)
@@ -1083,6 +1777,59 @@ def build_router(
 
     def _clamp(value: float, lower: float, upper: float) -> float:
         return min(max(value, lower), upper)
+
+    _GENERIC_SECTOR_TAG_KEYWORDS = (
+        "持股",
+        "溢价股",
+        "中盘",
+        "大盘",
+        "小盘",
+        "微盘",
+        "低价股",
+        "沪股通",
+        "深股通",
+        "融资融券",
+        "转融券",
+        "中字头",
+        "成分股",
+        "指数",
+        "标的",
+    )
+    _GENERIC_SECTOR_TAG_EXACT = {
+        "QFII持股",
+        "AH溢价股",
+        "中盘",
+    }
+
+    def _sector_tag_priority(tag: str) -> float:
+        text = str(tag or "").strip()
+        if not text:
+            return -999.0
+        score = float(min(len(text), 12))
+        if text in _GENERIC_SECTOR_TAG_EXACT:
+            score -= 8.0
+        if any(keyword in text for keyword in _GENERIC_SECTOR_TAG_KEYWORDS):
+            score -= 4.0
+        if text.endswith("股"):
+            score -= 1.0
+        if text.endswith("概念") or text.endswith("产业") or text.endswith("链") or text.endswith("题材"):
+            score += 1.5
+        return score
+
+    def _pick_preferred_sector_tag(tags: list[Any]) -> str:
+        normalized = [
+            str(item).strip()
+            for item in list(tags or [])
+            if str(item).strip()
+        ]
+        if not normalized:
+            return ""
+        ordered = sorted(
+            normalized,
+            key=lambda item: (_sector_tag_priority(item), len(item)),
+            reverse=True,
+        )
+        return ordered[0]
 
     def _playbook_ctx_payload(item) -> dict:
         if isinstance(item, dict):
@@ -1205,8 +1952,19 @@ def build_router(
         for symbol in list(unresolved):
             item = item_map.get(symbol) or {}
             tags = (((item.get("symbol_context") or {}).get("sector_relative") or {}).get("sector_tags") or [])
-            if tags:
-                resolved[symbol] = str(tags[0])
+            preferred_tag = _pick_preferred_sector_tag(tags)
+            if preferred_tag:
+                resolved[symbol] = preferred_tag
+                unresolved.discard(symbol)
+                continue
+            dossier_sector = str(
+                item.get("resolved_sector")
+                or item.get("sector")
+                or item.get("sector_name")
+                or ""
+            ).strip()
+            if dossier_sector:
+                resolved[symbol] = dossier_sector
                 unresolved.discard(symbol)
 
         if unresolved:
@@ -1228,6 +1986,138 @@ def build_router(
         for symbol in unresolved:
             resolved[symbol] = "候选池聚类"
         return resolved
+
+    def _style_tag_priority(style_tag: str) -> float:
+        return {
+            "leader": 1.2,
+            "reseal": 0.9,
+            "momentum": 0.6,
+            "mixed": 0.2,
+            "defensive": -0.5,
+        }.get(str(style_tag or "").strip(), 0.0)
+
+    def _resolve_sector_strength_map(market_profile_payload: dict[str, Any]) -> dict[str, float]:
+        strength_map: dict[str, float] = {}
+        for item in list(market_profile_payload.get("sector_profiles") or []):
+            if not isinstance(item, dict):
+                continue
+            sector_name = str(item.get("sector_name") or "").strip()
+            if not sector_name:
+                continue
+            strength_map[sector_name] = float(item.get("strength_score", 0.0) or 0.0)
+        return strength_map
+
+    def _apply_market_alignment_order(
+        decisions: list[dict],
+        *,
+        pack_items: list[dict],
+        playbook_contexts: list[Any],
+        behavior_profiles: dict[str, StockBehaviorProfile],
+        sector_map: dict[str, str],
+        market_profile_payload: dict[str, Any],
+    ) -> list[dict]:
+        if not decisions:
+            return decisions
+        pack_map = {
+            str(item.get("symbol") or ""): dict(item)
+            for item in pack_items
+            if isinstance(item, dict) and item.get("symbol")
+        }
+        playbook_payloads = [_playbook_ctx_payload(item) for item in playbook_contexts]
+        playbook_map = {
+            str(item.get("symbol") or ""): item
+            for item in playbook_payloads
+            if item.get("symbol")
+        }
+        hot_sectors = {
+            str(item).strip()
+            for item in list(market_profile_payload.get("hot_sectors") or [])
+            if str(item).strip()
+        }
+        sector_strength_map = _resolve_sector_strength_map(market_profile_payload)
+        aligned: list[dict[str, Any]] = []
+        for item in decisions:
+            updated = dict(item)
+            symbol = str(updated.get("symbol") or "").strip()
+            sector_name = str(sector_map.get(symbol) or updated.get("resolved_sector") or "").strip()
+            behavior_profile = behavior_profiles.get(symbol)
+            playbook_context = playbook_map.get(symbol, {})
+            symbol_context = dict((pack_map.get(symbol) or {}).get("symbol_context") or {})
+            market_relative = dict(symbol_context.get("market_relative") or {})
+            sector_relative = dict(symbol_context.get("sector_relative") or {})
+            relative_strength = float(market_relative.get("relative_strength_pct", 0.0) or 0.0)
+            sector_event_count = int(sector_relative.get("sector_event_count", 0) or 0)
+            board_success_rate = float(
+                getattr(behavior_profile, "board_success_rate_20d", 0.0) if behavior_profile is not None else 0.0
+            )
+            leader_frequency = float(
+                getattr(behavior_profile, "leader_frequency_30d", 0.0) if behavior_profile is not None else 0.0
+            )
+            style_tag = str(getattr(behavior_profile, "style_tag", "") if behavior_profile is not None else "").strip()
+            playbook_confidence = float(playbook_context.get("confidence", 0.0) or 0.0)
+            leader_score = float(playbook_context.get("leader_score", 0.0) or 0.0)
+            selection_score = float(updated.get("selection_score", 0.0) or 0.0)
+            hot_sector_hit = sector_name in hot_sectors
+            sector_strength = float(sector_strength_map.get(sector_name, 0.0) or 0.0)
+            alignment_score = (
+                (2.2 if hot_sector_hit else -0.5)
+                + min(sector_strength / 2.5, 1.2)
+                + _clamp(relative_strength * 24.0, -1.8, 1.8)
+                + board_success_rate * 2.0
+                + leader_frequency * 1.4
+                + _style_tag_priority(style_tag)
+                + playbook_confidence * 0.8
+                + leader_score * 0.6
+                + min(sector_event_count, 5) * 0.2
+                + _clamp((selection_score - 60.0) / 12.0, -1.0, 1.2)
+            )
+            cold_penalty = 0.0
+            if (
+                not hot_sector_hit
+                and relative_strength < -0.01
+                and board_success_rate < 0.25
+                and style_tag in {"defensive", "mixed", ""}
+            ):
+                cold_penalty -= 2.2
+            if selection_score < 58.0 and sector_event_count <= 0 and leader_frequency < 0.1:
+                cold_penalty -= 1.0
+            market_alignment_score = round(alignment_score + cold_penalty, 4)
+            updated["resolved_sector"] = sector_name or updated.get("resolved_sector")
+            updated["market_alignment"] = {
+                "score": market_alignment_score,
+                "hot_sector_hit": hot_sector_hit,
+                "sector_strength": round(sector_strength, 4),
+                "relative_strength_pct": round(relative_strength, 4),
+                "sector_event_count": sector_event_count,
+                "board_success_rate_20d": round(board_success_rate, 4),
+                "leader_frequency_30d": round(leader_frequency, 4),
+                "style_tag": style_tag or "unknown",
+                "playbook_confidence": round(playbook_confidence, 4),
+            }
+            summary = str(updated.get("summary") or "").strip()
+            if hot_sector_hit:
+                summary = f"{summary}，命中主线={sector_name}" if summary else f"命中主线={sector_name}"
+            elif market_alignment_score <= 0.2:
+                summary = f"{summary}，主线贴合度偏弱" if summary else "主线贴合度偏弱"
+            updated["summary"] = summary
+            if market_alignment_score <= 0.2:
+                updated["action"] = "HOLD"
+            elif market_alignment_score >= 2.2:
+                updated["action"] = "BUY"
+            aligned.append(updated)
+
+        ordered = sorted(
+            aligned,
+            key=lambda item: (
+                float(((item.get("market_alignment") or {}).get("score") or 0.0)),
+                float(((item.get("playbook_match_score") or {}).get("score") or 0.0)),
+                float(item.get("selection_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        for index, item in enumerate(ordered, start=1):
+            item["rank"] = index
+        return ordered
 
     def _infer_sector_profiles(
         pack_items: list[dict],
@@ -1605,7 +2495,13 @@ def build_router(
                     )
                     if pack and market_profile:
                         selected_symbols = [item["symbol"] for item in top_picks if item.get("symbol")]
-                        sector_map = _resolve_symbol_sector_map(pack.get("items", []), selected_symbols)
+                        historical_sector_hints = _build_historical_sector_hints(selected_symbols)
+                        sector_map = resolve_default_symbol_sector_map(
+                            pack.get("items", []),
+                            selected_symbols,
+                            market_adapter,
+                            fallback_top_picks=[*top_picks, *historical_sector_hints],
+                        )
                         top_picks, excluded_candidates, excluded_theme_keywords = _filter_top_picks_by_preferences(
                             top_picks,
                             runtime_config=_runtime_config(),
@@ -1623,8 +2519,14 @@ def build_router(
                             summary["hold_count"] = sum(1 for item in top_picks if item.get("action") == "HOLD")
                             payload["summary"] = summary
                             selected_symbols = [item["symbol"] for item in top_picks if item.get("symbol")]
-                            sector_map = _resolve_symbol_sector_map(pack.get("items", []), selected_symbols)
-                        sector_profiles = _infer_sector_profiles(
+                            historical_sector_hints = _build_historical_sector_hints(selected_symbols)
+                            sector_map = resolve_default_symbol_sector_map(
+                                pack.get("items", []),
+                                selected_symbols,
+                                market_adapter,
+                                fallback_top_picks=[*top_picks, *historical_sector_hints],
+                            )
+                        sector_profiles = infer_default_sector_profiles(
                             pack.get("items", []),
                             selected_symbols,
                             sector_map,
@@ -1636,23 +2538,28 @@ def build_router(
                                 "sector_profiles": sector_profiles,
                             }
                         )
-                        behavior_profiles = _infer_behavior_profiles(
+                        routing_profile, routing_meta = build_default_routing_market_profile(
+                            market_profile,
+                            sector_profiles,
+                        )
+                        behavior_profiles = infer_default_behavior_profiles(
                             pack.get("items", []),
                             selected_symbols,
                             sector_map,
                             sector_profiles,
                             top_picks,
-                            market_profile,
+                            routing_profile,
                         )
-                        leader_ranks = _build_leader_ranks(
-                            pack.get("items", []),
-                            selected_symbols,
-                            sector_map,
-                            top_picks,
-                            behavior_profiles,
+                        leader_ranks = build_default_leader_ranks(
+                            leader_ranker=leader_ranker,
+                            pack_items=pack.get("items", []),
+                            selected_symbols=selected_symbols,
+                            sector_map=sector_map,
+                            decisions=top_picks,
+                            behavior_profiles=behavior_profiles,
                         )
                         playbook_contexts = strategy_router.route(
-                            profile=market_profile,
+                            profile=routing_profile,
                             sector_profiles=sector_profiles,
                             candidates=selected_symbols,
                             stock_info={symbol: {"sector": sector_map.get(symbol, "")} for symbol in selected_symbols},
@@ -1679,7 +2586,17 @@ def build_router(
                         payload["playbook_contexts"] = [item.model_dump() for item in playbook_contexts]
                         payload["behavior_profiles"] = [item.model_dump() for item in behavior_profiles.values()]
                         payload["hot_sectors"] = market_profile_payload.get("hot_sectors", [])
-                        payload["top_picks"] = _apply_playbook_order(payload.get("top_picks", top_picks), payload["playbook_contexts"])
+                        if routing_meta.get("allow_probe_routing"):
+                            payload["playbook_routing_hint"] = routing_meta
+                        payload["top_picks"] = apply_default_playbook_order(payload.get("top_picks", top_picks), payload["playbook_contexts"])
+                        payload["top_picks"] = apply_default_market_alignment_order(
+                            payload["top_picks"],
+                            pack_items=enriched_pack.get("items", []),
+                            playbook_contexts=playbook_contexts,
+                            behavior_profiles=behavior_profiles,
+                            sector_map=sector_map,
+                            market_profile_payload=market_profile_payload,
+                        )
                         top_picks = payload["top_picks"]
                         strategy_context = {
                             "market_profile": payload["market_profile"],
@@ -1787,16 +2704,70 @@ def build_router(
 
     @router.get("/factors")
     async def get_runtime_factors():
-        items = factor_registry.list_all()
+        items = _seed_runtime_assets(factor_registry.list_all(), "seed.factor_library")
+        effectiveness_snapshot = _load_factor_effectiveness_snapshot(allow_compute=False)
+        effectiveness_map = {
+            str(item.get("factor_id") or ""): dict(item)
+            for item in list(effectiveness_snapshot.get("items") or [])
+            if str(item.get("factor_id") or "").strip()
+        }
         return {
             "ok": True,
-            "items": [item.model_dump() for item in items],
+            "items": [
+                {
+                    **item.model_dump(),
+                    "effectiveness_status": str((effectiveness_map.get(item.id) or {}).get("status") or "unknown"),
+                    "effectiveness": effectiveness_map.get(item.id),
+                }
+                for item in items
+            ],
             "count": len(items),
+        }
+
+    @router.get("/factor-effectiveness")
+    async def get_factor_effectiveness(
+        trade_date: str | None = None,
+        force: bool = False,
+    ):
+        snapshot = await run_in_threadpool(
+            factor_monitor.build_effectiveness_snapshot,
+            trade_date,
+            force,
+        )
+        return {
+            "ok": True,
+            **snapshot,
+        }
+
+    @router.get("/cache/kline/stats")
+    async def get_kline_cache_stats():
+        if kline_cache is None:
+            return {"available": False, "reason": "kline_cache_unavailable"}
+        cleaned = kline_cache.cleanup()
+        payload = kline_cache.stats()
+        payload["cleanup_removed"] = cleaned
+        return payload
+
+    @router.get("/data/health")
+    async def get_data_health():
+        symbols = list(market_adapter.get_main_board_universe()[:5])
+        gateway = freshness_monitor.check_gateway_health()
+        kline = freshness_monitor.check_kline_freshness(symbols)
+        coverage = freshness_monitor.check_universe_coverage()
+        overall_status = "healthy"
+        if gateway.get("status") in {"unreachable", "degraded"} or kline.get("status") == "stale" or coverage.get("status") == "degraded":
+            overall_status = "degraded"
+        return {
+            "available": True,
+            "status": overall_status,
+            "gateway_health": gateway,
+            "kline_freshness": kline,
+            "universe_coverage": coverage,
         }
 
     @router.get("/playbooks")
     async def get_runtime_playbooks():
-        items = playbook_registry.list_all()
+        items = _seed_runtime_assets(playbook_registry.list_all(), "seed.playbook_library")
         return {
             "ok": True,
             "items": [item.model_dump() for item in items],
@@ -1808,10 +2779,29 @@ def build_router(
         factors = factor_registry.list_all()
         playbooks = playbook_registry.list_all()
         repository_summary = strategy_atomic_repository.summary()
+        factor_effectiveness = _load_factor_effectiveness_snapshot(allow_compute=False)
+        detected_market_regime = _build_detected_market_regime({})
+        factor_effectiveness_map = {
+            str(item.get("factor_id") or ""): dict(item)
+            for item in list(factor_effectiveness.get("items") or [])
+            if str(item.get("factor_id") or "").strip()
+        }
+        factor_policy_contract = build_factor_selection_policy_contract()
         return {
             "ok": True,
             "compose_available": True,
             "repository_summary": repository_summary,
+            "factor_effectiveness": factor_effectiveness,
+            "factor_selection_policy": factor_policy_contract,
+            "market_regime_detector": detected_market_regime,
+            "subsystem_circuit_breakers": {
+                "factor_monitor": circuit_breaker.check("factor_monitor"),
+                "regime_detector": circuit_breaker.check("regime_detector"),
+            },
+            "diversification_rules": factor_policy_contract["diversification_rules"],
+            "rejection_conditions": factor_policy_contract["rejection_conditions"],
+            "warning_conditions": factor_policy_contract["warning_conditions"],
+            "direct_compose_guard_enabled": factor_policy_contract["direct_compose_guard_enabled"],
             "system_tools": [
                 {
                     "category": "market_data",
@@ -1850,6 +2840,7 @@ def build_router(
                     "endpoints": [
                         "/data/runtime-context/latest",
                         "/runtime/factors",
+                        "/runtime/factor-effectiveness",
                         "/runtime/playbooks",
                         "/runtime/capabilities",
                         "/runtime/jobs/compose",
@@ -1881,6 +2872,10 @@ def build_router(
                     "evidence_schema": item.evidence_schema,
                     "runtime_role": "因子评分器",
                     "agent_usage": "Agent 可组合多个因子，作为 runtime compose 的加权输入",
+                    "effectiveness_status": str(
+                        (factor_effectiveness_map.get(item.id) or {}).get("status") or "unknown"
+                    ),
+                    "effectiveness": factor_effectiveness_map.get(item.id),
                 }
                 for item in factors
             ],
@@ -1895,6 +2890,16 @@ def build_router(
                 }
                 for item in playbooks
             ],
+            "suggested_factors": factor_registry.suggest_factors(
+                market_hypothesis="",
+                market_regime=str(detected_market_regime.get("regime_label") or ""),
+                limit=8,
+            ),
+            "suggested_playbooks": playbook_registry.suggest_playbooks(
+                market_hypothesis="",
+                market_regime=str(detected_market_regime.get("regime_label") or ""),
+                limit=6,
+            ),
             "compose_contract": {
                 "positioning": "runtime 是 Agent 可参数化调用的策略工具与证据工具，不是固定选股器",
                 "agent_responsibilities": [
@@ -1902,11 +2907,13 @@ def build_router(
                     "根据盘中变化决定是否再次调用 compose，而不是机械重复运行",
                     "拿结构化候选、证据、反证进入讨论与质询",
                     "只有当已转正 learned asset 与当前市场假设、主题方向、战法/因子结构明显匹配时，才开启自动吸附",
+                    "若所选因子被监控判定 ineffective 或组合高度同质，必须接受执行层自动降权、拒绝与回显。",
                 ],
                 "runtime_responsibilities": [
                     "执行 Agent 组织好的参数化扫描",
                     "返回候选、过滤原因、证据、反证、仓位提示",
                     "把学习产物沉淀为可审批、可升级、可归档的仓库资产",
+                    "在服务端主链强制执行因子有效性、相关组约束、集中度审查与健康度检查",
                 ],
             },
             "compose_brief_contract": {
@@ -2270,6 +3277,40 @@ def build_router(
                     "raw_runtime_decision",
                 ],
                 "proposal_packet": ["selected_symbols", "watchlist_symbols", "discussion_focus"],
+                "factor_policy_summary": ["summary_lines", "health_status", "needs_review"],
+                "factor_portfolio_health": [
+                    "factor_count",
+                    "active_factor_count",
+                    "effective_factor_count",
+                    "dimension_count",
+                    "dominant_dimension_ratio",
+                    "effective_weight_concentration",
+                    "health_status",
+                ],
+                "factor_mix_validation": [
+                    "passed",
+                    "needs_review",
+                    "min_factor_count_met",
+                    "min_dimension_count_met",
+                    "ineffective_budget_ok",
+                    "unknown_budget_ok",
+                    "correlation_conflict_count",
+                ],
+                "factor_effectiveness_trace": ["factor_id", "status", "requested_weight", "adjusted_weight"],
+                "factor_auto_downgrades": ["factor_id", "rule", "detail", "previous_weight", "adjusted_weight"],
+                "factor_rejections": ["factor_id", "rule", "detail", "previous_weight", "adjusted_weight"],
+                "effectiveness_warnings": ["..."],
+                "diversification_warnings": ["..."],
+                "needs_review": ["bool"],
+                "review_action": [
+                    "required",
+                    "severity",
+                    "action",
+                    "auto_dispatch_allowed",
+                    "auto_execution_allowed",
+                    "position_size_multiplier",
+                    "next_step",
+                ],
                 "composition_manifest": [
                     "intent",
                     "universe",
@@ -2278,6 +3319,7 @@ def build_router(
                     "ranking",
                     "filters",
                     "evidence",
+                    "factor_policy",
                     "proposal_packet",
                 ],
                 "applied_constraints": ["hard_filters", "market_rules", "position_rules", "risk_rules", "execution_barriers", "summary_lines"],
@@ -2316,6 +3358,10 @@ def build_router(
                     "selected_factors",
                     "ranking",
                     "constraint_sections",
+                    "factor_policy_applied",
+                    "factor_health_status",
+                    "needs_review",
+                    "review_action",
                     "market_context_keys",
                 ],
             },
@@ -2340,6 +3386,7 @@ def build_router(
                 "reconcile_endpoint": "/runtime/evaluations/reconcile",
                 "reconcile_outcome_endpoint": "/runtime/evaluations/reconcile-outcome",
                 "panel_endpoint": "/runtime/evaluations/panel",
+                "unsupported_monitor_rule": "unsupported_for_monitor 因子不走横截面 IC，而是走 outcome attribution 事后归因。",
                 "tracked_fields": [
                     "request/intention/strategy/constraints",
                     "market_summary",
@@ -2670,7 +3717,6 @@ def build_router(
                 "error": str(exc),
             }
         payload = await run_compose(compose_request)
-        payload["ok"] = True
         payload["brief"] = {
             "intent_mode": brief.intent_mode,
             "objective": brief.objective,
@@ -2698,6 +3744,7 @@ def build_router(
     @router.post("/jobs/compose")
     async def run_compose(request: RuntimeComposeRequest):
         try:
+            request.market_context = _inject_latest_event_context(dict(request.market_context or {}))
             for playbook in request.strategy.playbooks:
                 entry = _resolve_repository_strategy_entry(
                     asset_type="playbook",
@@ -2719,14 +3766,46 @@ def build_router(
                 "ok": False,
                 "error": str(exc),
             }
+        factor_policy_trace = _apply_compose_factor_policy(request, policy_source="compose_runtime_guard")
+        if factor_policy_trace.get("hard_reject"):
+            if audit_store:
+                audit_store.append(
+                    category="runtime_compose_policy",
+                    message="compose 因子组合被执行层拒绝",
+                    payload={
+                        "request_id": request.request_id,
+                        "agent_id": request.agent.agent_id,
+                        "requested_factor_weights": factor_policy_trace.get("requested_factor_weights"),
+                        "adjusted_factor_weights": factor_policy_trace.get("adjusted_factor_weights"),
+                        "factor_rejections": factor_policy_trace.get("factor_rejections"),
+                        "factor_portfolio_health": factor_policy_trace.get("factor_portfolio_health"),
+                        "factor_mix_validation": factor_policy_trace.get("factor_mix_validation"),
+                    },
+                )
+            return {
+                "ok": False,
+                "error": "因子组合健康度不足，执行层已拒绝本次 compose",
+                "factor_policy_summary": factor_policy_trace.get("factor_policy_summary"),
+                "factor_portfolio_health": factor_policy_trace.get("factor_portfolio_health"),
+                "factor_mix_validation": factor_policy_trace.get("factor_mix_validation"),
+                "factor_effectiveness_trace": factor_policy_trace.get("factor_effectiveness_trace"),
+                "factor_auto_downgrades": factor_policy_trace.get("factor_auto_downgrades"),
+                "factor_rejections": factor_policy_trace.get("factor_rejections"),
+                "effectiveness_warnings": factor_policy_trace.get("effectiveness_warnings"),
+                "diversification_warnings": factor_policy_trace.get("diversification_warnings"),
+                "requested_factor_weights": factor_policy_trace.get("requested_factor_weights"),
+                "adjusted_factor_weights": factor_policy_trace.get("adjusted_factor_weights"),
+                "needs_review": factor_policy_trace.get("needs_review"),
+                "review_action": factor_policy_trace.get("review_action"),
+            }
         repository_payload = _register_compose_assets(request)
         base_runtime_config = _runtime_config()
         resolved_constraints = resolve_constraint_pack(request.constraints.model_dump(), base_runtime_config)
         runtime_config = _runtime_config_with_overrides(resolved_constraints.runtime_overrides(base_runtime_config))
         constraint_summary = resolved_constraints.summary(runtime_config)
         pipeline_request = RuntimeJobRequest(
-            symbols=request.universe.symbol_pool,
-            universe_scope=request.universe.scope,
+            symbols=_resolve_compose_pipeline_symbols(request),
+            universe_scope=("custom" if _resolve_compose_pipeline_symbols(request) else request.universe.scope),
             max_candidates=request.output.max_candidates,
             auto_trade=False,
             account_id=request.account_id,
@@ -2743,6 +3822,8 @@ def build_router(
         selection_preferences["excluded_candidates"] = list(selection_preferences.get("excluded_candidates") or []) + extra_filtered
         selection_preferences["constraint_pack"] = constraint_summary
         pipeline_payload["selection_preferences"] = selection_preferences
+        pipeline_payload["detected_market_regime"] = dict(request.market_context.get("detected_market_regime") or {})
+        pipeline_payload["regime_mismatch_warning"] = str(request.market_context.get("regime_mismatch_warning") or "")
         
         # 获取市场驱动上下文 (R0.4)
         event_context = serving_store.get_latest_event_context()
@@ -2758,6 +3839,61 @@ def build_router(
             monitor_context=monitor_context,
             market_adapter=market_adapter,
         )
+        if audit_store:
+            audit_store.append(
+                category="runtime_compose_policy",
+                message="compose 因子策略守门完成",
+                payload={
+                    "request_id": request.request_id,
+                    "agent_id": request.agent.agent_id,
+                    "requested_factor_weights": factor_policy_trace.get("requested_factor_weights"),
+                    "adjusted_factor_weights": factor_policy_trace.get("adjusted_factor_weights"),
+                    "factor_portfolio_health": factor_policy_trace.get("factor_portfolio_health"),
+                    "factor_mix_validation": factor_policy_trace.get("factor_mix_validation"),
+                    "factor_auto_downgrades": factor_policy_trace.get("factor_auto_downgrades"),
+                    "factor_rejections": factor_policy_trace.get("factor_rejections"),
+                    "needs_review": factor_policy_trace.get("needs_review"),
+                },
+            )
+        autonomy_trace, retry_plan = _build_autonomy_retry_plan(
+            request,
+            market_summary=compose_output["market_summary"],
+            filtered_out=compose_output["filtered_out"],
+            pipeline_payload=pipeline_payload,
+        )
+        active_learned_assets = [dict(item) for item in list(repository_payload.get("active_learned_assets") or [])]
+        active_learned_asset_ids = [
+            str(item.get("id") or "").strip()
+            for item in active_learned_assets
+            if str(item.get("id") or "").strip()
+        ]
+        candidate_count = len(list(compose_output.get("candidates") or []))
+        mainline_action_type = "candidate_proposal" if candidate_count > 0 else ("retry_compose" if bool(retry_plan.get("triggered")) else "observe_only")
+        mainline_action_summary = (
+            f"本轮已产出 {candidate_count} 个候选，可继续进入 proposal/discussion。"
+            if candidate_count > 0
+            else (
+                "本轮未产出可用候选，但已自动生成下一轮 compose 建议。"
+                if bool(retry_plan.get("triggered"))
+                else "本轮暂无下一步主线动作，需人工继续判断。"
+            )
+        )
+        autonomy_trace = {
+            **dict(autonomy_trace or {}),
+            "hypothesis_revised": bool((retry_plan or {}).get("revised_market_hypothesis")),
+            "original_market_hypothesis": str(request.intent.market_hypothesis or "").strip(),
+            "revised_market_hypothesis": str((retry_plan or {}).get("revised_market_hypothesis") or "").strip(),
+            "mainline_action_ready": bool(candidate_count > 0 or retry_plan.get("triggered")),
+            "mainline_action_type": mainline_action_type,
+            "mainline_action_summary": mainline_action_summary,
+            "learning_feedback_applied_count": len(active_learned_asset_ids),
+            "learning_feedback_asset_ids": active_learned_asset_ids,
+        }
+        retry_plan = {
+            **dict(retry_plan or {}),
+            "mainline_action_type": mainline_action_type,
+            "mainline_action_summary": mainline_action_summary,
+        }
         trace_id = f"compose-{pipeline_payload.get('job_id', uuid4().hex[:10])}"
         evaluation_ledger_service.record_compose_evaluation(
             trace_id=trace_id,
@@ -2774,6 +3910,23 @@ def build_router(
             applied_constraints=constraint_summary,
             repository=repository_payload,
             generated_at=str(pipeline_payload.get("generated_at") or datetime.now().isoformat()),
+            autonomy_trace=autonomy_trace,
+            retry_plan=retry_plan,
+        )
+        trace_service.append_event(
+            trace_id=trace_id,
+            stage="compose",
+            trade_date=str(request.market_context.get("trade_date") or datetime.now().date().isoformat()),
+            payload={
+                "request_id": request.request_id,
+                "agent_id": request.agent.agent_id,
+                "candidate_count": candidate_count,
+                "market_regime": request.market_context.get("market_regime"),
+                "regime_transition": (request.market_context.get("detected_market_regime") or {}).get("transition"),
+                "market_memory": request.market_context.get("market_memory"),
+                "failure_journal": request.market_context.get("failure_journal"),
+                "strategy_lifecycle": request.market_context.get("strategy_lifecycle"),
+            },
         )
         composition_manifest = _build_composition_manifest(
             request,
@@ -2781,6 +3934,7 @@ def build_router(
             compose_output=compose_output,
         )
         return {
+            "ok": True,
             "job_id": pipeline_payload.get("job_id"),
             "status": "completed",
             "request_id": request.request_id or f"compose-{uuid4().hex[:10]}",
@@ -2792,8 +3946,22 @@ def build_router(
             "filtered_out": compose_output["filtered_out"],
             "explanations": compose_output["explanations"],
             "proposal_packet": compose_output["proposal_packet"],
+            "factor_policy_summary": compose_output["factor_policy_summary"],
+            "factor_portfolio_health": compose_output["factor_portfolio_health"],
+            "factor_mix_validation": compose_output["factor_mix_validation"],
+            "factor_effectiveness_trace": compose_output["factor_effectiveness_trace"],
+            "factor_auto_downgrades": compose_output["factor_auto_downgrades"],
+            "factor_rejections": compose_output["factor_rejections"],
+            "effectiveness_warnings": compose_output["effectiveness_warnings"],
+            "diversification_warnings": compose_output["diversification_warnings"],
+            "requested_factor_weights": compose_output["requested_factor_weights"],
+            "adjusted_factor_weights": compose_output["adjusted_factor_weights"],
+            "needs_review": compose_output["needs_review"],
+            "review_action": compose_output["review_action"],
             "composition_manifest": composition_manifest,
             "applied_constraints": constraint_summary,
+            "autonomy_trace": autonomy_trace,
+            "auto_replan": retry_plan,
             "evaluation_trace": {
                 "stored": True,
                 "trace_id": trace_id,
@@ -2811,45 +3979,70 @@ def build_router(
         candidate_limit = request.max_candidates or runtime_config.screener_pool_size
         universe = _pick_universe(request)
         snapshots = market_adapter.get_snapshots(universe)
-        ranked = sorted(
+        pre_ranked = sorted(
             snapshots,
             key=lambda item: (
-                item.volume,
-                item.last_price - (item.pre_close or item.last_price),
-                item.last_price,
+                (
+                    (float(item.last_price or 0.0) - float(item.pre_close or item.last_price or 0.0))
+                    / max(float(item.pre_close or item.last_price or 1.0), 1e-9)
+                ),
+                float(item.volume or 0.0),
+                float(item.last_price or 0.0),
             ),
             reverse=True,
         )
+        snapshot_map = {item.symbol: item for item in pre_ranked}
+        seed_decisions: list[dict[str, Any]] = []
+        seed_score_map: dict[str, float] = {}
+        for index, item in enumerate(pre_ranked, start=1):
+            decision = score_runtime_snapshot(
+                symbol=item.symbol,
+                last_price=float(item.last_price or 0.0),
+                pre_close=float(item.pre_close or item.last_price or 0.0),
+                volume=float(item.volume or 0.0),
+                rank=index,
+            )
+            seed_decisions.append(decision)
+            seed_score_map[item.symbol] = float(decision["selection_score"])
 
-        candidate_symbols = [item.symbol for item in ranked[: max(candidate_limit * 3, candidate_limit)]]
-        passed = screener.run(candidate_symbols, runtime_config=runtime_config, top_n=candidate_limit).passed
+        candidate_symbols = [
+            str(item.get("symbol") or "")
+            for item in sorted(seed_decisions, key=lambda payload: float(payload.get("selection_score", 0.0) or 0.0), reverse=True)[
+                : max(candidate_limit * 5, candidate_limit * 3)
+            ]
+            if str(item.get("symbol") or "").strip()
+        ]
+        market_profile = sentiment_calculator.calc_from_market_data(market_adapter)
+        passed = screener.run(
+            candidate_symbols,
+            profile=market_profile,
+            factor_scores=seed_score_map,
+            runtime_config=runtime_config,
+            top_n=candidate_limit,
+        ).passed
 
         decisions = []
-        score_map: dict[str, float] = {}
-        name_map: dict[str, str] = {}
-        snapshot_map = {item.symbol: item for item in ranked}
         final_symbols = passed or candidate_symbols[:candidate_limit]
         for index, symbol in enumerate(final_symbols[:candidate_limit], start=1):
             item = snapshot_map.get(symbol)
             if item is None:
                 continue
-            decision = _score_snapshot(
+            decision = score_runtime_snapshot(
                 symbol=symbol,
-                last_price=item.last_price,
-                pre_close=item.pre_close,
-                volume=item.volume,
+                last_price=float(item.last_price or 0.0),
+                pre_close=float(item.pre_close or item.last_price or 0.0),
+                volume=float(item.volume or 0.0),
                 rank=index,
             )
             decision["name"] = getattr(item, "name", "") or market_adapter.get_symbol_name(symbol)
-            score_map[symbol] = float(decision["selection_score"])
-            name_map[symbol] = decision["name"]
             decisions.append(decision)
 
-        early_sector_map = _resolve_symbol_sector_map([], [item["symbol"] for item in decisions if item.get("symbol")])
         decisions, excluded_candidates, excluded_theme_keywords = _filter_top_picks_by_preferences(
             decisions,
             runtime_config=runtime_config,
-            sector_map=early_sector_map,
+            # 粗筛阶段尚未拿到 dossier，避免为黑名单过滤提前做一次全市场板块扫描。
+            # 真正的 resolved_sector 在 _persist_runtime_report 中会结合 dossier 再补齐。
+            sector_map={},
         )
 
         job_id = f"runtime-{uuid4().hex[:10]}"
@@ -2873,7 +4066,7 @@ def build_router(
                 "excluded_candidates": excluded_candidates,
             },
         }
-        _, market_profile_payload = _build_market_profile(decisions, ranked)
+        _, market_profile_payload = _build_market_profile(decisions, pre_ranked)
         report["market_profile"] = market_profile_payload
         _write_report(report)
         report = _persist_runtime_report(report)
@@ -3067,5 +4260,253 @@ def build_router(
         if not dossier:
             return {"available": False, "trade_date": trade_date, "symbol": symbol}
         return {"available": True, **dossier}
+
+    @router.get("/history/capabilities")
+    async def get_history_capabilities():
+        return {
+            "ok": True,
+            **history_store.capabilities(),
+            "catalog": history_catalog.build_health_snapshot(),
+        }
+
+    @router.post("/history/ingest/daily")
+    async def ingest_history_daily(symbols: str = "", trade_date: str = "", count: int = 120, universe_scope: str = "main-board"):
+        resolved_symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+        if not resolved_symbols:
+            if universe_scope == "a-share":
+                resolved_symbols = market_adapter.get_a_share_universe()
+            else:
+                resolved_symbols = market_adapter.get_main_board_universe()
+        resolved_trade_date = trade_date.strip() or datetime.now().date().isoformat()
+        return await run_in_threadpool(
+            lambda: history_ingest_service.ingest_daily_bars(
+                symbols=resolved_symbols,
+                trade_date=resolved_trade_date,
+                count=max(min(int(count or 120), 3000), 1),
+            )
+        )
+
+    @router.post("/history/ingest/daily-backfill")
+    async def ingest_history_daily_backfill(
+        symbols: str = "",
+        trade_date: str = "",
+        start_trade_date: str = "",
+        window_count: int = 240,
+        max_rounds: int = 12,
+        batch_size: int = 200,
+        universe_scope: str = "main-board",
+    ):
+        resolved_symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+        if not resolved_symbols:
+            resolved_symbols = (
+                market_adapter.get_a_share_universe()
+                if universe_scope == "a-share"
+                else market_adapter.get_main_board_universe()
+            )
+        resolved_trade_date = trade_date.strip() or datetime.now().date().isoformat()
+
+        def _run_backfill() -> dict[str, Any]:
+            batches = [resolved_symbols[index:index + max(batch_size, 1)] for index in range(0, len(resolved_symbols), max(batch_size, 1))]
+            batch_results: list[dict[str, Any]] = []
+            total_rows = 0
+            total_partitions = 0
+            for index, batch in enumerate(batches, start=1):
+                payload = history_ingest_service.backfill_daily_bars(
+                    symbols=batch,
+                    end_trade_date=resolved_trade_date,
+                    start_trade_date=start_trade_date.strip() or None,
+                    window_count=max(min(int(window_count or 240), 3000), 1),
+                    max_rounds=max(min(int(max_rounds or 12), 60), 1),
+                    source=f"runtime_backfill_batch_{index}",
+                )
+                batch_results.append(payload)
+                total_rows += int(payload.get("row_count", 0) or 0)
+                total_partitions += int(payload.get("partition_count", 0) or 0)
+            return {
+                "ok": True,
+                "trade_date": resolved_trade_date,
+                "start_trade_date": start_trade_date.strip() or None,
+                "symbol_count": len(resolved_symbols),
+                "batch_count": len(batch_results),
+                "row_count": total_rows,
+                "partition_count": total_partitions,
+                "items": batch_results,
+            }
+
+        return await run_in_threadpool(_run_backfill)
+
+    @router.post("/history/ingest/minute")
+    async def ingest_history_minute(symbols: str = "", trade_date: str = "", count: int = 240, period: str = "1m"):
+        resolved_symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+        if not resolved_symbols:
+            resolved_symbols = market_adapter.get_main_board_universe()[:10]
+        resolved_trade_date = trade_date.strip() or datetime.now().date().isoformat()
+        return await run_in_threadpool(
+            lambda: history_ingest_service.ingest_minute_bars(
+                symbols=resolved_symbols,
+                trade_date=resolved_trade_date,
+                count=max(min(int(count or 240), 1200), 1),
+                period=period,
+            )
+        )
+
+    @router.post("/history/ingest/behavior-profiles")
+    async def ingest_behavior_profiles(trade_date: str = ""):
+        return await run_in_threadpool(
+            lambda: history_ingest_service.sync_behavior_profiles(trade_date=trade_date.strip() or None)
+        )
+
+    @router.get("/history/behavior-profile")
+    async def get_history_behavior_profile(symbol: str, trade_date: str = ""):
+        profile = history_store.get_behavior_profile(symbol, trade_date=trade_date.strip() or None)
+        if profile is None and research_state_store is not None:
+            try:
+                history_ingest_service.sync_behavior_profiles(trade_date=trade_date.strip() or None)
+            except Exception:
+                pass
+            profile = history_store.get_behavior_profile(symbol, trade_date=trade_date.strip() or None)
+        return {
+            "available": profile is not None,
+            "symbol": symbol,
+            "trade_date": trade_date or None,
+            "item": profile,
+        }
+
+    @router.get("/history/stock-summary")
+    async def get_history_stock_summary(symbol: str, trade_date: str = ""):
+        summary = history_store.get_stock_summary(symbol, trade_date=trade_date.strip() or None)
+        if summary is None and research_state_store is not None:
+            try:
+                history_ingest_service.sync_behavior_profiles(trade_date=trade_date.strip() or None)
+            except Exception:
+                pass
+            summary = history_store.get_stock_summary(symbol, trade_date=trade_date.strip() or None)
+        return {
+            "available": summary is not None,
+            "symbol": symbol,
+            "trade_date": trade_date or None,
+            "item": summary,
+        }
+
+    @router.get("/history/behavior-profiles")
+    async def list_history_behavior_profiles(trade_date: str = "", limit: int = 20):
+        items = history_store.list_behavior_profiles(trade_date=trade_date.strip() or None, limit=max(min(limit, 100), 1))
+        return {
+            "ok": True,
+            "trade_date": trade_date or None,
+            "count": len(items),
+            "items": items,
+        }
+
+    @router.get("/history/catalog")
+    async def get_history_catalog():
+        return {
+            "ok": True,
+            **history_store.catalog_snapshot(),
+        }
+
+    @router.get("/history/partitions")
+    async def get_history_partitions(
+        dataset_name: str = "bars_1d",
+        period: str = "",
+        trade_date_start: str = "",
+        trade_date_end: str = "",
+        limit: int = 100,
+    ):
+        items = history_store.list_partitions(
+            dataset_name=dataset_name,
+            period=period.strip() or None,
+            trade_date_start=trade_date_start.strip() or None,
+            trade_date_end=trade_date_end.strip() or None,
+            limit=max(min(limit, 2000), 1),
+        )
+        return {
+            "ok": True,
+            "dataset_name": dataset_name,
+            "period": period or None,
+            "count": len(items),
+            "items": items,
+        }
+
+    @router.get("/history/bars")
+    async def get_history_bars(
+        symbol: str = "",
+        symbols: str = "",
+        period: str = "1d",
+        start_trade_date: str = "",
+        end_trade_date: str = "",
+        limit: int = 240,
+    ):
+        resolved_symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+        if symbol.strip():
+            resolved_symbols = [symbol.strip().upper(), *resolved_symbols]
+        resolved_symbols = list(dict.fromkeys(resolved_symbols))
+        payload = history_store.read_bars(
+            symbols=resolved_symbols,
+            period=period,
+            start_trade_date=start_trade_date.strip() or None,
+            end_trade_date=end_trade_date.strip() or None,
+            limit=max(min(limit, 3000), 1),
+        )
+        return {"ok": True, **payload}
+
+    @router.get("/history/bars/latest")
+    async def get_history_latest_bars(symbols: str, period: str = "1d"):
+        resolved_symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+        items = history_store.latest_bars(symbols=resolved_symbols, period=period)
+        return {
+            "ok": True,
+            "period": period,
+            "count": len(items),
+            "items": items,
+        }
+
+    @router.get("/history/search-symbol")
+    async def search_history_symbol(q: str, limit: int = 10):
+        items = market_adapter.search_symbols(q, limit=max(min(limit, 50), 1))
+        enriched_items: list[dict[str, Any]] = []
+        for item in items:
+            symbol = str(item.get("symbol") or "").strip().upper()
+            stock_summary = history_store.get_stock_summary(symbol)
+            latest_bar = history_store.latest_bars(symbols=[symbol], period="1d")
+            enriched_items.append(
+                {
+                    **item,
+                    "history_summary": stock_summary,
+                    "latest_daily_bar": latest_bar[0] if latest_bar else None,
+                }
+            )
+        return {
+            "ok": True,
+            "query": q,
+            "count": len(enriched_items),
+            "items": enriched_items,
+        }
+
+    @router.get("/history/context")
+    async def get_history_context(symbols: str, trade_date: str = "", daily_limit: int = 60, minute_limit: int = 120):
+        resolved_symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+        payload = history_store.build_history_context(
+            symbols=resolved_symbols,
+            trade_date=trade_date.strip() or None,
+            daily_limit=max(min(daily_limit, 500), 1),
+            minute_limit=max(min(minute_limit, 1000), 1),
+        )
+        return {"ok": True, **payload}
+
+    @router.get("/history/regime-memory")
+    async def get_history_regime_memory(
+        regime_label: str = "",
+        playbook: str = "",
+        sector: str = "",
+        limit: int = 20,
+    ):
+        payload = market_memory_service.list_entries(
+            regime_label=regime_label.strip() or None,
+            playbook=playbook.strip() or None,
+            sector=sector.strip() or None,
+            limit=max(min(limit, 100), 1),
+        )
+        return {"ok": True, **payload}
 
     return router

@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -24,8 +24,12 @@ from ..contracts import (
     ExecutionGatewayClaimInput,
     ExecutionGatewayReceiptInput,
     PlaceOrderRequest,
+    QuoteSnapshot,
 )
 from ..data.archive import DataArchiveStore
+from ..data.catalog_service import CatalogService
+from ..data.control_db import ControlPlaneDB
+from ..data.history_store import HistoryStore
 from ..data.serving import ServingStore
 from ..discussion.candidate_case import CandidateCase, CandidateCaseService, CandidateOpinion
 from ..discussion.client_brief import build_client_brief_payload
@@ -38,14 +42,22 @@ from ..discussion.protocol import (
 from ..execution_reconciliation import ExecutionReconciliationService
 from ..execution_gateway import (
     EXECUTION_GATEWAY_PENDING_PATH,
+    TERMINAL_INTENT_STATUSES,
     append_execution_intent_history as append_gateway_execution_intent_history,
+    append_execution_gateway_receipt as append_gateway_execution_gateway_receipt,
+    append_receipt_audit_event,
     build_execution_gateway_intent_packet,
     enqueue_execution_gateway_intent,
     get_execution_intent_history as get_gateway_execution_intent_history,
     get_pending_execution_intents as get_gateway_pending_execution_intents,
+    map_order_status_to_intent_status,
+    retry_stale_claimed_intents,
     resolve_execution_gateway_state_store,
     save_pending_execution_intents as save_gateway_pending_execution_intents,
+    transition_execution_intent,
 )
+from ..execution.order_strategy import OrderStrategyResolver
+from ..execution.quality_tracker import ExecutionQualityTracker
 from ..execution_safety import (
     is_limit_down,
     is_limit_up,
@@ -61,12 +73,18 @@ from ..governance.inspection import (
 )
 from ..governance.nl_adjustment import NaturalLanguageAdjustmentInterpreter
 from ..governance.param_service import ParameterService, ParamProposalInput
+from ..hermes.inference_client import HermesInferenceClient
+from ..hermes.model_router import HermesModelRouter
 from ..infra.adapters import ExecutionAdapter
 from ..infra.audit_store import AuditStore, StateStore
 from ..infra.healthcheck import EnvironmentHealthcheck
-from ..learning.score_state import AgentScoreService
 from ..learning.attribution import TradeAttributionRecord, TradeAttributionService
+from ..learning.failure_journal import FailureJournalService
+from ..learning.market_memory import MarketMemoryService
+from ..learning.parameter_snapshot import ParameterSnapshotService
+from ..learning.score_state import AgentScoreService
 from ..learning.settlement import AgentScoreSettlementService, SettlementSymbolOutcome
+from ..learning.strategy_lifecycle import StrategyLifecycleService
 from ..logging_config import get_logger
 from ..monitor.persistence import (
     MonitorStateService,
@@ -96,12 +114,16 @@ from ..portfolio import build_test_trading_budget, summarize_position_buckets
 from ..precompute import DossierPrecomputeService
 from ..reverse_repo import ReverseRepoService
 from ..risk.guard import ExecutionGuard
+from ..risk.portfolio_risk import PortfolioPositionContext, PortfolioRiskChecker
+from ..risk.position_sizing import PositionSizer
 from ..runtime_config import RuntimeConfig, RuntimeConfigManager
 from ..scheduler import run_tail_market_scan
 from ..selection_preferences import match_excluded_theme, normalize_excluded_theme_keywords
 from ..settings import AppSettings
 from ..startup_recovery import StartupRecoveryService
+from ..infra.trace import TradeTraceService
 from ..strategy.nightly_sandbox import NightlySandbox
+from ..strategy.playbook_registry import bootstrap_playbook_registry, playbook_registry
 from ..supervision_state import (
     annotate_supervision_payload,
     record_supervision_ack,
@@ -111,6 +133,7 @@ from ..supervision_tasks import (
     build_agent_task_plan,
     record_agent_task_dispatch,
     record_agent_task_completion,
+    resolve_market_phase,
 )
 
 logger = get_logger("system.api")
@@ -217,6 +240,7 @@ _EXECUTION_BLOCKER_PRIORITY = {
     "cash_exceeded": 19,
     "single_amount_exceeded": 20,
     "guard_reject": 21,
+    "regime_transition_confirmation": 22,
 }
 
 _EXECUTION_BLOCKER_LABELS = {
@@ -245,6 +269,7 @@ _EXECUTION_BLOCKER_LABELS = {
     "cash_exceeded": "下单金额超过可用现金",
     "single_amount_exceeded": "下单金额超过单票上限",
     "guard_reject": "执行守卫拒绝",
+    "regime_transition_confirmation": "市场状态切换确认期，暂停旧 regime 强相关新买入",
 }
 
 _EXECUTION_NEXT_ACTION_PRIORITY = {
@@ -316,6 +341,7 @@ def _execution_blocker_next_actions(code: str) -> list[str]:
         "audit_gate_hold": ["review_risk_and_audit"],
         "excluded_by_selection_preferences": ["adjust_selection_preferences"],
         "guard_reject": ["review_risk_and_audit"],
+        "regime_transition_confirmation": ["review_risk_and_audit"],
         "trading_session_closed": ["retry_when_market_opens"],
         "limit_up_locked": ["wait_for_better_price"],
         "limit_down_locked": ["wait_for_better_price"],
@@ -726,7 +752,7 @@ def _build_parameter_hint_rollback_policy(
 
 
 class CandidateOpinionInput(BaseModel):
-    round: int = Field(ge=1, le=2)
+    round: int = Field(ge=1)
     agent_id: str
     stance: str
     confidence: str | float = "medium"
@@ -747,7 +773,7 @@ class CandidateOpinionInput(BaseModel):
 
 class BatchOpinionItem(BaseModel):
     case_id: str
-    round: int = Field(ge=1, le=2)
+    round: int = Field(ge=1)
     agent_id: str
     stance: str
     confidence: str | float = "medium"
@@ -797,7 +823,7 @@ class OpportunityTicketBatchInput(BaseModel):
 class OpenClawOpinionIngressInput(BaseModel):
     payload: Any = Field(default_factory=dict)
     trade_date: str | None = None
-    expected_round: int | None = Field(default=None, ge=1, le=2)
+    expected_round: int | None = Field(default=None, ge=1)
     expected_agent_id: str | None = None
     expected_case_ids: list[str] = Field(default_factory=list)
     case_id_map: dict[str, str] = Field(default_factory=dict)
@@ -809,7 +835,7 @@ class ComposeOpinionWritebackInput(BaseModel):
     payload: Any = Field(default_factory=dict)
     trade_date: str | None = None
     trace_id: str | None = None
-    expected_round: int | None = Field(default=None, ge=1, le=2)
+    expected_round: int | None = Field(default=None, ge=1)
     expected_agent_id: str = "ashare-strategy"
     case_id_map: dict[str, str] = Field(default_factory=dict)
     auto_rebuild: bool = True
@@ -817,7 +843,7 @@ class ComposeOpinionWritebackInput(BaseModel):
 
 class AgentAutoOpinionWritebackInput(BaseModel):
     trade_date: str | None = None
-    expected_round: int | None = Field(default=None, ge=1, le=2)
+    expected_round: int | None = Field(default=None, ge=1)
     expected_agent_id: str | None = None
     auto_rebuild: bool = True
 
@@ -870,6 +896,9 @@ class FeishuAskInput(BaseModel):
     trade_date: str | None = None
     notify: bool = False
     force: bool = False
+    bot_role: str = "main"
+    bot_id: str = ""
+    source: str = "feishu_api"
 
 
 class FeishuSupervisionAckInput(BaseModel):
@@ -1016,6 +1045,9 @@ def build_router(
     runtime_state_store: StateStore | None = None,
     research_state_store: StateStore | None = None,
     meeting_state_store: StateStore | None = None,
+    discussion_state_store: StateStore | None = None,
+    execution_gateway_state_store: StateStore | None = None,
+    position_watch_state_store: StateStore | None = None,
     feishu_longconn_state_store: StateStore | None = None,
     parameter_service: ParameterService | None = None,
     candidate_case_service: CandidateCaseService | None = None,
@@ -1028,14 +1060,28 @@ def build_router(
     dossier_precompute_service: DossierPrecomputeService | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/system", tags=["system"])
+    bootstrap_playbook_registry()
     reports_dir = settings.logs_dir / "reports"
     runtime_report_path = reports_dir / "runtime_latest.json"
     serving_store = ServingStore(settings.storage_root)
     archive_store = DataArchiveStore(settings.storage_root)
+    control_plane_db = ControlPlaneDB(settings.control_plane_db_path)
+    history_catalog = CatalogService(control_plane_db)
+    history_store = HistoryStore(settings.storage_root, control_plane_db, history_catalog)
+    hermes_model_router = HermesModelRouter(settings.hermes)
+    hermes_inference_client = HermesInferenceClient(settings.hermes, hermes_model_router)
     nightly_sandbox = NightlySandbox(settings.storage_root)
     offline_backtest_runner = PlaybookBacktestRunner()
     settlement_service = AgentScoreSettlementService()
     trade_attribution_service = TradeAttributionService(settings.storage_root / "learning" / "trade_attribution.json")
+    market_memory_service = MarketMemoryService(settings.storage_root / "learning" / "market_memory.json")
+    failure_journal_service = FailureJournalService(settings.storage_root / "learning" / "failure_journal.json")
+    strategy_lifecycle_service = StrategyLifecycleService(settings.storage_root / "learning" / "strategy_lifecycle.json")
+    parameter_snapshot_service = ParameterSnapshotService(settings.storage_root / "learning" / "parameter_snapshots.json")
+    quality_tracker = ExecutionQualityTracker(settings.storage_root / "execution" / "quality_tracker.json")
+    trace_service = TradeTraceService(settings.storage_root / "infra" / "trade_traces.json")
+    order_strategy_resolver = OrderStrategyResolver()
+    portfolio_risk_checker = PortfolioRiskChecker()
     adjustment_interpreter = NaturalLanguageAdjustmentInterpreter(parameter_service._registry) if parameter_service else None
     monitor_change_notifier = (
         MonitorChangeNotifier(monitor_state_service, message_dispatcher)
@@ -1097,7 +1143,7 @@ def build_router(
         else None
     )
     execution_reconciliation_service = (
-        ExecutionReconciliationService(execution_adapter, meeting_state_store)
+        ExecutionReconciliationService(execution_adapter, meeting_state_store, quality_tracker=quality_tracker)
         if meeting_state_store and execution_adapter
         else None
     )
@@ -1370,7 +1416,7 @@ def build_router(
                     ),
                     exit_reason=exit_reason,
                     next_day_close_pct=next_day_close_pct,
-                    note=f"对账成交回写 {order_id}",
+                    note=f"对账成交回写 {order_id} trace={journal_item.get('trace_id') or ((journal_item.get('request') or {}).get('trace_id') or '')}",
                     selection_score=(case.runtime_snapshot.selection_score if case else dossier_item.get("selection_score")),
                     rank=(case.runtime_snapshot.rank if case else dossier_item.get("rank")),
                     final_status=(case.final_status if case else dossier_item.get("final_status", "")),
@@ -1394,6 +1440,18 @@ def build_router(
             score_date=score_date,
             items=attribution_items,
         )
+        attribution_payloads = [item.model_dump() for item in attribution_items]
+        market_memory_service.update_from_attribution(attribution_payloads)
+        failure_journal_service.record_failures(attribution_payloads)
+        strategy_lifecycle_service.refresh_from_attribution(_derive_trade_records())
+        for item in attribution_items:
+            trace_id = str(item.note or "").split("trace=", 1)[-1] if "trace=" in str(item.note or "") else None
+            _record_trade_trace(
+                trace_id,
+                stage="attribution",
+                trade_date=item.trade_date,
+                payload=item.model_dump(),
+            )
         return {
             "update_count": len(attribution_items),
             "items": [item.model_dump() for item in attribution_items],
@@ -1401,6 +1459,109 @@ def build_router(
         }
     def _build_execution_guard(runtime_config: RuntimeConfig) -> ExecutionGuard:
         return ExecutionGuard.from_runtime_config(runtime_config)
+
+    def _record_trade_trace(
+        trace_id: str | None,
+        *,
+        stage: str,
+        payload: dict[str, Any] | None = None,
+        trade_date: str | None = None,
+    ) -> None:
+        if not trace_id:
+            return
+        trace_service.append_event(
+            trace_id=trace_id,
+            stage=stage,
+            payload=_sanitize_json_compatible(payload or {}),
+            trade_date=trade_date,
+        )
+
+    def _build_governance_snapshot_payload() -> dict[str, Any]:
+        latest_factor_effectiveness = dict((runtime_state_store.get("factor_effectiveness:latest", {}) if runtime_state_store else {}) or {})
+        latest_playbook_override = dict((meeting_state_store.get("latest_playbook_override_snapshot", {}) if meeting_state_store else {}) or {})
+        latest_agent_scores = [item.model_dump() for item in agent_score_service.list_scores()] if agent_score_service else []
+        runtime_config_payload = config_mgr.get().model_dump() if config_mgr else {}
+        return {
+            "factor_weights": latest_factor_effectiveness,
+            "playbook_priorities": latest_playbook_override,
+            "agent_scores": latest_agent_scores,
+            "runtime_config": runtime_config_payload,
+        }
+
+    def _create_governance_snapshot() -> dict[str, Any]:
+        return parameter_snapshot_service.create_snapshot(_build_governance_snapshot_payload())
+
+    def _apply_governance_snapshot(snapshot_id: str) -> dict[str, Any]:
+        snapshot = parameter_snapshot_service.get_snapshot(snapshot_id)
+        if not snapshot:
+            raise KeyError(f"snapshot not found: {snapshot_id}")
+        if runtime_state_store and snapshot.get("factor_weights") is not None:
+            runtime_state_store.set("factor_effectiveness:latest", snapshot.get("factor_weights"))
+        if meeting_state_store and snapshot.get("playbook_priorities") is not None:
+            meeting_state_store.set("latest_playbook_override_snapshot", snapshot.get("playbook_priorities"))
+        if config_mgr and snapshot.get("runtime_config"):
+            config_mgr.update(**dict(snapshot.get("runtime_config") or {}))
+        if agent_score_service and snapshot.get("agent_scores"):
+            score_path = getattr(agent_score_service, "_storage_path", None)
+            if score_path is not None:
+                score_path.write_text(
+                    json.dumps({"states": list(snapshot.get("agent_scores") or [])}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        return snapshot
+
+    def _build_portfolio_position_contexts(
+        positions_payload: list[Any],
+        *,
+        dossier_map: dict[str, Any] | None = None,
+        playbook_map: dict[str, Any] | None = None,
+    ) -> list[PortfolioPositionContext]:
+        dossier_map = dossier_map or {}
+        playbook_map = playbook_map or {}
+        results: list[PortfolioPositionContext] = []
+        for position in list(positions_payload or []):
+            symbol = str(getattr(position, "symbol", None) or (position.get("symbol") if isinstance(position, dict) else "") or "").strip()
+            if not symbol:
+                continue
+            quantity = float(getattr(position, "quantity", None) or (position.get("quantity") if isinstance(position, dict) else 0.0) or 0.0)
+            last_price = float(getattr(position, "last_price", None) or (position.get("last_price") if isinstance(position, dict) else 0.0) or 0.0)
+            context = dict(playbook_map.get(symbol) or {})
+            dossier = dict(dossier_map.get(symbol) or {})
+            sector = str(context.get("sector") or dossier.get("resolved_sector") or dossier.get("sector") or "unknown")
+            beta = float(dossier.get("beta", 1.0) or 1.0)
+            results.append(
+                PortfolioPositionContext(
+                    symbol=symbol,
+                    market_value=quantity * last_price,
+                    sector=sector,
+                    beta=beta,
+                )
+            )
+        return results
+
+    def _resolve_daily_new_exposure(trade_date: str) -> float:
+        total = 0.0
+        if meeting_state_store:
+            for item in list(meeting_state_store.get("execution_order_journal", []) or []):
+                request = dict(item.get("request") or {})
+                side = str(item.get("side") or request.get("side") or "").upper()
+                if str(item.get("trade_date") or request.get("trade_date") or "") != trade_date:
+                    continue
+                if side != "BUY":
+                    continue
+                total += float(request.get("quantity", 0) or 0.0) * float(request.get("price", 0.0) or 0.0)
+        if execution_gateway_state_store:
+            for item in list(get_gateway_execution_intent_history(_get_execution_gateway_state_store()) or []):
+                if str(item.get("trade_date") or "") != trade_date:
+                    continue
+                if str(item.get("side") or "").upper() != "BUY":
+                    continue
+                total += float(item.get("quantity", 0) or 0.0) * float(item.get("price", 0.0) or 0.0)
+        return round(total, 4)
+
+    def _derive_trade_records() -> list[dict[str, Any]]:
+        report = trade_attribution_service.latest_report()
+        return [item.model_dump() for item in list(report.items or [])]
 
     def _recent_reports() -> list[str]:
         if not reports_dir.exists():
@@ -1573,7 +1734,7 @@ def build_router(
             "symbol": case.symbol,
             "name": case.name,
             "symbol_display": f"{case.symbol} {case.name or case.symbol}",
-            "headline_reason": case.selected_reason or case.rejected_reason or case.runtime_snapshot.summary,
+            "headline_reason": CandidateCaseService.resolve_headline_reason(case),
             "discussion": {},
             "latest_opinions": {},
             "rounds": {},
@@ -1690,11 +1851,211 @@ def build_router(
             if generated_at.startswith(trade_date) or str(adoption.get("trade_date") or "").strip() == trade_date:
                 matched.append(_sanitize_json_compatible(item))
         latest = matched[-1] if matched else {}
+        latest_retry = dict((latest or {}).get("retry_plan") or {})
+        latest_autonomy = dict((latest or {}).get("autonomy_trace") or {})
         return {
             "count": len(matched),
             "latest": latest,
             "latest_generated_at": str((latest or {}).get("generated_at") or "").strip() or None,
             "latest_trace_id": str((latest or {}).get("trace_id") or "").strip() or None,
+            "latest_retry_triggered": bool(latest_retry.get("triggered")),
+            "latest_retry_generated_at": str(latest_retry.get("generated_at") or "").strip() or None,
+            "latest_retry_reason_codes": [
+                str(item).strip()
+                for item in list(latest_retry.get("reason_codes") or [])
+                if str(item).strip()
+            ],
+            "latest_retry_reason_summary": str(latest_retry.get("reason_summary") or "").strip(),
+            "latest_autonomy_trace": latest_autonomy,
+            "latest_mainline_action_ready": bool(latest_autonomy.get("mainline_action_ready")),
+            "latest_mainline_action_type": str(latest_autonomy.get("mainline_action_type") or "").strip(),
+            "latest_mainline_action_summary": str(latest_autonomy.get("mainline_action_summary") or "").strip(),
+            "latest_hypothesis_revised": bool(latest_autonomy.get("hypothesis_revised")),
+            "latest_learning_feedback_applied_count": int(latest_autonomy.get("learning_feedback_applied_count", 0) or 0),
+        }
+
+    def _resolve_mainline_stage_payload(
+        trade_date: str | None,
+        *,
+        cycle_state: str | None = None,
+        execution_summary: dict[str, Any] | None = None,
+        compose_metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        phase = resolve_market_phase(trade_date)
+        execution_summary = dict(execution_summary or {})
+        compose_metrics = dict(compose_metrics or _compose_evaluation_metrics_for_trade_date(trade_date))
+        latest_reconciliation = dict(execution_summary.get("latest_execution_reconciliation") or {})
+        latest_nightly_sandbox = dict(execution_summary.get("latest_nightly_sandbox") or {})
+        latest_review_board = dict(execution_summary.get("latest_review_board") or {})
+        latest_autonomy_trace = dict(compose_metrics.get("latest_autonomy_trace") or {})
+        dispatch_status = str(execution_summary.get("dispatch_status") or "").strip()
+        trade_count = int(execution_summary.get("trade_count", 0) or 0)
+        matched_order_count = int(execution_summary.get("matched_order_count", 0) or 0)
+        position_count = 0
+        current_total_ratio = 0.0
+        equity_position_limit = 0.0
+        if account_state_service:
+            latest_account_state = dict(account_state_service.latest() or {})
+            metrics = dict(latest_account_state.get("metrics") or {})
+            account_trade_date = str(latest_account_state.get("trade_date") or "").strip()
+            if not trade_date or not account_trade_date or account_trade_date == trade_date:
+                position_count = int(latest_account_state.get("position_count", 0) or 0)
+                current_total_ratio = float(metrics.get("current_total_ratio", 0.0) or 0.0)
+                equity_position_limit = float(metrics.get("equity_position_limit", 0.0) or 0.0)
+        if position_count <= 0:
+            position_count = int(latest_reconciliation.get("position_count", 0) or 0)
+        if current_total_ratio <= 0:
+            current_total_ratio = float(((latest_reconciliation.get("metrics") or {}).get("current_total_ratio", 0.0)) or 0.0)
+        if equity_position_limit <= 0:
+            equity_position_limit = float(((latest_reconciliation.get("metrics") or {}).get("equity_position_limit", 0.0)) or 0.0)
+
+        tail_review = _build_tail_market_review_section(source="latest", limit=5)
+        tail_review_available = bool(tail_review.get("available"))
+        latest_tail_trade_date = str(tail_review.get("trade_date") or "").strip()
+        if trade_date and latest_tail_trade_date and latest_tail_trade_date != trade_date:
+            tail_review_available = False
+
+        near_full_position = bool(
+            position_count > 0
+            and equity_position_limit > 0
+            and current_total_ratio >= max(equity_position_limit - 0.03, equity_position_limit * 0.85)
+        )
+        retry_generated = bool(compose_metrics.get("latest_retry_triggered"))
+        mainline_action_ready = bool(compose_metrics.get("latest_mainline_action_ready"))
+        phase_code = str(phase.get("code") or "").strip()
+
+        stage_code = "opportunity_discovery"
+        label = "找机会"
+        reason_parts: list[str] = []
+        next_stage_code = "position_management" if position_count > 0 else "deliberation"
+
+        latest_nightly_sandbox_matches = _payload_trade_date_matches(latest_nightly_sandbox, trade_date)
+        latest_review_board_matches = _payload_trade_date_matches(latest_review_board, trade_date)
+
+        if phase_code in {"post_close", "overnight"} or (
+            phase_code in {"pre_market", "auction"} and (latest_nightly_sandbox_matches or latest_review_board_matches)
+        ):
+            stage_code = "postclose_learning"
+            label = "盘后学习"
+            reason_parts.append("当前处于非交易时段，主线应收口到复盘、学习与次日预案。")
+            if trade_count > 0 or matched_order_count > 0:
+                reason_parts.append(f"最新对账 trade_count={trade_count} matched_orders={matched_order_count}。")
+            if latest_review_board and latest_review_board_matches:
+                reason_parts.append("已有 review board，可继续做证据复核与归因。")
+            if latest_nightly_sandbox and latest_nightly_sandbox_matches:
+                reason_parts.append("已有 nightly sandbox，可直接沉淀次日优先级。")
+            next_stage_code = "preopen"
+        elif tail_review_available and position_count > 0 and phase_code in {"afternoon_session", "tail_session"}:
+            stage_code = "day_trading"
+            label = "做T"
+            reason_parts.append("当前已有持仓且尾盘/T 复核可用，应优先处理日内回转与降本机会。")
+            next_stage_code = "replacement_review" if near_full_position else "position_management"
+        elif near_full_position or (position_count > 0 and dispatch_status in {"blocked", "queued_for_gateway", "queued", "queued_for_gateway"}):
+            stage_code = "replacement_review"
+            label = "换仓"
+            reason_parts.append("当前仓位接近上限或执行链存在阻断，主线应先判断替弱换强。")
+            if dispatch_status:
+                reason_parts.append(f"当前 dispatch={dispatch_status}。")
+            next_stage_code = "postclose_learning" if phase_code in {"tail_session", "post_close", "overnight"} else "position_management"
+        elif position_count > 0:
+            stage_code = "position_management"
+            label = "持仓管理"
+            reason_parts.append("当前已有持仓，主线应先围绕持仓复核、风控和补位节奏推进。")
+            if retry_generated:
+                reason_parts.append("最近 compose 已触发重编排，持仓判断要与新策略草案一起看。")
+            next_stage_code = "day_trading" if phase_code in {"afternoon_session", "tail_session"} else "replacement_review"
+        else:
+            stage_code = "opportunity_discovery"
+            label = "找机会"
+            reason_parts.append("当前以发现新机会、补位候选和形成 compose 草案为主。")
+            if retry_generated:
+                reason_parts.append("上一轮 compose 失败后已生成第二轮重编排建议。")
+            elif mainline_action_ready:
+                reason_parts.append("最新 compose 已形成下一步主线动作。")
+            next_stage_code = "deliberation"
+
+        source_signals = [
+            f"phase={phase.get('label')}",
+            f"position_count={position_count}",
+        ]
+        if dispatch_status:
+            source_signals.append(f"dispatch={dispatch_status}")
+        if trade_count > 0 or matched_order_count > 0:
+            source_signals.append(f"reconciliation trades={trade_count} matched={matched_order_count}")
+        if retry_generated:
+            source_signals.append("auto_replan=triggered")
+        if int(compose_metrics.get("count", 0) or 0) > 0:
+            source_signals.append(f"compose_count={compose_metrics.get('count', 0)}")
+        if int(compose_metrics.get("latest_learning_feedback_applied_count", 0) or 0) > 0:
+            source_signals.append(
+                f"learning_feedback={compose_metrics.get('latest_learning_feedback_applied_count', 0)}"
+            )
+        if cycle_state:
+            source_signals.append(f"cycle={cycle_state}")
+
+        return {
+            "code": stage_code,
+            "label": label,
+            "reason": " ".join(reason_parts).strip(),
+            "next_stage_code": next_stage_code,
+            "phase_code": phase_code,
+            "phase_label": str(phase.get("label") or "").strip(),
+            "position_count": position_count,
+            "current_total_ratio": round(current_total_ratio, 4),
+            "equity_position_limit": round(equity_position_limit, 4),
+            "dispatch_status": dispatch_status,
+            "trade_count": trade_count,
+            "matched_order_count": matched_order_count,
+            "retry_generated": retry_generated,
+            "mainline_action_ready": mainline_action_ready,
+            "source_signals": source_signals,
+        }
+
+    def _build_autonomy_progress_snapshot(
+        *,
+        compose_metrics: dict[str, Any],
+        agent_proposed_count: int,
+        mainline_stage: dict[str, Any],
+    ) -> dict[str, Any]:
+        latest_autonomy = dict(compose_metrics.get("latest_autonomy_trace") or {})
+        completed_steps: list[str] = []
+        pending_steps: list[str] = []
+
+        def _mark(flag: bool, label: str) -> None:
+            if flag:
+                completed_steps.append(label)
+            else:
+                pending_steps.append(label)
+
+        _mark(bool(latest_autonomy.get("market_hypothesis_present")), "已形成市场假设")
+        _mark(int(compose_metrics.get("count", 0) or 0) > 0, "已形成 compose")
+        _mark(bool(latest_autonomy.get("retry_generated")), "失败后已重编排")
+        _mark(agent_proposed_count > 0, "已产出新机会票")
+        _mark(bool(latest_autonomy.get("mainline_action_ready")), "已形成下一步主线动作")
+
+        learning_feedback_applied_count = int(latest_autonomy.get("learning_feedback_applied_count", 0) or 0)
+        if learning_feedback_applied_count > 0:
+            completed_steps.append(f"学习结果已回灌 {learning_feedback_applied_count} 项")
+        else:
+            pending_steps.append("学习结果回灌待增强")
+
+        if len(completed_steps) >= 5:
+            status = "strong"
+        elif len(completed_steps) >= 3:
+            status = "partial"
+        else:
+            status = "weak"
+
+        summary_line = (
+            f"当前主线={str(mainline_stage.get('label') or '-')}；"
+            f"已完成={len(completed_steps)} 项；"
+            f"待补={len(pending_steps)} 项。"
+        )
+        return {
+            "status": status,
+            "completed_steps": completed_steps,
+            "pending_steps": pending_steps,
+            "summary_line": summary_line,
         }
 
     def _compose_evaluation_by_trace_id(trace_id: str) -> dict[str, Any]:
@@ -1830,10 +2191,24 @@ def build_router(
         if not trade_date:
             return payload
         archive_store.persist_discussion_context(trade_date, payload)
-        if meeting_state_store:
-            meeting_state_store.set("latest_discussion_context", payload)
-            meeting_state_store.set(f"discussion_context:{trade_date}", payload)
+        if discussion_state_store:
+            discussion_state_store.set("latest_discussion_context", payload)
+            discussion_state_store.set(f"discussion_context:{trade_date}", payload)
         return payload
+
+    def _get_discussion_context_from_store(trade_date: str | None = None) -> dict[str, Any]:
+        if not discussion_state_store:
+            return {}
+        key = f"discussion_context:{trade_date}" if trade_date else "latest_discussion_context"
+        payload = discussion_state_store.get(key, {})
+        return _sanitize_json_compatible(payload) if isinstance(payload, dict) else {}
+
+    def _get_latest_discussion_context_payload() -> dict[str, Any]:
+        stored = _get_discussion_context_from_store()
+        if stored:
+            return stored
+        latest = _sanitize_json_compatible(serving_store.get_latest_discussion_context())
+        return latest if isinstance(latest, dict) else {}
 
     def _serialize_cycle_compact(cycle: Any | None) -> dict[str, Any]:
         if cycle is None:
@@ -1981,7 +2356,10 @@ def build_router(
         generated_at = runtime.get("generated_at")
         if generated_at:
             return datetime.fromisoformat(generated_at).date().isoformat()
-        raise ValueError("trade_date is required because no candidate cases are available yet")
+        reference_trade_date = _resolve_reference_trade_date()
+        if reference_trade_date:
+            return reference_trade_date
+        return datetime.now().date().isoformat()
 
     def _persist_discussion_writeback_items(
         items: list[tuple[str, CandidateOpinion]],
@@ -2542,7 +2920,11 @@ def build_router(
         openclaw_proposal = ((serving_latest_index.get("items") or {}).get("openclaw_proposal_packet") or {})
 
         readiness_status = str(readiness.get("status") or "blocked")
-        readiness_check_status = "ok" if readiness_status == "ready" else ("warning" if readiness_status == "degraded" else "blocked")
+        readiness_check_status = (
+            "ok"
+            if readiness_status == "ready"
+            else ("warning" if readiness_status in {"degraded", "degraded_allow"} else "blocked")
+        )
         execution_bridge_status = str(execution_bridge_overview.get("overall_status") or "unknown")
         execution_bridge_check_status = (
             "ok"
@@ -2768,6 +3150,7 @@ def build_router(
         emergency_stop_active = bool(getattr(runtime_config, "emergency_stop", False))
         trading_halt_reason = str(getattr(runtime_config, "trading_halt_reason", "") or "").strip()
         pending_order_warn_seconds = int(getattr(runtime_config, "pending_order_warn_seconds", 300) or 300)
+        parameter_consistency = _build_parameter_consistency_payload()
 
         checks.append(
             {
@@ -2776,6 +3159,14 @@ def build_router(
                 "detail": (trading_halt_reason or "inactive"),
             }
         )
+        if parameter_consistency.get("parameter_drift_warning"):
+            checks.append(
+                {
+                    "name": "parameter_drift_warning",
+                    "status": "warning",
+                    "detail": str(parameter_consistency["equity_position_limit"]["recommendation"]),
+                }
+            )
 
         latest_account_state = account_state_service.latest() if account_state_service else {}
         if latest_account_state and str(latest_account_state.get("account_id") or "") != resolved_account_id:
@@ -2835,6 +3226,20 @@ def build_router(
             else {}
         )
         startup_recovery = dict(meeting_state_latest.get("latest_startup_recovery") or {})
+        startup_recovery_age_seconds = _snapshot_age_seconds(
+            {"captured_at": startup_recovery.get("recovered_at")}
+        )
+        if (
+            startup_recovery_service
+            and account_state_is_fresh
+            and (
+                not startup_recovery
+                or startup_recovery.get("status") in {"missing", "error"}
+                or startup_recovery_age_seconds is None
+                or startup_recovery_age_seconds > 1800
+            )
+        ):
+            startup_recovery = dict(startup_recovery_service.recover(resolved_account_id, persist=True) or {})
         startup_status = startup_recovery.get("status", "missing")
         checks.append(
             {
@@ -3057,23 +3462,169 @@ def build_router(
             "submitted_count": submitted_count,
         }
 
+    def _resolve_controlled_apply_default_int(value: int | None, env_name: str, fallback: int) -> int:
+        if value is not None:
+            return int(value)
+        raw_value = str(os.getenv(env_name, "") or "").strip()
+        if not raw_value:
+            return fallback
+        try:
+            return int(raw_value)
+        except ValueError:
+            return fallback
+
+    def _resolve_controlled_apply_default_float(
+        value: float | None,
+        env_name: str,
+        fallback: float | None,
+    ) -> float | None:
+        if value is not None:
+            return float(value)
+        raw_value = str(os.getenv(env_name, "") or "").strip()
+        if not raw_value:
+            return fallback
+        try:
+            return float(raw_value)
+        except ValueError:
+            return fallback
+
+    def _resolve_controlled_apply_default_bool(value: bool | None, env_name: str, fallback: bool) -> bool:
+        if value is not None:
+            return bool(value)
+        raw_value = str(os.getenv(env_name, "") or "").strip().lower()
+        if not raw_value:
+            return fallback
+        return raw_value in {"1", "true", "yes", "on"}
+
+    def _safe_float(value: Any, default: float | None = None) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _resolve_runtime_equity_position_limit() -> float:
+        runtime_limit = _safe_float(getattr(config_mgr.get(), "equity_position_limit", None), None) if config_mgr else None
+        if runtime_limit is not None:
+            return runtime_limit
+        parameter_limit = (
+            _safe_float(parameter_service.get_param_value("equity_position_limit"), None)
+            if parameter_service
+            else None
+        )
+        if parameter_limit is not None:
+            return parameter_limit
+        return 0.3
+
+    def _resolve_controlled_apply_equity_position_limit(value: float | None) -> float:
+        if value is not None:
+            return float(value)
+        env_value = _resolve_controlled_apply_default_float(
+            None,
+            "ASHARE_APPLY_READY_MAX_EQUITY_POSITION_LIMIT",
+            None,
+        )
+        if env_value is not None:
+            return float(env_value)
+        runtime_limit = _safe_float(getattr(config_mgr.get(), "equity_position_limit", None), None) if config_mgr else None
+        if runtime_limit is not None:
+            return runtime_limit
+        parameter_limit = (
+            _safe_float(parameter_service.get_param_value("equity_position_limit"), None)
+            if parameter_service
+            else None
+        )
+        if parameter_limit is not None:
+            return parameter_limit
+        return 0.3
+
+    def _build_parameter_consistency_payload() -> dict[str, Any]:
+        runtime_limit = _safe_float(getattr(config_mgr.get(), "equity_position_limit", None), None) if config_mgr else None
+        parameter_limit = (
+            _safe_float(parameter_service.get_param_value("equity_position_limit"), None)
+            if parameter_service
+            else None
+        )
+        env_limit = _resolve_controlled_apply_default_float(
+            None,
+            "ASHARE_APPLY_READY_MAX_EQUITY_POSITION_LIMIT",
+            None,
+        )
+        controlled_limit = float(env_limit) if env_limit is not None else float(runtime_limit or parameter_limit or 0.3)
+        available_values = [value for value in [runtime_limit, parameter_limit, controlled_limit] if value is not None]
+        baseline = runtime_limit if runtime_limit is not None else (parameter_limit if parameter_limit is not None else controlled_limit)
+        consistent = len({round(float(value), 6) for value in available_values}) <= 1
+        recommended = round(float(baseline or 0.3) * 0.85, 4)
+        equity_payload = {
+            "runtime_config": runtime_limit,
+            "controlled_apply": round(controlled_limit, 4),
+            "parameter_service": parameter_limit,
+            "controlled_apply_env": env_limit,
+            "consistent": consistent,
+            "recommendation": (
+                f"将受控准入上限调整为 {recommended} (运营口径 * 0.85 安全系数)"
+                if not consistent
+                else "当前参数口径一致"
+            ),
+            "baseline_runtime_limit": baseline,
+            "recommended_safe_limit": recommended,
+        }
+        return {
+            "generated_at": datetime.now().isoformat(),
+            "equity_position_limit": equity_payload,
+            "parameter_drift_warning": not consistent,
+            "summary_lines": [
+                (
+                    f"equity_position_limit: runtime={runtime_limit} "
+                    f"controlled_apply={round(controlled_limit, 4)} parameter_service={parameter_limit}"
+                ),
+                equity_payload["recommendation"],
+            ],
+        }
+
     def _build_controlled_apply_readiness(
         trade_date: str | None = None,
         *,
         account_id: str | None = None,
-        max_apply_intents: int = 1,
+        max_apply_intents: int | None = None,
         intent_ids: tuple[str, ...] = (),
         allowed_symbols: tuple[str, ...] = (),
-        require_live: bool = True,
-        require_trading_session: bool = True,
-        max_equity_position_limit: float | None = 0.2,
-        max_single_amount: float | None = 50000.0,
-        min_reverse_repo_reserved_amount: float | None = 70000.0,
+        require_live: bool | None = None,
+        require_trading_session: bool | None = None,
+        max_equity_position_limit: float | None = None,
+        max_single_amount: float | None = None,
+        min_reverse_repo_reserved_amount: float | None = None,
         max_stock_test_budget_amount: float | None = None,
         max_apply_submissions_per_day: int | None = None,
         blocked_time_windows: str | None = None,
         include_details: bool = True,
     ) -> dict[str, Any]:
+        max_single_amount_input = max_single_amount
+        max_apply_intents = _resolve_controlled_apply_default_int(
+            max_apply_intents,
+            "ASHARE_APPLY_READY_MAX_INTENTS",
+            1,
+        )
+        require_live = _resolve_controlled_apply_default_bool(
+            require_live,
+            "ASHARE_APPLY_READY_REQUIRE_LIVE",
+            True,
+        )
+        require_trading_session = _resolve_controlled_apply_default_bool(
+            require_trading_session,
+            "ASHARE_APPLY_READY_REQUIRE_TRADING_SESSION",
+            True,
+        )
+        max_equity_position_limit = _resolve_controlled_apply_equity_position_limit(max_equity_position_limit)
+        max_single_amount = _resolve_controlled_apply_default_float(
+            max_single_amount,
+            "ASHARE_APPLY_READY_MAX_SINGLE_AMOUNT",
+            50000.0,
+        )
+        min_reverse_repo_reserved_amount = _resolve_controlled_apply_default_float(
+            min_reverse_repo_reserved_amount,
+            "ASHARE_APPLY_READY_MIN_REVERSE_REPO_RESERVED_AMOUNT",
+            70000.0,
+        )
         resolved_trade_date = trade_date or datetime.now().date().isoformat()
         resolved_account_id = _resolve_account_id(account_id)
         resolved_intent_ids = tuple(sorted({str(item).strip() for item in intent_ids if str(item).strip()}))
@@ -3104,6 +3655,10 @@ def build_router(
             if filtered_precheck["approved_count"] > 0 and not filtered_precheck.get("balance_error")
             else "blocked"
         )
+        if max_single_amount_input is None:
+            stock_budget_cap = _safe_float(filtered_precheck.get("stock_test_budget_amount"), None)
+            if stock_budget_cap is not None and stock_budget_cap > 0:
+                max_single_amount = max(float(max_single_amount or 0.0), stock_budget_cap)
 
         filtered_intents = dict(intents)
         filtered_intents["intents"] = intent_items
@@ -3129,8 +3684,20 @@ def build_router(
         intent_symbols = [str(item.get("symbol") or "").strip() for item in intent_items if str(item.get("symbol") or "").strip()]
         approved_items = [item for item in precheck_items if bool(item.get("approved"))]
         effective_single_amount = max(
-            [float(item.get("max_single_amount", 0.0) or 0.0) for item in precheck_items] or [0.0]
+            [
+                float(
+                    item.get("proposed_value")
+                    or item.get("budget_value")
+                    or item.get("planned_value")
+                    or item.get("max_single_amount", 0.0)
+                    or 0.0
+                )
+                for item in (approved_items or precheck_items)
+            ]
+            or [0.0]
         )
+        runtime_equity_limit = _resolve_runtime_equity_position_limit()
+        parameter_consistency = _build_parameter_consistency_payload()
 
         bridge_ok = True
         bridge_detail = "non_windows_execution_plane"
@@ -3291,13 +3858,27 @@ def build_router(
                 "name": "equity_position_limit",
                 "status": (
                     "ok"
-                    if max_equity_position_limit is None
-                    or float(filtered_precheck.get("equity_position_limit", 0.0) or 0.0) <= max_equity_position_limit + 1e-9
-                    else "blocked"
+                    if float(filtered_precheck.get("equity_position_limit", 0.0) or 0.0) <= max_equity_position_limit + 1e-9
+                    else (
+                        "warning"
+                        if float(filtered_precheck.get("equity_position_limit", 0.0) or 0.0) <= runtime_equity_limit + 1e-9
+                        else "blocked"
+                    )
                 ),
-                "detail": f"current={filtered_precheck.get('equity_position_limit')} allowed<={max_equity_position_limit}",
+                "detail": (
+                    f"current={filtered_precheck.get('equity_position_limit')} "
+                    f"controlled_apply<={max_equity_position_limit} runtime_config<={runtime_equity_limit}"
+                ),
             }
         )
+        if parameter_consistency.get("parameter_drift_warning"):
+            checks.append(
+                {
+                    "name": "parameter_drift_warning",
+                    "status": "warning",
+                    "detail": str(parameter_consistency["equity_position_limit"]["recommendation"]),
+                }
+            )
         checks.append(
             {
                 "name": "single_amount_limit",
@@ -3352,11 +3933,16 @@ def build_router(
         )
 
         check_statuses = {item["status"] for item in checks}
+        warning_check_names = {
+            str(item.get("name") or "")
+            for item in checks
+            if str(item.get("status") or "") == "warning"
+        }
         overall_status = "ready"
         if "blocked" in check_statuses:
             overall_status = "blocked"
-        elif "warning" in check_statuses:
-            overall_status = "degraded"
+        elif warning_check_names - {"parameter_drift_warning"}:
+            overall_status = "degraded_allow"
 
         summary_lines = [
             f"受控 apply 准入检查: status={overall_status} trade_date={resolved_trade_date} account={resolved_account_id}。",
@@ -3415,6 +4001,7 @@ def build_router(
                 "max_apply_submissions_per_day": max_apply_submissions_per_day,
                 "blocked_time_windows": [str(item.get("label") or "") for item in parsed_blocked_windows],
             },
+            "parameter_consistency": parameter_consistency,
             "longconn": longconn,
             "cycle": (cycle.model_dump() if cycle else {"available": False, "trade_date": resolved_trade_date}),
             "execution_precheck": filtered_precheck,
@@ -3445,13 +4032,15 @@ def build_router(
         include_details: bool = True,
     ) -> dict[str, Any]:
         resolved_trade_date = _resolve_reference_trade_date(trade_date) or datetime.now().date().isoformat()
+        current_trade_date = datetime.now().date().isoformat()
+        historical_trade_date = resolved_trade_date != current_trade_date
         resolved_account_id = _resolve_account_id(account_id)
         readiness_payload = _build_readiness(account_id=resolved_account_id)
         components_payload = _build_operations_components_payload()
         longconn = _build_feishu_longconn_status()
         workspace_context = _sanitize_json_compatible(serving_store.get_latest_workspace_context()) or {}
         runtime_context = _sanitize_json_compatible(serving_store.get_latest_runtime_context()) or {}
-        discussion_context = _sanitize_json_compatible(serving_store.get_latest_discussion_context()) or {}
+        discussion_context = _get_latest_discussion_context_payload()
         monitor_context = _sanitize_json_compatible(serving_store.get_latest_monitor_context()) or {}
         supervision_payload = _build_agent_supervision_payload(resolved_trade_date)
         briefing_payload = _build_feishu_briefing_payload(resolved_trade_date)
@@ -3495,7 +4084,7 @@ def build_router(
         checks.append(
             {
                 "name": "readiness",
-                "status": ("ok" if str(readiness_payload.get("status")) in {"ready", "degraded"} else "blocked"),
+                "status": ("ok" if str(readiness_payload.get("status")) in {"ready", "degraded", "degraded_allow"} else "blocked"),
                 "detail": f"status={readiness_payload.get('status')} run_mode={readiness_payload.get('run_mode')}",
             }
         )
@@ -3530,7 +4119,11 @@ def build_router(
                 "name": "workspace_context",
                 "status": (
                     "ok"
-                    if workspace_context.get("available") and workspace_age is not None and workspace_age <= max_workspace_age_seconds
+                    if workspace_context.get("available")
+                    and (
+                        (workspace_age is not None and workspace_age <= max_workspace_age_seconds)
+                        or historical_trade_date
+                    )
                     else "blocked"
                 ),
                 "detail": f"available={workspace_context.get('available')} generated_at={workspace_timestamp or ''} age={workspace_age}",
@@ -3541,7 +4134,11 @@ def build_router(
                 "name": "recovery_signal_freshness",
                 "status": (
                     "ok"
-                    if latest_signal_at and latest_signal_age is not None and latest_signal_age <= max_signal_age_seconds
+                    if latest_signal_at
+                    and (
+                        (latest_signal_age is not None and latest_signal_age <= max_signal_age_seconds)
+                        or historical_trade_date
+                    )
                     else "blocked"
                 ),
                 "detail": f"latest_signal_at={latest_signal_at or ''} age={latest_signal_age}",
@@ -3629,7 +4226,13 @@ def build_router(
             raw = ""
         return normalize_excluded_theme_keywords(raw)
 
-    def _build_execution_precheck(trade_date: str, account_id: str | None = None) -> dict:
+    def _build_execution_precheck(
+        trade_date: str,
+        account_id: str | None = None,
+        *,
+        candidate_case_ids: list[str] | None = None,
+        ignore_discussion_gate_blockers: bool = False,
+    ) -> dict:
         start_time_all = time.perf_counter()
         steps_timing = []
 
@@ -3684,7 +4287,10 @@ def build_router(
             record_step("list_cases", s4, False, str(e))
             case_map = {}
 
-        execution_case_ids = cycle.execution_pool_case_ids if cycle else []
+        execution_case_ids = list(candidate_case_ids or [])
+        precheck_scope = "discussion_preview" if execution_case_ids else "execution_pool"
+        if not execution_case_ids:
+            execution_case_ids = list(getattr(cycle, "execution_pool_case_ids", []) or []) if cycle else []
         
         # 5. Account Data (Balance & Positions)
         balance_error = None
@@ -3864,12 +4470,128 @@ def build_router(
         dossier_map = execution_context["dossier_map"]
         regime_value = execution_context["regime_value"]
         execution_guard = _build_execution_guard(runtime_config)
+        historical_trade_records = _derive_trade_records()
+        existing_portfolio_positions = _build_portfolio_position_contexts(
+            position_buckets.equity_positions,
+            dossier_map=dossier_map,
+            playbook_map=playbook_map,
+        )
+        intraday_new_exposure_value = _resolve_daily_new_exposure(trade_date)
+        daily_bar_cache: dict[tuple[str, int], list[Any]] = {}
+        return_series_cache: dict[str, list[float]] = {}
+
+        def _load_daily_bars(symbol: str, count: int = 25) -> list[Any]:
+            key = (symbol, count)
+            if key in daily_bar_cache:
+                return daily_bar_cache[key]
+            if not market_adapter or not symbol:
+                daily_bar_cache[key] = []
+                return daily_bar_cache[key]
+            try:
+                bars = list(market_adapter.get_bars([symbol], period="1d", count=count, end_time=trade_date) or [])
+            except Exception:
+                bars = []
+            bars.sort(key=lambda item: str(getattr(item, "trade_time", "") or ""))
+            daily_bar_cache[key] = bars
+            return bars
+
+        def _build_return_series(symbol: str, count: int = 25) -> list[float]:
+            if symbol in return_series_cache:
+                return return_series_cache[symbol]
+            bars = _load_daily_bars(symbol, count)
+            closes = [
+                float(getattr(bar, "close", 0.0) or 0.0)
+                for bar in bars
+                if float(getattr(bar, "close", 0.0) or 0.0) > 0
+            ]
+            returns = [
+                (curr - prev) / prev
+                for prev, curr in zip(closes[:-1], closes[1:])
+                if prev > 0
+            ]
+            return_series_cache[symbol] = returns
+            return returns
+
+        def _compute_realized_volatility(symbol: str) -> float | None:
+            returns = _build_return_series(symbol)
+            if len(returns) < 5:
+                return None
+            sample = returns[-20:]
+            mean_value = sum(sample) / len(sample)
+            variance = sum((item - mean_value) ** 2 for item in sample) / max(len(sample) - 1, 1)
+            return math.sqrt(max(variance, 0.0))
+
+        def _compute_daily_turnover_amount(symbol: str, snapshot: dict[str, Any]) -> float | None:
+            snapshot_amount = float(snapshot.get("amount", 0.0) or 0.0)
+            if snapshot_amount > 0:
+                return snapshot_amount
+            bars = _load_daily_bars(symbol, 5)
+            if bars:
+                latest_bar = bars[-1]
+                bar_amount = float(getattr(latest_bar, "amount", 0.0) or 0.0)
+                if bar_amount > 0:
+                    return bar_amount
+            last_price = float(snapshot.get("last_price", 0.0) or 0.0)
+            volume = float(snapshot.get("volume", 0.0) or 0.0)
+            if last_price > 0 and volume > 0:
+                return last_price * volume
+            return None
+
+        def _pearson_correlation(left: list[float], right: list[float]) -> float | None:
+            size = min(len(left), len(right))
+            if size < 5:
+                return None
+            xs = left[-size:]
+            ys = right[-size:]
+            mean_x = sum(xs) / size
+            mean_y = sum(ys) / size
+            cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+            var_x = sum((x - mean_x) ** 2 for x in xs)
+            var_y = sum((y - mean_y) ** 2 for y in ys)
+            if var_x <= 1e-12 or var_y <= 1e-12:
+                return None
+            return cov / math.sqrt(var_x * var_y)
+
+        def _compute_position_correlation(symbol: str, current_position: Any | None) -> float | None:
+            if current_position is not None:
+                return None
+            candidate_returns = _build_return_series(symbol)
+            if len(candidate_returns) < 5:
+                return None
+            correlations: list[float] = []
+            for position in position_buckets.equity_positions:
+                position_symbol = str(getattr(position, "symbol", "") or "").strip()
+                quantity = int(getattr(position, "quantity", 0) or 0)
+                if not position_symbol or position_symbol == symbol or quantity <= 0:
+                    continue
+                corr = _pearson_correlation(candidate_returns, _build_return_series(position_symbol))
+                if corr is not None:
+                    correlations.append(corr)
+            if not correlations:
+                return None
+            return max(correlations)
 
         # 9. Build Items
         s9 = time.perf_counter()
         items: list[dict[str, Any]] = []
         approved_count = 0
         blocked_count = 0
+        reserved_cash_value = 0.0
+        reserved_total_position_value = 0.0
+        reserved_stock_budget_value = 0.0
+        reserved_new_symbol_count = 0
+        reserved_new_exposure_value = 0.0
+        # 盘中切 regime 时，执行预检也要读取同一份 runtime_state_store 守门结果。
+        regime_transition_guard = dict(
+            (runtime_state_store.get("latest_regime_transition_guard", {}) if runtime_state_store else {}) or {}
+        )
+        offensive_playbooks = {
+            "leader_chase",
+            "divergence_reseal",
+            "sector_reflow_first_board",
+            "limit_up_relay",
+            "dragon_relay",
+        }
         for case_id in execution_case_ids:
             case = case_map.get(case_id)
             if case is None:
@@ -3916,49 +4638,108 @@ def build_router(
             quote_age_seconds = snapshot_age_seconds(quote_timestamp, now)
             quote_is_fresh = is_snapshot_fresh(quote_timestamp, now, market_snapshot_ttl_seconds)
             current_position = next((item for item in positions if item.symbol == case.symbol), None)
-            projected_equity_position_count = current_equity_position_count + (0 if current_position else 1)
+            regime_max_hold_count = portfolio_risk_checker.max_positions_for_regime(
+                str((case.runtime_snapshot.market_profile or {}).get("regime") or regime_value or "")
+            )
+            dynamic_max_hold_count = max(min(max_hold_count, regime_max_hold_count), 1)
+            guard_target_runtime = str(regime_transition_guard.get("target_runtime_regime") or "").strip().lower()
+            guard_case_regime = str((case.runtime_snapshot.market_profile or {}).get("regime") or regime_value or "").strip().lower()
+            guard_blocks_new_buy = bool(regime_transition_guard.get("active")) and current_position is None and (
+                (
+                    guard_target_runtime in {"defensive", "chaos"}
+                    and str(resolved_playbook or "").strip().lower() in offensive_playbooks
+                )
+                or (
+                    guard_target_runtime
+                    and guard_case_regime
+                    and guard_case_regime != guard_target_runtime
+                )
+            )
+            projected_equity_position_count = (
+                current_equity_position_count
+                + reserved_new_symbol_count
+                + (0 if current_position else 1)
+            )
             current_symbol_value = (
                 float(current_position.quantity) * float(current_position.last_price)
                 if current_position
                 else 0.0
             )
-            remaining_risk_total_value = max(total_asset * effective_total_position_limit - invested_value, 0.0)
-            remaining_test_budget_value = trading_budget.stock_test_budget_remaining
-            remaining_total_value = remaining_risk_total_value
+            single_position_pnl_pct = None
+            if current_position and float(getattr(current_position, "cost_price", 0.0) or 0.0) > 0 and latest_price > 0:
+                single_position_pnl_pct = (
+                    latest_price - float(current_position.cost_price)
+                ) / max(float(current_position.cost_price), 1e-9)
+            realized_volatility = _compute_realized_volatility(case.symbol)
+            daily_turnover_amount = _compute_daily_turnover_amount(case.symbol, runtime_market_snapshot)
+            position_correlation = _compute_position_correlation(case.symbol, current_position)
+            remaining_risk_total_value = max(
+                total_asset * effective_total_position_limit - invested_value - reserved_total_position_value,
+                0.0,
+            )
+            remaining_test_budget_value = max(
+                trading_budget.stock_test_budget_remaining - reserved_stock_budget_value,
+                0.0,
+            )
+            remaining_total_value = min(remaining_risk_total_value, remaining_test_budget_value)
             remaining_single_value = max(total_asset * max_single_position - current_symbol_value, 0.0)
-            budget_value = min(cash, remaining_total_value, remaining_single_value, max_single_amount)
-            proposed_quantity = int(budget_value / max(latest_price, 1e-9) / 100) * 100 if latest_price > 0 else 0
-            proposed_value = round(proposed_quantity * latest_price, 2) if latest_price > 0 else 0.0
+            cash_available = max(cash - reserved_cash_value, 0.0)
+            strategy_lifecycle = strategy_lifecycle_service.get_cap(playbook=str(resolved_playbook or "unassigned"))
+            lifecycle_cap_value = total_asset * float(strategy_lifecycle.get("max_position_fraction", max_single_position) or max_single_position)
+            budget_value = min(cash_available, remaining_total_value, remaining_single_value, max_single_amount, lifecycle_cap_value)
+            order_execution_plan = order_strategy_resolver.resolve(
+                side="BUY",
+                quote=QuoteSnapshot(
+                    symbol=case.symbol,
+                    name=str(case.name or ""),
+                    last_price=latest_price,
+                    bid_price=bid_price,
+                    ask_price=ask_price,
+                    volume=float(runtime_market_snapshot.get("volume", 0.0) or 0.0),
+                    pre_close=pre_close,
+                ),
+                scenario=("normal_buy" if str(regime_value or "").strip().lower() in {"trend", "rotation"} else "opportunistic_buy"),
+                signal_price=latest_price,
+            )
+            execution_price = float(order_execution_plan.price or latest_price or 0.0)
+            proposed_quantity = int(budget_value / max(execution_price, 1e-9) / 100) * 100 if execution_price > 0 else 0
+            proposed_value = round(proposed_quantity * execution_price, 2) if execution_price > 0 else 0.0
+            trace_id = f"trade-{trade_date}-{case.case_id}"
             blockers: list[str] = []
-            if case.risk_gate == "reject":
-                blockers.append("risk_gate_reject")
-            if case.audit_gate == "hold":
-                blockers.append("audit_gate_hold")
+            if not ignore_discussion_gate_blockers:
+                if case.risk_gate == "reject":
+                    blockers.append("risk_gate_reject")
+                if case.audit_gate == "hold":
+                    blockers.append("audit_gate_hold")
             if balance_error:
                 blockers.append("balance_unavailable")
             if positions_error:
                 blockers.append("positions_unavailable")
             if latest_price <= 0:
                 blockers.append("market_price_unavailable")
+            if remaining_test_budget_value <= 0:
+                blockers.append("stock_test_budget_reached")
             if remaining_total_value <= 0:
                 blockers.append("total_position_limit_reached")
-            if not current_position and current_equity_position_count >= max_hold_count:
+            if not current_position and current_equity_position_count + reserved_new_symbol_count >= dynamic_max_hold_count:
                 blockers.append("max_hold_count_reached")
             if remaining_single_value <= 0:
                 blockers.append("single_position_limit_reached")
-            if cash <= 0:
+            if cash_available <= 0:
                 blockers.append("cash_unavailable")
-            min_lot_value = round(latest_price * 100, 2) if latest_price > 0 else 0.0
-            if latest_price > 0 and budget_value < min_lot_value:
+            min_lot_value = round(execution_price * 100, 2) if execution_price > 0 else 0.0
+            if execution_price > 0 and budget_value < min_lot_value:
                 blockers.append("budget_below_min_lot")
             elif proposed_quantity < 100:
                 blockers.append("order_lot_insufficient")
-            if proposed_value > cash + 1e-6:
+            if proposed_value > cash_available + 1e-6:
                 blockers.append("cash_exceeded")
             if proposed_value > max_single_amount + 1e-6:
                 blockers.append("single_amount_exceeded")
             if emergency_stop_active:
                 blockers.append("emergency_stop_active")
+            if guard_blocks_new_buy:
+                blockers.append("regime_transition_confirmation")
             if settings.run_mode == "live":
                 force_session = os.getenv("ASHARE_TEST_FORCE_SESSION", "false").lower() == "true"
                 if not session_open and not force_session:
@@ -3984,23 +4765,45 @@ def build_router(
             approved = False
             guard_reason = "skipped"
             adjusted_request = None
+            sizing_stats = PositionSizer.derive_trade_stats(
+                historical_trade_records,
+                playbook=str(resolved_playbook or "unassigned"),
+            )
             if not blockers and balance:
                 request = PlaceOrderRequest(
                     account_id=resolved_account_id,
                     symbol=case.symbol,
                     side="BUY",
                     quantity=proposed_quantity,
-                    price=latest_price,
+                    price=execution_price,
                     request_id=f"precheck-{trade_date}-{case.symbol}",
                     decision_id=case.case_id,
                     trade_date=trade_date,
                     playbook=resolved_playbook,
                     regime=regime_value,
+                    trace_id=trace_id,
+                    signal_price=latest_price,
+                    signal_time=quote_timestamp or now.isoformat(),
+                    order_type=order_execution_plan.order_type,
+                    time_in_force=order_execution_plan.time_in_force,
+                    urgency_tag=order_execution_plan.urgency_tag,
                 )
                 approved, guard_reason, adjusted_request = execution_guard.approve(
                     request,
                     balance,
                     daily_pnl=daily_pnl,
+                    realized_volatility=realized_volatility,
+                    position_correlation=position_correlation,
+                    daily_turnover_amount=daily_turnover_amount,
+                    single_position_pnl_pct=single_position_pnl_pct,
+                    existing_positions=existing_portfolio_positions,
+                    candidate_sector=str(resolved_sector or ""),
+                    candidate_beta=float(dossier_item.get("beta", 1.0) or 1.0),
+                    regime_label=str((case.runtime_snapshot.market_profile or {}).get("regime") or regime_value or ""),
+                    daily_new_exposure=intraday_new_exposure_value + reserved_new_exposure_value,
+                    historical_trade_stats=sizing_stats,
+                    sizing_mode=str(getattr(runtime_config, "position_sizing_mode", "half_kelly") or "half_kelly"),
+                    open_slots=max(dynamic_max_hold_count - (current_equity_position_count + reserved_new_symbol_count), 1),
                 )
                 if not approved:
                     blockers.append("guard_reject")
@@ -4037,20 +4840,42 @@ def build_router(
                 "risk_gate": case.risk_gate,
                 "audit_gate": case.audit_gate,
                 "final_status": case.final_status,
+                "trace_id": trace_id,
                 "latest_price": latest_price,
+                "execution_price": execution_price,
                 "bid_price": bid_price,
                 "ask_price": ask_price,
                 "pre_close": pre_close,
                 "quote_timestamp": quote_timestamp,
                 "snapshot_age_seconds": quote_age_seconds,
                 "snapshot_is_fresh": quote_is_fresh,
+                "realized_volatility": realized_volatility,
+                "position_correlation": position_correlation,
+                "daily_turnover_amount": daily_turnover_amount,
+                "single_position_pnl_pct": single_position_pnl_pct,
+                "position_sizing": (
+                    execution_guard.last_position_sizing.to_payload()
+                    if getattr(execution_guard, "last_position_sizing", None) is not None
+                    else None
+                ),
+                "portfolio_risk": (
+                    execution_guard.last_portfolio_risk.to_payload()
+                    if getattr(execution_guard, "last_portfolio_risk", None) is not None
+                    else None
+                ),
+                "strategy_lifecycle": strategy_lifecycle,
+                "order_execution_plan": order_execution_plan.to_payload(),
+                "regime_transition_guard": regime_transition_guard,
+                "regime_transition_blocked": guard_blocks_new_buy,
                 "session_open": session_open,
                 "max_price_deviation_pct": max_price_deviation_pct,
                 "current_position_quantity": (current_position.quantity if current_position else 0),
                 "current_position_value": round(current_symbol_value, 2),
                 "current_equity_position_count": current_equity_position_count,
                 "projected_equity_position_count": projected_equity_position_count,
-                "max_hold_count": max_hold_count,
+                "max_hold_count": dynamic_max_hold_count,
+                "regime_max_hold_count": regime_max_hold_count,
+                "configured_max_hold_count": max_hold_count,
                 "current_total_ratio": round(current_total_ratio, 4),
                 "gross_total_ratio": round(gross_total_ratio, 4),
                 "max_total_position": max_total_position,
@@ -4073,7 +4898,7 @@ def build_router(
                 "remaining_total_value": round(remaining_total_value, 2),
                 "remaining_risk_total_value": round(remaining_risk_total_value, 2),
                 "remaining_single_value": round(remaining_single_value, 2),
-                "cash_available": round(cash, 2),
+                "cash_available": round(cash_available, 2),
                 "budget_value": round(budget_value, 2),
                 "min_lot_value": min_lot_value,
                 "proposed_quantity": proposed_quantity,
@@ -4087,7 +4912,7 @@ def build_router(
                 "recommended_next_actions": next_actions,
                 "primary_recommended_next_action": primary_next_action,
                 "primary_recommended_next_action_label": primary_next_action_label,
-                "headline_reason": case.selected_reason or case.runtime_snapshot.summary,
+                "headline_reason": CandidateCaseService.resolve_headline_reason(case),
                 "playbook": resolved_playbook,
                 "regime": regime_value,
                 "resolved_sector": resolved_sector,
@@ -4097,8 +4922,39 @@ def build_router(
             items.append(item)
             if item["approved"]:
                 approved_count += 1
+                reserved_cash_value += proposed_value
+                reserved_total_position_value += proposed_value
+                reserved_stock_budget_value += proposed_value
+                reserved_new_exposure_value += proposed_value
+                if current_position is None:
+                    reserved_new_symbol_count += 1
+                _record_trade_trace(
+                    trace_id,
+                    stage="execution_precheck",
+                    trade_date=trade_date,
+                    payload={
+                        "symbol": case.symbol,
+                        "approved": True,
+                        "proposed_quantity": proposed_quantity,
+                        "proposed_value": proposed_value,
+                        "position_sizing": item.get("position_sizing"),
+                        "portfolio_risk": item.get("portfolio_risk"),
+                        "order_execution_plan": item.get("order_execution_plan"),
+                    },
+                )
             else:
                 blocked_count += 1
+                _record_trade_trace(
+                    trace_id,
+                    stage="execution_precheck",
+                    trade_date=trade_date,
+                    payload={
+                        "symbol": case.symbol,
+                        "approved": False,
+                        "blockers": blockers,
+                        "guard_reason": guard_reason,
+                    },
+                )
 
         status = "ready" if items and approved_count > 0 and not balance_error and not positions_error else "blocked"
         precheck_degrade_reason = None
@@ -4182,6 +5038,7 @@ def build_router(
             "positions_available": positions_error is None,
             "positions_error": positions_error,
             "cycle_state": (cycle.discussion_state if cycle else None),
+            "precheck_scope": precheck_scope,
             "execution_pool_case_ids": execution_case_ids,
             "approved_count": approved_count,
             "blocked_count": blocked_count,
@@ -4327,6 +5184,7 @@ def build_router(
             intents.append(
                 {
                     "intent_id": request_id,
+                    "trace_id": item.get("trace_id"),
                     "trade_date": trade_date,
                     "case_id": item["case_id"],
                     "decision_id": item["case_id"],
@@ -4335,19 +5193,25 @@ def build_router(
                     "name": item.get("name"),
                     "side": "BUY",
                     "quantity": item["proposed_quantity"],
-                    "price": item["latest_price"],
+                    "price": item.get("execution_price") or item["latest_price"],
                     "estimated_value": item["proposed_value"],
                     "request": {
                         "account_id": precheck["account_id"],
                         "symbol": item["symbol"],
                         "side": "BUY",
                         "quantity": item["proposed_quantity"],
-                        "price": item["latest_price"],
+                        "price": item.get("execution_price") or item["latest_price"],
                         "request_id": request_id,
                         "decision_id": item["case_id"],
                         "trade_date": trade_date,
                         "playbook": item.get("playbook"),
                         "regime": item.get("regime"),
+                        "trace_id": item.get("trace_id"),
+                        "signal_price": item.get("latest_price"),
+                        "signal_time": item.get("quote_timestamp"),
+                        "order_type": (item.get("order_execution_plan") or {}).get("order_type", "limit"),
+                        "time_in_force": (item.get("order_execution_plan") or {}).get("time_in_force", "day"),
+                        "urgency_tag": (item.get("order_execution_plan") or {}).get("urgency_tag"),
                     },
                     "precheck": {
                         "budget_value": item.get("budget_value"),
@@ -4356,11 +5220,14 @@ def build_router(
                         "remaining_single_value": item.get("remaining_single_value"),
                         "max_single_amount": item.get("max_single_amount"),
                         "guard_reason": item.get("guard_reason"),
+                        "position_sizing": item.get("position_sizing"),
+                        "portfolio_risk": item.get("portfolio_risk"),
                     },
                     "headline_reason": item.get("headline_reason"),
                     "playbook": item.get("playbook"),
                     "regime": item.get("regime"),
                     "resolved_sector": item.get("resolved_sector"),
+                    "order_execution_plan": item.get("order_execution_plan"),
                 }
             )
         payload = {
@@ -4494,7 +5361,7 @@ def build_router(
         current_status = str(intent.get("status") or "approved")
         allowed: dict[str, set[str]] = {
             "approved": {"claimed"},
-            "claimed": {"submitted", "failed", "expired"},
+            "claimed": {"submitted", "partial_filled", "filled", "canceled", "rejected", "failed", "expired"},
             "submitted": {"partial_filled", "filled", "canceled", "rejected", "failed"},
             "partial_filled": {"filled", "canceled", "failed"},
             "filled": set(),
@@ -4592,7 +5459,7 @@ def build_router(
         meeting_state_store.set("execution_intent_history", history[-30:])
 
     def _get_execution_gateway_state_store() -> StateStore | None:
-        return resolve_execution_gateway_state_store(meeting_state_store, runtime_state_store)
+        return resolve_execution_gateway_state_store(execution_gateway_state_store, runtime_state_store)
 
     def _prune_active_pending_execution_intents(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         current_trade_date = _resolve_trade_date()
@@ -4665,14 +5532,7 @@ def build_router(
         return [_sanitize_json_compatible(item) for item in history if isinstance(item, dict)]
 
     def _append_execution_gateway_receipt(item: dict[str, Any]) -> None:
-        state_store = _get_execution_gateway_state_store()
-        if not state_store:
-            return
-        receipt = _sanitize_json_compatible(item)
-        history = _get_execution_gateway_receipt_history()
-        history.append(receipt)
-        state_store.set("latest_execution_gateway_receipt", receipt)
-        state_store.set("execution_gateway_receipt_history", history[-500:])
+        append_gateway_execution_gateway_receipt(_get_execution_gateway_state_store(), item)
 
     def _find_execution_intent(intent_id: str) -> tuple[dict[str, Any], int | None]:
         pending = _get_pending_execution_intents()
@@ -4700,13 +5560,23 @@ def build_router(
             if current_status != "approved":
                 return False, "invalid_status", item, f"intent status {current_status} cannot be claimed"
             updated = dict(item)
-            updated["status"] = "claimed"
             updated["claim"] = {
                 "gateway_source_id": payload.gateway_source_id,
                 "deployment_role": payload.deployment_role,
                 "bridge_path": payload.bridge_path,
                 "claimed_at": payload.claimed_at,
             }
+            updated = transition_execution_intent(
+                _get_execution_gateway_state_store(),
+                updated,
+                "claimed",
+                reason="gateway_claimed",
+                metadata={
+                    "gateway_source_id": payload.gateway_source_id,
+                    "deployment_role": payload.deployment_role,
+                    "bridge_path": payload.bridge_path,
+                },
+            )
             pending[index] = updated
             _save_pending_execution_intents(pending)
             _append_execution_intent_history(updated)
@@ -4731,40 +5601,12 @@ def build_router(
         if not matched_intent:
             return False, False, {}, "intent not found"
 
-        current_status = str(matched_intent.get("status") or "approved")
-        next_status = payload.status
-        allowed_next = {
-            "claimed": {"submitted", "failed"},
-            "submitted": {"partial_filled", "filled", "canceled", "rejected", "failed"},
-            "partial_filled": {"filled", "canceled", "failed"},
-            "approved": set(),
-            "filled": set(),
-            "canceled": set(),
-            "rejected": set(),
-            "failed": set(),
-            "expired": set(),
-        }
-        if next_status != current_status and next_status not in allowed_next.get(current_status, set()):
-            return False, False, {}, f"intent status {current_status} cannot transition to {next_status}"
-
         updated_intent = dict(matched_intent)
-        updated_intent["status"] = next_status
-        updated_intent["latest_receipt_id"] = payload.receipt_id
-        updated_intent["latest_gateway_source_id"] = payload.gateway_source_id
-        updated_intent["latest_reported_at"] = payload.reported_at
-        if matched_index is not None:
-            terminal_statuses = {"filled", "canceled", "rejected", "failed", "expired"}
-            if next_status in terminal_statuses:
-                pending.pop(matched_index)
-            else:
-                pending[matched_index] = updated_intent
-            _save_pending_execution_intents(pending)
-        _append_execution_intent_history(updated_intent)
-
         receipt = {
             "receipt_scope": "execution_gateway_receipt",
             "receipt_id": payload.receipt_id,
             "intent_id": payload.intent_id,
+            "trace_id": matched_intent.get("trace_id"),
             "intent_version": payload.intent_version,
             "gateway_source_id": payload.gateway_source_id,
             "deployment_role": payload.deployment_role,
@@ -4783,7 +5625,61 @@ def build_router(
             "raw_payload": payload.raw_payload,
             "summary_lines": list(payload.summary_lines or []),
         }
+        try:
+            updated_intent = transition_execution_intent(
+                _get_execution_gateway_state_store(),
+                updated_intent,
+                payload.status,
+                reason="gateway_receipt_reported",
+                receipt=receipt,
+                metadata={
+                    "gateway_source_id": payload.gateway_source_id,
+                    "broker_order_id": payload.broker_order_id,
+                    "error_code": payload.error_code,
+                },
+            )
+        except ValueError as exc:
+            return False, False, {}, str(exc)
+        if matched_index is not None:
+            if str(payload.status or "").strip().lower() in TERMINAL_INTENT_STATUSES:
+                pending.pop(matched_index)
+            else:
+                pending[matched_index] = updated_intent
+            _save_pending_execution_intents(pending)
+        _append_execution_intent_history(updated_intent)
         _append_execution_gateway_receipt(receipt)
+        fills = list(payload.fills or [])
+        total_qty = sum(int(item.get("quantity", item.get("filled_quantity", 0)) or 0) for item in fills)
+        total_value = sum(
+            float(item.get("price", item.get("filled_price", 0.0)) or 0.0)
+            * int(item.get("quantity", item.get("filled_quantity", 0)) or 0)
+            for item in fills
+        )
+        avg_fill_price = round(total_value / total_qty, 4) if total_qty > 0 else None
+        if payload.status in {"partial_filled", "filled", "submitted"}:
+            quality_tracker.record_fill(
+                intent_id=payload.intent_id,
+                order_id=str(payload.broker_order_id or ""),
+                fill_price=avg_fill_price,
+                fill_time=payload.reported_at or payload.submitted_at or datetime.now().isoformat(),
+                filled_quantity=total_qty if total_qty > 0 else None,
+                filled_value=total_value if total_qty > 0 else None,
+                status=payload.status,
+                trace_id=str(matched_intent.get("trace_id") or ""),
+            )
+        _record_trade_trace(
+            str(matched_intent.get("trace_id") or ""),
+            stage="receipt",
+            trade_date=str(matched_intent.get("trade_date") or "") or None,
+            payload={
+                "intent_id": payload.intent_id,
+                "receipt_id": payload.receipt_id,
+                "status": payload.status,
+                "broker_order_id": payload.broker_order_id,
+                "latency_ms": payload.latency_ms,
+                "fills": fills,
+            },
+        )
         return True, True, receipt, ""
 
     def _build_execution_gateway_intent_packet(intent: dict[str, Any]) -> dict[str, Any]:
@@ -4861,22 +5757,40 @@ def build_router(
                 elif settings.run_mode == "live" and not settings.live_trade_enabled:
                     submit_block_reason = "live_not_enabled"
             else:
+                # T4.1: go_platform 模式下 execution_plane 可能仍是默认值 local_xtquant，需自动纠正
+                if execution_mode == "go_platform" and execution_plane == "local_xtquant":
+                    execution_plane = "go_platform"
                 if not execution_adapter:
                     submit_block_reason = "execution_adapter_unavailable"
                 elif execution_mode.startswith("mock"):
                     if settings.run_mode == "live":
                         submit_block_reason = "live_mock_fallback_blocked"
-                elif execution_mode == "xtquant":
+                elif execution_mode in {"xtquant", "go_platform", "windows_proxy"}:
                     if settings.run_mode != "live":
                         submit_block_reason = "live_confirmation_required"
                     elif not settings.live_trade_enabled:
                         submit_block_reason = "live_not_enabled"
                 else:
-                    submit_block_reason = "execution_adapter_unavailable"
+                    # T4.1: 未识别的 execution_mode，用独立错误码+告警，避免与"适配器不可用"混淆
+                    logger.warning(
+                        "未识别的 execution_mode，无法派发执行意图: mode=%s plane=%s",
+                        execution_mode, execution_plane,
+                    )
+                    submit_block_reason = "execution_mode_unknown"
+                    submit_block_detail = {"execution_mode": execution_mode, "execution_plane": execution_plane}
+                if execution_plane == "windows_gateway" and runtime_state_store:
+                    latest_bridge_guardian = dict(runtime_state_store.get("latest_bridge_guardian", {}) or {})
+                    if bool(runtime_state_store.get("bridge_dispatch_blocked", False)):
+                        submit_block_reason = "bridge_guardian_blocked"
+                        submit_block_detail = {
+                            "guardian_status": latest_bridge_guardian.get("status"),
+                            "guardian_summary_lines": list(latest_bridge_guardian.get("summary_lines") or []),
+                        }
 
         for intent in selected_intents:
             receipt = {
                 "intent_id": intent["intent_id"],
+                "trace_id": intent.get("trace_id"),
                 "case_id": intent["case_id"],
                 "decision_id": intent["decision_id"],
                 "symbol": intent["symbol"],
@@ -4904,14 +5818,43 @@ def build_router(
             try:
                 if execution_plane == "windows_gateway":
                     queued_packet = _enqueue_execution_gateway_intent(intent)
+                    quality_tracker.record_submission(
+                        intent_id=str(intent.get("intent_id") or ""),
+                        trace_id=str(intent.get("trace_id") or ""),
+                        symbol=str(intent.get("symbol") or ""),
+                        side=str(intent.get("side") or "BUY"),
+                        signal_price=float((intent.get("request") or {}).get("signal_price") or intent.get("price") or 0.0),
+                        signal_time=str((intent.get("request") or {}).get("signal_time") or datetime.now().isoformat()),
+                        submit_price=float((intent.get("request") or {}).get("price") or intent.get("price") or 0.0),
+                        submit_time=datetime.now().isoformat(),
+                        metadata={"execution_plane": execution_plane, "status": "queued_for_gateway"},
+                    )
                     receipt["status"] = "queued_for_gateway"
                     receipt["reason"] = "forward_to_windows_execution_gateway"
                     receipt["queued_at"] = queued_packet["approved_at"]
                     receipt["gateway_pull_path"] = gateway_pull_path
                     receipt["gateway_intent"] = queued_packet
                     queued_count += 1
+                    _record_trade_trace(
+                        str(intent.get("trace_id") or ""),
+                        stage="intent",
+                        trade_date=trade_date,
+                        payload={"intent_id": intent.get("intent_id"), "status": "queued_for_gateway", "execution_plane": execution_plane},
+                    )
                 else:
                     order = execution_adapter.place_order(PlaceOrderRequest(**intent["request"]))
+                    quality_tracker.record_submission(
+                        intent_id=str(intent.get("intent_id") or ""),
+                        order_id=str(order.order_id or ""),
+                        trace_id=str(intent.get("trace_id") or ""),
+                        symbol=str(intent.get("symbol") or ""),
+                        side=str(intent.get("side") or "BUY"),
+                        signal_price=float((intent.get("request") or {}).get("signal_price") or intent.get("price") or 0.0),
+                        signal_time=str((intent.get("request") or {}).get("signal_time") or datetime.now().isoformat()),
+                        submit_price=float((intent.get("request") or {}).get("price") or intent.get("price") or 0.0),
+                        submit_time=datetime.now().isoformat(),
+                        metadata={"execution_plane": execution_plane, "status": "submitted"},
+                    )
                     receipt["status"] = "submitted"
                     receipt["reason"] = "sent"
                     receipt["submitted_at"] = datetime.now().isoformat()
@@ -4930,10 +5873,22 @@ def build_router(
                         reason=intent.get("headline_reason"),
                     )
                     submitted_count += 1
+                    _record_trade_trace(
+                        str(intent.get("trace_id") or ""),
+                        stage="gateway",
+                        trade_date=trade_date,
+                        payload={"intent_id": intent.get("intent_id"), "order_id": order.order_id, "status": "submitted", "execution_plane": execution_plane},
+                    )
             except Exception as exc:
                 receipt["status"] = "dispatch_failed"
                 receipt["reason"] = str(exc)
                 blocked_count += 1
+                _record_trade_trace(
+                    str(intent.get("trace_id") or ""),
+                    stage="gateway",
+                    trade_date=trade_date,
+                    payload={"intent_id": intent.get("intent_id"), "status": "dispatch_failed", "error": str(exc)},
+                )
             receipts.append(receipt)
 
         blocked_from_intents = [
@@ -5050,6 +6005,7 @@ def build_router(
                     "symbol": receipt.get("symbol"),
                     "name": receipt.get("name"),
                     "decision_id": receipt.get("decision_id"),
+                    "trace_id": receipt.get("trace_id") or (receipt.get("request") or {}).get("trace_id"),
                     "side": request.get("side"),
                     "submitted_at": receipt.get("submitted_at") or receipt.get("processed_at"),
                     "playbook": request.get("playbook"),
@@ -5075,6 +6031,198 @@ def build_router(
         if trade_date and payload and payload.get("trade_date") != trade_date:
             return None
         return payload
+
+    def _dispatch_execution_intents(
+        *,
+        trade_date: str,
+        account_id: str | None = None,
+        intent_ids: list[str] | None = None,
+        apply: bool = False,
+        trigger: str = "api",
+    ) -> dict[str, Any]:
+        result = _build_execution_dispatch_receipts(
+            trade_date=trade_date,
+            account_id=account_id,
+            intent_ids=intent_ids,
+            apply=apply,
+        )
+        _persist_execution_dispatch(result)
+        summary_dispatch_result = _dispatch_execution_dispatch_summary(result)
+        alert_result = (
+            live_execution_alert_notifier.dispatch_dispatch(result)
+            if settings.run_mode == "live" and live_execution_alert_notifier
+            else None
+        )
+        if audit_store:
+            audit_store.append(
+                category="execution",
+                message=(
+                    f"讨论终审后已自动派发执行意图: {trade_date}"
+                    if trigger == "discussion_finalize_auto_dispatch"
+                    else f"执行意图已派发: {trade_date}"
+                ),
+                payload={
+                    "trade_date": trade_date,
+                    "apply": apply,
+                    "trigger": trigger,
+                    "submitted_count": result.get("submitted_count", 0),
+                    "queued_count": result.get("queued_count", 0),
+                    "preview_count": result.get("preview_count", 0),
+                    "blocked_count": result.get("blocked_count", 0),
+                    "status": result.get("status"),
+                    "summary_dispatched": summary_dispatch_result.get("dispatched", False),
+                    "summary_reason": summary_dispatch_result.get("reason"),
+                    "alert_dispatched": (alert_result.dispatched if alert_result else False),
+                    "alert_reason": (alert_result.reason if alert_result else "disabled"),
+                },
+            )
+        return {
+            "result": result,
+            "summary_notification": summary_dispatch_result,
+            "alert_notification": (
+                {
+                    "dispatched": alert_result.dispatched,
+                    "reason": alert_result.reason,
+                    "level": alert_result.payload.get("level"),
+                    "title": alert_result.payload.get("title"),
+                }
+                if alert_result
+                else {"dispatched": False, "reason": "disabled"}
+            ),
+        }
+
+    def _maybe_auto_dispatch_execution_intents(
+        *,
+        trade_date: str,
+        account_id: str | None,
+        execution_intents: dict[str, Any] | None,
+        trigger: str = "discussion_finalize_auto_dispatch",
+    ) -> dict[str, Any]:
+        intents_payload = dict(execution_intents or {})
+        intent_count = int(intents_payload.get("intent_count", 0) or 0)
+        if intent_count <= 0:
+            return {
+                "dispatched": False,
+                "reason": "no_execution_intents",
+                "status": "skipped",
+                "execution_dispatch": None,
+            }
+        if settings.run_mode != "live":
+            return {
+                "dispatched": False,
+                "reason": "run_mode_not_live",
+                "status": "skipped",
+                "execution_dispatch": None,
+            }
+        existing_dispatch = _sanitize_json_compatible(_get_execution_dispatch_payload(trade_date) or {})
+        existing_status = str(existing_dispatch.get("status") or "").strip()
+        if existing_dispatch and bool(existing_dispatch.get("apply")) and existing_status in {"queued_for_gateway", "submitted"}:
+            return {
+                "dispatched": False,
+                "reason": "already_dispatched",
+                "status": existing_status,
+                "execution_dispatch": existing_dispatch,
+            }
+
+        dispatch_packet = _dispatch_execution_intents(
+            trade_date=trade_date,
+            account_id=account_id,
+            intent_ids=[],
+            apply=True,
+            trigger=trigger,
+        )
+        return {
+            "dispatched": True,
+            "reason": "auto_apply",
+            "status": dispatch_packet["result"].get("status"),
+            "execution_dispatch": dispatch_packet["result"],
+            "summary_notification": dispatch_packet["summary_notification"],
+            "alert_notification": dispatch_packet["alert_notification"],
+        }
+
+    def _payload_trade_date_matches(payload: dict[str, Any] | None, trade_date: str | None) -> bool:
+        if not trade_date or not isinstance(payload, dict):
+            return False
+        payload_trade_date = str(payload.get("trade_date") or "").strip()
+        if payload_trade_date:
+            return payload_trade_date == trade_date
+        generated_at = str(payload.get("generated_at") or payload.get("created_at") or "").strip()
+        if not generated_at:
+            return False
+        try:
+            return datetime.fromisoformat(generated_at).date().isoformat() == trade_date
+        except ValueError:
+            return False
+
+    def _should_prepare_execution_chain_for_cycle(cycle: Any) -> bool:
+        if cycle is None:
+            return False
+        discussion_state = str(getattr(cycle, "discussion_state", "") or "").strip()
+        execution_pool_case_ids = list(getattr(cycle, "execution_pool_case_ids", []) or [])
+        if not execution_pool_case_ids:
+            return False
+        return discussion_state in {
+            "round_summarized",
+            "final_review_ready",
+            "final_selection_ready",
+            "final_selection_blocked",
+            "finalized",
+        }
+
+    def _prepare_execution_chain_for_cycle(
+        *,
+        trade_date: str,
+        cycle: Any,
+        trigger: str,
+        allow_dispatch: bool,
+    ) -> dict[str, Any]:
+        if not _should_prepare_execution_chain_for_cycle(cycle):
+            return {
+                "prepared": False,
+                "reason": "discussion_state_not_ready",
+                "execution_precheck": None,
+                "execution_intents": None,
+                "execution_dispatch": None,
+            }
+        execution_precheck = _build_execution_precheck(
+            trade_date,
+            account_id=_resolve_account_id(),
+        )
+        _persist_execution_precheck(execution_precheck)
+        execution_intents = _build_execution_intents_from_precheck(trade_date, execution_precheck)
+        execution_intents["learned_asset_execution_guidance"] = dict(
+            execution_precheck.get("learned_asset_execution_guidance") or {}
+        )
+        _persist_execution_intents(execution_intents)
+        auto_dispatch = {
+            "dispatched": False,
+            "reason": "dispatch_not_allowed",
+            "status": "skipped",
+            "execution_dispatch": None,
+        }
+        session_open = bool(execution_precheck.get("session_open"))
+        if allow_dispatch and session_open and int(execution_precheck.get("approved_count", 0) or 0) > 0:
+            auto_dispatch = _maybe_auto_dispatch_execution_intents(
+                trade_date=trade_date,
+                account_id=execution_precheck.get("account_id"),
+                execution_intents=execution_intents,
+                trigger=trigger,
+            )
+        elif allow_dispatch and not session_open:
+            auto_dispatch = {
+                "dispatched": False,
+                "reason": "session_closed",
+                "status": "skipped",
+                "execution_dispatch": None,
+            }
+        return {
+            "prepared": True,
+            "reason": "execution_chain_prepared",
+            "execution_precheck": execution_precheck,
+            "execution_intents": execution_intents,
+            "execution_dispatch": auto_dispatch.get("execution_dispatch"),
+            "auto_dispatch": auto_dispatch,
+        }
 
     def _extract_gateway_source_from_intents(items: list[dict[str, Any]]) -> str:
         for item in reversed(items):
@@ -5276,6 +6424,7 @@ def build_router(
         selection_limit: int = 3,
         watchlist_limit: int = 5,
         rejected_limit: int = 5,
+        display_trade_date: str | None = None,
     ) -> dict:
         reply_pack = _enrich_discussion_payload(
             trade_date,
@@ -5304,25 +6453,109 @@ def build_router(
             execution_dispatch=execution_dispatch,
             cycle=(cycle.model_dump() if cycle else None),
         )
-        return _enrich_discussion_payload(trade_date, payload)
+        enriched_payload = _enrich_discussion_payload(trade_date, payload)
+        return _decorate_client_brief_display_trade_date(
+            enriched_payload,
+            effective_trade_date=display_trade_date or trade_date,
+            source_trade_date=trade_date,
+        )
 
     def _resolve_reference_trade_date(trade_date: str | None = None) -> str | None:
         if trade_date:
             return trade_date
+        candidates: list[str] = []
         for payload in (
-            serving_store.get_latest_discussion_context(),
+            serving_store.get_latest_workspace_context(),
             serving_store.get_latest_dossier_pack(),
             serving_store.get_latest_runtime_context(),
-            serving_store.get_latest_workspace_context(),
+            _get_latest_discussion_context_payload(),
         ):
             resolved = str((payload or {}).get("trade_date") or "").strip()
             if resolved:
-                return resolved
+                candidates.append(resolved)
         if candidate_case_service:
             latest_cases = candidate_case_service.list_cases(limit=1)
             if latest_cases:
-                return latest_cases[0].trade_date
-        return None
+                latest_case_trade_date = str(latest_cases[0].trade_date or "").strip()
+                if latest_case_trade_date:
+                    candidates.append(latest_case_trade_date)
+        return max(candidates) if candidates else None
+
+    def _resolve_operational_trade_date(now: datetime | None = None) -> str:
+        current = now or datetime.now()
+        if current.weekday() >= 5:
+            days_back = current.weekday() - 4
+            return (current - timedelta(days=days_back)).date().isoformat()
+        return current.date().isoformat()
+
+    def _resolve_user_facing_trade_context(trade_date: str | None = None) -> dict[str, Any]:
+        if trade_date:
+            return {
+                "effective_trade_date": trade_date,
+                "source_trade_date": trade_date,
+                "source_trade_date_stale": False,
+            }
+        effective_trade_date = _resolve_operational_trade_date()
+        source_trade_date = _resolve_reference_trade_date() or effective_trade_date
+        if source_trade_date > effective_trade_date:
+            effective_trade_date = source_trade_date
+        return {
+            "effective_trade_date": effective_trade_date,
+            "source_trade_date": source_trade_date,
+            "source_trade_date_stale": source_trade_date != effective_trade_date,
+        }
+
+    def _decorate_client_brief_display_trade_date(
+        payload: dict[str, Any],
+        *,
+        effective_trade_date: str,
+        source_trade_date: str,
+    ) -> dict[str, Any]:
+        normalized = dict(payload or {})
+        if not normalized:
+            return normalized
+        normalized["trade_date"] = effective_trade_date
+        normalized["effective_trade_date"] = effective_trade_date
+        normalized["source_trade_date"] = source_trade_date
+        normalized["source_trade_date_stale"] = source_trade_date != effective_trade_date
+        if source_trade_date == effective_trade_date:
+            return normalized
+
+        reply_pack = dict(normalized.get("reply_pack") or {})
+        case_count = int(reply_pack.get("case_count", 0) or 0)
+        selected_count = int(normalized.get("selected_count", 0) or 0)
+        watchlist_count = int(normalized.get("watchlist_count", 0) or 0)
+        rejected_count = int(normalized.get("rejected_count", 0) or 0)
+        previous_overview_lines = [
+            str(item).strip()
+            for item in list(normalized.get("overview_lines") or [])
+            if str(item).strip()
+        ]
+        refreshed_overview_lines = [
+            (
+                f"交易日 {effective_trade_date}，候选 {case_count} 只，入选 {selected_count} 只，"
+                f"观察 {watchlist_count} 只，淘汰 {rejected_count} 只。"
+            ),
+            f"当前展示为 {effective_trade_date} 盘前/盘中视图，候选与讨论数据暂沿用 {source_trade_date}，待今日流程刷新。",
+        ]
+        if len(previous_overview_lines) > 1:
+            refreshed_overview_lines.extend(previous_overview_lines[1:])
+        normalized["overview_lines"] = refreshed_overview_lines
+
+        previous_lines = [
+            str(item).strip()
+            for item in list(normalized.get("lines") or [])
+            if str(item).strip()
+        ]
+        remaining_lines = list(previous_lines)
+        for line in previous_overview_lines:
+            if remaining_lines and remaining_lines[0] == line:
+                remaining_lines.pop(0)
+            else:
+                break
+        normalized["lines"] = [*refreshed_overview_lines, *remaining_lines]
+        normalized["summary_text"] = "\n".join(normalized["lines"])
+        return normalized
 
     def _extract_workspace_hot_sectors(workspace_context: dict[str, Any] | None) -> list[str]:
         payload = dict(workspace_context or {})
@@ -5402,12 +6635,14 @@ def build_router(
         return lines
 
     def _resolve_feishu_card_base_url(control_plane_base_url: str | None = None) -> str:
+        notify_base = str(settings.notify.feishu_control_plane_base_url or "").strip()
+        if notify_base.startswith("http://") or notify_base.startswith("https://"):
+            notify_host = str(urlparse(notify_base).hostname or "").strip().lower()
+            if notify_host not in {"", "127.0.0.1", "localhost", "0.0.0.0", "::1"}:
+                return notify_base.rstrip("/")
         configured = str(control_plane_base_url or "").strip()
         if configured:
             return configured.rstrip("/")
-        notify_base = str(settings.notify.feishu_control_plane_base_url or "").strip()
-        if notify_base.startswith("http://") or notify_base.startswith("https://"):
-            return notify_base.rstrip("/")
         public_base = str(settings.service.public_base_url or "").strip()
         if public_base:
             return public_base.rstrip("/")
@@ -5416,6 +6651,32 @@ def build_router(
             host = "127.0.0.1"
         return f"http://{host}:{settings.service.port}"
 
+    def _map_feishu_ref_to_console_path(ref: str) -> str:
+        normalized = str(ref or "").strip()
+        if not normalized:
+            return "/dashboard"
+        path = urlparse(normalized).path if normalized.startswith(("http://", "https://")) else normalized
+        path = "/" + str(path or "").lstrip("/")
+        if path.startswith("/dashboard"):
+            return path
+        mapping = (
+            ("/system/feishu/briefing", "/dashboard/overview"),
+            ("/system/feishu/rights", "/dashboard/overview"),
+            ("/system/discussions/execution-precheck", "/dashboard/risk"),
+            ("/system/discussions/client-brief", "/dashboard/discussion"),
+            ("/system/discussions/meeting-context", "/dashboard/discussion"),
+            ("/system/discussions/cycles", "/dashboard/discussion"),
+            ("/system/agents/supervision-board", "/dashboard/agents"),
+            ("/system/workflow/mainline", "/dashboard/overview"),
+            ("/system/nightly-sandbox/latest", "/dashboard/overview"),
+            ("/system/hermes", "/dashboard/hermes/chat"),
+            ("/system/robot/console-layout", "/dashboard"),
+        )
+        for prefix, target in mapping:
+            if path.startswith(prefix):
+                return target
+        return "/dashboard"
+
     def _build_feishu_card_urls(data_refs: list[str], control_plane_base_url: str | None = None) -> list[str]:
         base_url = _resolve_feishu_card_base_url(control_plane_base_url)
         urls: list[str] = []
@@ -5423,7 +6684,11 @@ def build_router(
             ref = str(item or "").strip()
             if not ref:
                 continue
-            url = ref if ref.startswith(("http://", "https://")) else urljoin(base_url.rstrip("/") + "/", ref.lstrip("/"))
+            if ref.startswith(("http://", "https://")):
+                url = ref
+            else:
+                target_path = _map_feishu_ref_to_console_path(ref)
+                url = urljoin(base_url.rstrip("/") + "/", target_path.lstrip("/"))
             if url and url not in urls:
                 urls.append(url)
         return urls
@@ -5493,22 +6758,46 @@ def build_router(
                 if not trade_date or not payload_trade_date or payload_trade_date == trade_date:
                     latest_nightly_sandbox = payload
 
-        intent_count = 0
-        last_active_at = None
         status = str((latest_dispatch or {}).get("status") or "")
+        latest_receipt = _get_latest_execution_gateway_receipt()
+        latest_receipt_intent: dict[str, Any] = {}
+        latest_receipt_trade_date = ""
+        if latest_receipt:
+            latest_receipt_intent, _ = _find_execution_intent(str(latest_receipt.get("intent_id") or ""))
+            latest_receipt_trade_date = str(latest_receipt_intent.get("trade_date") or "").strip()
+            if not latest_receipt_trade_date:
+                reported_at = str(latest_receipt.get("reported_at") or latest_receipt.get("submitted_at") or "").strip()
+                if reported_at:
+                    try:
+                        latest_receipt_trade_date = datetime.fromisoformat(reported_at).date().isoformat()
+                    except ValueError:
+                        latest_receipt_trade_date = ""
+            if trade_date and latest_receipt_trade_date and latest_receipt_trade_date != trade_date:
+                latest_receipt = {}
+                latest_receipt_intent = {}
+                latest_receipt_trade_date = ""
 
         dispatch_intents = int((((latest_dispatch or {}).get("execution_intents") or {}).get("intent_count", 0) or 0))
-        if dispatch_intents > 0:
-            intent_count = dispatch_intents
-        elif latest_precheck:
-            intent_count = int(latest_precheck.get("approved_count", 0) or 0)
-        elif pending_gateway_intents:
+        precheck_approved_count = int((latest_precheck or {}).get("approved_count", 0) or 0)
+        if pending_gateway_intents:
             intent_count = len(pending_gateway_intents)
-        elif cycle and getattr(cycle, "execution_pool_case_ids", None):
-            intent_count = len(list(cycle.execution_pool_case_ids or []))
+        elif dispatch_intents > 0 and status in {"queued_for_gateway", "submitted", "preview", "blocked"}:
+            intent_count = dispatch_intents
+        else:
+            intent_count = 0
+
+        if not status:
+            if pending_gateway_intents:
+                status = "pending"
+            elif latest_receipt:
+                status = str(latest_receipt.get("status") or "").strip()
+
+        last_active_at = None
 
         if latest_dispatch:
             last_active_at = latest_dispatch.get("generated_at")
+        elif latest_receipt:
+            last_active_at = latest_receipt.get("reported_at") or latest_receipt.get("submitted_at")
         elif latest_precheck:
             last_active_at = latest_precheck.get("generated_at")
         elif pending_gateway_intents:
@@ -5521,6 +6810,7 @@ def build_router(
             "submitted_count": int((latest_dispatch or {}).get("submitted_count", 0) or 0),
             "preview_count": int((latest_dispatch or {}).get("preview_count", 0) or 0),
             "blocked_count": int((latest_dispatch or {}).get("blocked_count", 0) or 0),
+            "precheck_approved_count": precheck_approved_count,
             "receipts": list((latest_dispatch or {}).get("receipts") or []),
             "reconciliation_status": str((latest_execution_reconciliation or {}).get("status") or ""),
             "trade_count": int((latest_execution_reconciliation or {}).get("trade_count", 0) or 0),
@@ -5533,13 +6823,17 @@ def build_router(
             "latest_nightly_sandbox": latest_nightly_sandbox,
             "latest_dispatch": latest_dispatch,
             "latest_precheck": latest_precheck,
+            "latest_receipt": latest_receipt,
+            "latest_receipt_trade_date": latest_receipt_trade_date,
             "pending_gateway_intents": pending_gateway_intents,
         }
 
     def _build_feishu_briefing_payload(trade_date: str | None = None) -> dict[str, Any]:
-        resolved_trade_date = _resolve_reference_trade_date(trade_date)
+        trade_context = _resolve_user_facing_trade_context(trade_date)
+        effective_trade_date = str(trade_context.get("effective_trade_date") or "").strip() or None
+        source_trade_date = str(trade_context.get("source_trade_date") or "").strip() or effective_trade_date
         workspace_context = _sanitize_json_compatible(serving_store.get_latest_workspace_context()) or {}
-        cadence_payload = _build_supervision_cadence_payload(resolved_trade_date)
+        cadence_payload = _build_supervision_cadence_payload(effective_trade_date)
         if cadence_payload.get("polling_status"):
             cadence_summary_lines: list[str] = []
             dossier = cadence_payload.get("dossier", {})
@@ -5559,21 +6853,44 @@ def build_router(
             cadence_payload["summary_lines"] = ["cadence=unavailable"]
 
         client_brief = None
-        if resolved_trade_date and candidate_case_service:
+        if source_trade_date and candidate_case_service:
             try:
-                client_brief = _build_client_brief(resolved_trade_date)
+                client_brief = _build_client_brief(
+                    source_trade_date,
+                    display_trade_date=effective_trade_date,
+                )
             except Exception:
                 client_brief = None
-        execution_dispatch = _get_execution_dispatch_payload(resolved_trade_date) if resolved_trade_date else None
+        execution_dispatch = _get_execution_dispatch_payload(effective_trade_date) if effective_trade_date else None
+        cycle = discussion_cycle_service.get_cycle(effective_trade_date) if (effective_trade_date and discussion_cycle_service) else None
+        execution_summary = _build_supervision_execution_summary(effective_trade_date, cycle)
+        compose_metrics = _compose_evaluation_metrics_for_trade_date(effective_trade_date)
+        history_runtime = _build_history_runtime_payload()
+        mainline_stage = _resolve_mainline_stage_payload(
+            effective_trade_date,
+            cycle_state=(cycle.discussion_state if cycle else None),
+            execution_summary=execution_summary,
+            compose_metrics=compose_metrics,
+        )
+        source_counts = dict(((client_brief or {}).get("source_counts") or {}))
+        autonomy_summary = _build_autonomy_progress_snapshot(
+            compose_metrics=compose_metrics,
+            agent_proposed_count=int(source_counts.get("agent_proposed", 0) or 0),
+            mainline_stage=mainline_stage,
+        )
         agent_scores = []
         if agent_score_service:
-            score_date = resolved_trade_date or datetime.now().date().isoformat()
+            score_date = effective_trade_date or datetime.now().date().isoformat()
             try:
                 agent_scores = [item.model_dump() for item in agent_score_service.ensure_defaults(score_date)]
             except Exception:
                 agent_scores = []
 
         summary_lines: list[str] = []
+        if source_trade_date and effective_trade_date and source_trade_date != effective_trade_date:
+            summary_lines.append(
+                f"当前运营交易日={effective_trade_date}，候选/讨论数据来源={source_trade_date}，待今日盘前流程刷新。"
+            )
         workspace_summary = list(workspace_context.get("summary_lines") or [])
         summary_lines.extend(workspace_summary[:4])
         for line in cadence_payload.get("summary_lines", [])[:4]:
@@ -5587,6 +6904,18 @@ def build_router(
             for line in execution_dispatch_summary_lines(execution_dispatch)[:4]:
                 if line not in summary_lines:
                     summary_lines.append(line)
+        for line in list(history_runtime.get("summary_lines") or [])[:3]:
+            if line not in summary_lines:
+                summary_lines.append(line)
+        mainline_line = (
+            f"mainline: {mainline_stage.get('label') or '-'}"
+            f" next={mainline_stage.get('next_stage_code') or '-'}"
+        )
+        if mainline_line not in summary_lines:
+            summary_lines.append(mainline_line)
+        autonomy_line = "autonomy: " + str(autonomy_summary.get("summary_line") or "")
+        if autonomy_line not in summary_lines:
+            summary_lines.append(autonomy_line)
         if agent_scores:
             score_line = "；".join(
                 f"{item['agent_id']}={item['new_score']:.1f}/{item['weight_bucket']}"
@@ -5599,15 +6928,24 @@ def build_router(
             "/system/monitoring/cadence",
             "/system/discussions/client-brief",
             "/system/discussions/execution-dispatch/latest",
+            "/system/workflow/mainline",
+            "/system/agents/supervision-board",
             "/system/agent-scores",
             "/system/adjustments/natural-language",
+            "/system/search/catalog",
         ]
         return {
-            "trade_date": resolved_trade_date,
+            "trade_date": effective_trade_date,
+            "effective_trade_date": effective_trade_date,
+            "source_trade_date": source_trade_date,
+            "source_trade_date_stale": source_trade_date != effective_trade_date,
             "workspace_context": workspace_context,
             "cadence": cadence_payload,
             "client_brief": client_brief,
             "execution_dispatch": execution_dispatch,
+            "history_runtime": history_runtime,
+            "mainline_stage": mainline_stage,
+            "autonomy_summary": autonomy_summary,
             "agent_scores": agent_scores,
             "summary_lines": summary_lines,
             "data_refs": data_refs,
@@ -6032,11 +7370,720 @@ def build_router(
             ],
         }
 
-    def _build_mainline_workflow_payload(trade_date: str | None = None) -> dict[str, Any]:
-        resolved_trade_date = _resolve_reference_trade_date(trade_date)
+    def _build_feishu_bot_registry_payload() -> dict[str, Any]:
+        bot_role_labels = {
+            "main": "Hermes主控",
+            "supervision": "Hermes督办",
+            "execution": "Hermes回执",
+        }
+        state_candidates = {
+            "main": "feishu_longconn_state.json",
+            "supervision": "feishu_longconn_supervision_state.json",
+            "execution": "feishu_longconn_execution_state.json",
+        }
+        items: list[dict[str, Any]] = []
+        for config in settings.notify.list_feishu_bot_configs():
+            role = str(config.get("role") or "main").strip().lower() or "main"
+            state_payload: dict[str, Any] = {}
+            state_path = settings.storage_root / state_candidates.get(role, f"feishu_longconn_{role}_state.json")
+            if state_path.exists():
+                try:
+                    state_payload = dict(json.loads(state_path.read_text(encoding="utf-8")) or {})
+                except Exception:
+                    state_payload = {}
+            available = bool(str(config.get("app_id") or "").strip() and str(config.get("app_secret") or "").strip())
+            reported_status = str(state_payload.get("status") or ("configured" if available else "missing")).strip() or "unknown"
+            items.append(
+                {
+                    "role": role,
+                    "label": bot_role_labels.get(role, role),
+                    "bot_name": str(config.get("bot_name") or bot_role_labels.get(role, role)).strip(),
+                    "bot_id": str(config.get("bot_id") or "").strip(),
+                    "app_configured": available,
+                    "chat_id_configured": bool(str(config.get("chat_id") or "").strip()),
+                    "reported_status": reported_status,
+                    "last_heartbeat_at": state_payload.get("last_heartbeat_at"),
+                    "last_event_at": state_payload.get("last_event_at"),
+                    "last_error": state_payload.get("last_error"),
+                    "routing_scope": (
+                        "自然语言问答、状态查询、机会追问、持仓体检、调参预判"
+                        if role == "main"
+                        else (
+                            "催办、ACK、作业追踪、超时升级"
+                            if role == "supervision"
+                            else "预检结果、派发回执、成交撤单、桥接异常"
+                        )
+                    ),
+                    "trigger_rule": "@mention 或明确前缀触发，避免同群抢答",
+                    "state_path": str(state_path.relative_to(settings.workspace))
+                    if str(state_path).startswith(str(settings.workspace))
+                    else str(state_path),
+                }
+            )
         return {
-            "trade_date": resolved_trade_date,
+            "title": "飞书机器人注册表",
+            "summary_lines": [
+                "三个机器人默认共用同一群，但必须按职责分流，禁止多个 bot 自动抢答。",
+                "在正式可达外链缺失前，机器人回复必须群内自解释，链接只作为补充入口。",
+            ],
+            "items": items,
+        }
+
+    def _build_dashboard_blockers(
+        *,
+        readiness: dict[str, Any],
+        supervision: dict[str, Any],
+        precheck: dict[str, Any],
+        dispatch: dict[str, Any] | None,
+        position_watch: dict[str, Any],
+        fast_opportunity: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for check in list(readiness.get("checks") or []):
+            status = str(check.get("status") or "").strip().lower()
+            if status in {"warning", "invalid", "blocked", "error"}:
+                items.append(
+                    {
+                        "type": "readiness",
+                        "severity": "high" if status in {"blocked", "error"} else "medium",
+                        "title": str(check.get("name") or "readiness_check"),
+                        "detail": str(check.get("detail") or "无详细说明"),
+                        "path": "/system/readiness",
+                    }
+                )
+        for item in list(supervision.get("attention_items") or [])[:4]:
+            reasons = [str(reason).strip() for reason in list(item.get("reasons") or []) if str(reason).strip()]
+            items.append(
+                {
+                    "type": "supervision",
+                    "severity": "high" if str(item.get("status") or "").strip().lower() in {"error", "overdue"} else "medium",
+                    "title": str(item.get("agent_id") or "unknown_agent"),
+                    "detail": "；".join(reasons[:2]) or "当前需要监督关注。",
+                    "path": "/system/agents/supervision-board",
+                }
+            )
+        blocked_count = int(precheck.get("blocked_count", 0) or 0)
+        if blocked_count > 0:
+            items.append(
+                {
+                    "type": "execution_precheck",
+                    "severity": "high",
+                    "title": "执行预检存在阻断",
+                    "detail": "；".join(str(item).strip() for item in list(precheck.get("summary_lines") or [])[:2] if str(item).strip())
+                    or f"当前有 {blocked_count} 个候选未通过执行预检。",
+                    "path": "/system/discussions/execution-precheck",
+                }
+            )
+        dispatch_payload = dict(dispatch or {})
+        dispatch_status = str(dispatch_payload.get("status") or "").strip().lower()
+        gateway_summary = dict(dispatch_payload.get("control_plane_gateway_summary") or {})
+        latest_receipt_summary = dict(gateway_summary.get("latest_receipt_summary") or {})
+        pending_intent_count = int(gateway_summary.get("pending_intent_count", 0) or 0)
+        queued_for_gateway_count = int(gateway_summary.get("queued_for_gateway_count", 0) or 0)
+        dispatch_problem_detected = dispatch_status in {"blocked", "dispatch_failed"} or (
+            dispatch_status == "not_found" and (pending_intent_count > 0 or queued_for_gateway_count > 0)
+        )
+        if dispatch_problem_detected and not bool(latest_receipt_summary.get("available")):
+            items.append(
+                {
+                    "type": "execution_dispatch",
+                    "severity": "high" if dispatch_status != "not_found" else "medium",
+                    "title": "执行派发未顺利落地",
+                    "detail": "；".join(str(item).strip() for item in list(dispatch_payload.get("summary_lines") or [])[:2] if str(item).strip())
+                    or "当前没有可用执行回执。",
+                    "path": "/system/discussions/execution-dispatch/latest",
+                }
+            )
+        if not list(fast_opportunity.get("items") or []) and not list(position_watch.get("items") or []):
+            items.append(
+                {
+                    "type": "opportunity",
+                    "severity": "medium",
+                    "title": "盘中机会流为空",
+                    "detail": "快机会与持仓巡视都没有形成新的结构化动作事实。",
+                    "path": "/system/discussions/client-brief",
+                }
+            )
+        severity_rank = {"high": 0, "medium": 1, "low": 2}
+        items.sort(key=lambda item: (severity_rank.get(str(item.get("severity") or "low"), 9), str(item.get("title") or "")))
+        return items[:8]
+
+    def _build_dashboard_timeline(
+        *,
+        trade_date: str | None,
+        readiness: dict[str, Any],
+        client_brief: dict[str, Any],
+        discussion_context: dict[str, Any],
+        fast_opportunity: dict[str, Any],
+        position_watch: dict[str, Any],
+        dispatch: dict[str, Any] | None,
+        supervision: dict[str, Any],
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        if audit_store:
+            for audit in audit_store.recent(limit=limit * 2):
+                payload = dict(audit.payload or {})
+                created_at = str(
+                    getattr(audit, "created_at", "")
+                    or getattr(audit, "timestamp", "")
+                    or payload.get("created_at")
+                    or payload.get("timestamp")
+                    or ""
+                ).strip()
+                message = str(audit.message or "").strip()
+                if trade_date and created_at and not created_at.startswith(str(trade_date)):
+                    continue
+                items.append(
+                    {
+                        "created_at": created_at,
+                        "stage": str(audit.category or "audit"),
+                        "title": message or str(audit.category or "audit"),
+                        "detail": payload.get("summary") or payload.get("reason") or payload.get("trigger") or "",
+                        "source": "audit",
+                    }
+                )
+        synthetic_sources = [
+            ("discussion", client_brief.get("generated_at"), client_brief.get("status"), client_brief.get("summary_text")),
+            ("meeting", discussion_context.get("generated_at"), discussion_context.get("status"), "；".join(list(discussion_context.get("summary_lines") or [])[:2])),
+            ("fast_opportunity", fast_opportunity.get("generated_at"), fast_opportunity.get("status"), "；".join(list(fast_opportunity.get("summary_lines") or [])[:2])),
+            ("position_watch", position_watch.get("generated_at"), position_watch.get("status"), "；".join(list(position_watch.get("summary_lines") or [])[:2])),
+            (
+                "execution_dispatch",
+                (dispatch or {}).get("generated_at") or (dispatch or {}).get("updated_at"),
+                (dispatch or {}).get("status"),
+                "；".join(list((dispatch or {}).get("summary_lines") or [])[:2]),
+            ),
+            ("supervision", supervision.get("generated_at"), supervision.get("cycle_state"), "；".join(list(supervision.get("summary_lines") or [])[:2])),
+            ("readiness", readiness.get("generated_at"), readiness.get("status"), "；".join(list(readiness.get("summary_lines") or [])[:2])),
+        ]
+        for stage, created_at, status, detail in synthetic_sources:
+            if not created_at:
+                continue
+            items.append(
+                {
+                    "created_at": created_at,
+                    "stage": stage,
+                    "title": f"{stage} {status or 'updated'}",
+                    "detail": detail or "",
+                    "source": "derived",
+                }
+            )
+        items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return items[:limit]
+
+    def _load_dashboard_account_state(
+        account_id: str,
+        *,
+        freshness_seconds: int = 20,
+    ) -> dict[str, Any]:
+        if not account_state_service:
+            return {"status": "unavailable", "summary_lines": ["account state service unavailable"]}
+        cached = dict(account_state_service.latest_for(account_id) or {})
+        cached_captured_at = str(cached.get("captured_at") or "").strip()
+        if cached and cached_captured_at:
+            try:
+                cached_dt = datetime.fromisoformat(cached_captured_at)
+                now = datetime.now(tz=cached_dt.tzinfo) if cached_dt.tzinfo else datetime.now()
+                age_seconds = max((now - cached_dt).total_seconds(), 0.0)
+                cached["age_seconds"] = age_seconds
+                cached["fresh"] = age_seconds <= freshness_seconds
+                cached["dashboard_source"] = "cache"
+                if age_seconds <= freshness_seconds:
+                    return cached
+            except ValueError:
+                cached["fresh"] = False
+                cached["dashboard_source"] = "cache"
+        try:
+            refreshed = dict(
+                account_state_service.snapshot(
+                    account_id,
+                    persist=True,
+                    include_trades=False,
+                    timeout_sec=4.0,
+                )
+                or {}
+            )
+            refreshed["dashboard_source"] = "live_refresh"
+            refreshed["fresh"] = refreshed.get("status") == "ok"
+            return refreshed
+        except Exception as exc:
+            if cached:
+                summary_lines = list(cached.get("summary_lines") or [])
+                summary_lines.append(f"实时刷新失败，已回退到最近缓存：{exc}")
+                cached["summary_lines"] = summary_lines[-5:]
+                cached["dashboard_source"] = "cache_fallback"
+                cached["fresh"] = False
+                return cached
+            return {
+                "account_id": account_id,
+                "status": "error",
+                "fresh": False,
+                "dashboard_source": "refresh_failed",
+                "summary_lines": [f"账户状态刷新失败：{exc}"],
+            }
+
+    def _build_history_runtime_payload() -> dict[str, Any]:
+        latest_daily = dict(runtime_state_store.get("latest_history_daily_ingest", {}) or {}) if runtime_state_store else {}
+        latest_minute = dict(runtime_state_store.get("latest_history_minute_ingest", {}) or {}) if runtime_state_store else {}
+        latest_behavior = (
+            dict(runtime_state_store.get("latest_history_behavior_profile_ingest", {}) or {})
+            if runtime_state_store
+            else {}
+        )
+        catalog_snapshot = history_catalog.build_health_snapshot()
+        capabilities = history_store.capabilities()
+        latest_by_dataset = {
+            str(item.get("dataset_name") or ""): item
+            for item in list(catalog_snapshot.get("datasets") or [])
+            if isinstance(item, dict)
+        }
+        summary_lines = [
+            (
+                f"日线入湖：最近交易日 {latest_by_dataset.get('bars_1d', {}).get('latest_trade_date') or '--'}，"
+                f"最近作业 {latest_daily.get('row_count', 0)} 行 / "
+                f"{latest_daily.get('ingested_symbol_count', 0) or latest_daily.get('symbol_count', 0)} 只。"
+            ),
+            (
+                f"分钟线入湖：最近作业 {latest_minute.get('row_count', 0)} 行 / {latest_minute.get('symbol_count', 0)} 只，"
+                f"窗口 count={latest_minute.get('count', 0) or '--'}。"
+            ),
+            (
+                f"股性画像：最近作业 {latest_behavior.get('row_count', 0)} 条 / {latest_behavior.get('symbol_count', 0)} 只，"
+                f"Parquet={'on' if capabilities.get('parquet_enabled') else 'off'} DuckDB={'on' if capabilities.get('duckdb_enabled') else 'off'}。"
+            ),
+        ]
+        return {
+            "capabilities": capabilities,
+            "catalog": catalog_snapshot,
+            "latest_daily": latest_daily,
+            "latest_minute": latest_minute,
+            "latest_behavior_profiles": latest_behavior,
+            "latest_by_dataset": latest_by_dataset,
+            "summary_lines": summary_lines,
+        }
+
+    def _build_dashboard_mission_control_payload(trade_date: str | None = None) -> dict[str, Any]:
+        trade_context = _resolve_user_facing_trade_context(trade_date)
+        effective_trade_date = str(trade_context.get("effective_trade_date") or "").strip() or datetime.now().date().isoformat()
+        source_trade_date = str(trade_context.get("source_trade_date") or "").strip() or effective_trade_date
+        readiness = _build_readiness(_resolve_account_id())
+        account_state = _load_dashboard_account_state(_resolve_account_id())
+        history_runtime = _build_history_runtime_payload()
+        supervision = _build_agent_supervision_payload(effective_trade_date, overdue_after_seconds=180)
+        client_brief = (
+            _build_client_brief(source_trade_date, display_trade_date=effective_trade_date)
+            if candidate_case_service and source_trade_date
+            else {}
+        )
+        discussion_context = _get_discussion_context_from_store(effective_trade_date) or _get_latest_discussion_context_payload() or {}
+        runtime_context = _sanitize_json_compatible(serving_store.get_latest_runtime_context() or {}) or (
+            runtime_state_store.get("latest_runtime_context", {}) if runtime_state_store else {}
+        ) or {}
+        fast_opportunity = _get_latest_fast_opportunity_payload()
+        position_watch = _get_latest_position_watch_payload()
+        precheck = _build_execution_precheck(effective_trade_date, account_id=_resolve_account_id()) if candidate_case_service else {}
+        dispatch = _get_execution_dispatch_payload(effective_trade_date)
+        portfolio_efficiency = (
+            portfolio_risk_checker.build_efficiency_snapshot(
+                total_equity=float((((account_state or {}).get("metrics") or {}).get("total_asset", 0.0) or 0.0)),
+                cash_available=float((((account_state or {}).get("metrics") or {}).get("cash", 0.0) or 0.0)),
+                existing_positions=[],
+                regime_label=str((((runtime_context.get("market_profile") or {}).get("regime")) or "unknown")),
+                daily_new_exposure=0.0,
+                reverse_repo_value=float((((account_state or {}).get("metrics") or {}).get("reverse_repo_value", 0.0) or 0.0)),
+            )
+            if account_state and account_state.get("status") == "ok"
+            else {"cash_ratio": 0.0, "risk_budget_used": 0.0, "risk_budget_remaining": 0.0, "portfolio_beta": 0.0}
+        )
+        opportunity_items = list(fast_opportunity.get("items") or [])
+        top_picks = [dict(item) for item in list(runtime_context.get("top_picks") or []) if isinstance(item, dict)]
+        blockers = _build_dashboard_blockers(
+            readiness=readiness,
+            supervision=supervision,
+            precheck=precheck,
+            dispatch=dispatch,
+            position_watch=position_watch,
+            fast_opportunity=fast_opportunity,
+        )
+        timeline = _build_dashboard_timeline(
+            trade_date=effective_trade_date,
+            readiness=readiness,
+            client_brief=client_brief,
+            discussion_context=discussion_context,
+            fast_opportunity=fast_opportunity,
+            position_watch=position_watch,
+            dispatch=dispatch,
+            supervision=supervision,
+        )
+        market_profile = dict(runtime_context.get("market_profile") or {})
+        detected_regime = dict(market_profile.get("detected_market_regime") or {})
+        return {
+            "trade_date": effective_trade_date,
+            "effective_trade_date": effective_trade_date,
+            "source_trade_date": source_trade_date,
+            "source_trade_date_stale": source_trade_date != effective_trade_date,
+            "generated_at": datetime.now().isoformat(),
+            "market": {
+                "regime_label": str(
+                    detected_regime.get("regime_label")
+                    or market_profile.get("regime_label")
+                    or market_profile.get("regime")
+                    or "unknown"
+                ),
+                "confidence": detected_regime.get("confidence") or runtime_context.get("regime_confidence"),
+                "hot_sectors": list(runtime_context.get("hot_sectors") or market_profile.get("hot_sectors") or []),
+                "summary_lines": list(runtime_context.get("summary_lines") or [])[:3],
+            },
+            "account": account_state,
+            "readiness": readiness,
+            "portfolio_efficiency": portfolio_efficiency,
+            "discussion": {
+                "client_brief": client_brief,
+                "meeting_context": discussion_context,
+                "selected_count": client_brief.get("selected_count", 0),
+                "watchlist_count": client_brief.get("watchlist_count", 0),
+                "rejected_count": client_brief.get("rejected_count", 0),
+            },
+            "runtime": {
+                "context": runtime_context,
+                "top_picks": top_picks[:8],
+                "opportunity_count": len(opportunity_items),
+            },
+            "position_watch": position_watch,
+            "fast_opportunity_scan": fast_opportunity,
+            "execution": {
+                "precheck": precheck,
+                "dispatch": dispatch or {},
+            },
+            "history": history_runtime,
+            "supervision": supervision,
+            "blockers": blockers,
+            "timeline": timeline,
+            "feishu_bots": _build_feishu_bot_registry_payload(),
+        }
+
+    def _build_opportunity_flow_payload(trade_date: str | None = None) -> dict[str, Any]:
+        trade_context = _resolve_user_facing_trade_context(trade_date)
+        effective_trade_date = str(trade_context.get("effective_trade_date") or "").strip() or datetime.now().date().isoformat()
+        source_trade_date = str(trade_context.get("source_trade_date") or "").strip() or effective_trade_date
+        brief = (
+            _build_client_brief(source_trade_date, display_trade_date=effective_trade_date)
+            if candidate_case_service and source_trade_date
+            else {}
+        )
+        runtime_context = _sanitize_json_compatible(serving_store.get_latest_runtime_context() or {}) or (
+            runtime_state_store.get("latest_runtime_context", {}) if runtime_state_store else {}
+        ) or {}
+        precheck = _build_execution_precheck(effective_trade_date, account_id=_resolve_account_id()) if candidate_case_service else {}
+        precheck_map = {
+            str(item.get("symbol") or "").strip(): dict(item)
+            for item in list(precheck.get("items") or [])
+            if str(item.get("symbol") or "").strip()
+        }
+        top_pick_map = {
+            str(item.get("symbol") or "").strip(): dict(item)
+            for item in list(runtime_context.get("top_picks") or [])
+            if isinstance(item, dict) and str(item.get("symbol") or "").strip()
+        }
+        sections: list[tuple[str, str, list[dict[str, Any]]]] = [
+            ("selected", "执行池 / 核心推荐", list(brief.get("selected_packets") or [])),
+            ("watchlist", "观察池 / 候选补位", list(brief.get("watchlist_packets") or [])),
+            ("rejected", "淘汰池 / 被拦截", list(brief.get("rejected_packets") or [])),
+        ]
+        items: list[dict[str, Any]] = []
+        grouped: dict[str, list[dict[str, Any]]] = {"selected": [], "watchlist": [], "rejected": []}
+        for bucket, label, packets in sections:
+            for packet in packets:
+                runtime_snapshot = dict(packet.get("runtime_snapshot") or {})
+                symbol = str(packet.get("symbol") or runtime_snapshot.get("symbol") or "").strip()
+                if not symbol:
+                    continue
+                precheck_item = precheck_map.get(symbol, {})
+                top_pick = top_pick_map.get(symbol, {})
+                discussion = dict(packet.get("discussion") or {})
+                item = {
+                    "bucket": bucket,
+                    "bucket_label": label,
+                    "symbol": symbol,
+                    "name": packet.get("name") or symbol,
+                    "headline_reason": packet.get("headline_reason") or runtime_snapshot.get("summary") or "暂无结构化归因。",
+                    "selection_score": runtime_snapshot.get("selection_score"),
+                    "rank": runtime_snapshot.get("rank"),
+                    "action": runtime_snapshot.get("action"),
+                    "disposition": packet.get("final_status") or bucket.upper(),
+                    "risk_gate": packet.get("risk_gate"),
+                    "audit_gate": packet.get("audit_gate"),
+                    "resolved_sector": ((packet.get("dossier") or {}).get("symbol_context") or {}).get("sector_relative", {}).get("sector_tags", ["未标注板块"])[0],
+                    "source": top_pick.get("source") or runtime_snapshot.get("source") or "discussion_case",
+                    "assigned_playbook": top_pick.get("assigned_playbook") or ((top_pick.get("playbook_context") or {}).get("playbook")) or "",
+                    "approved": precheck_item.get("approved"),
+                    "primary_blocker_label": precheck_item.get("primary_blocker_label"),
+                    "recommended_next_action": precheck_item.get("primary_recommended_next_action_label"),
+                    "evidence_gaps": list(discussion.get("evidence_gaps") or []),
+                    "questions_for_round_2": list(discussion.get("questions_for_round_2") or []),
+                    "detail_path": f"/dashboard/discussion/{symbol}",
+                }
+                grouped[bucket].append(item)
+                items.append(item)
+        fast_opportunity = _get_latest_fast_opportunity_payload()
+        return {
+            "trade_date": effective_trade_date,
+            "effective_trade_date": effective_trade_date,
+            "source_trade_date": source_trade_date,
+            "source_trade_date_stale": source_trade_date != effective_trade_date,
+            "generated_at": datetime.now().isoformat(),
+            "summary_lines": [
+                f"当前机会流: selected={len(grouped['selected'])} watchlist={len(grouped['watchlist'])} rejected={len(grouped['rejected'])}。",
+                (
+                    f"当前运营交易日={effective_trade_date}，候选/讨论数据来源={source_trade_date}。"
+                    if source_trade_date != effective_trade_date
+                    else f"当前运营交易日={effective_trade_date}。"
+                ),
+                (
+                    "；".join(str(item).strip() for item in list(fast_opportunity.get("summary_lines") or [])[:2] if str(item).strip())
+                    or "当前快机会扫描暂无新的高优先级摘要。"
+                ),
+            ],
+            "items": items,
+            "selected": grouped["selected"],
+            "watchlist": grouped["watchlist"],
+            "rejected": grouped["rejected"],
+            "runtime_top_picks": list(top_pick_map.values())[:8],
+            "fast_opportunity_scan": fast_opportunity,
+            "execution_precheck": precheck,
+        }
+
+    def _build_execution_mainline_trace_payload(
+        trade_date: str | None = None,
+        *,
+        symbol: str | None = None,
+        trace_id: str | None = None,
+    ) -> dict[str, Any]:
+        trade_context = _resolve_user_facing_trade_context(trade_date)
+        effective_trade_date = str(trade_context.get("effective_trade_date") or "").strip() or datetime.now().date().isoformat()
+        source_trade_date = str(trade_context.get("source_trade_date") or "").strip() or effective_trade_date
+        requested_symbol = str(symbol or "").strip().upper()
+        requested_trace_id = str(trace_id or "").strip()
+
+        cases = (
+            candidate_case_service.list_cases(source_trade_date, limit=500)
+            if candidate_case_service and source_trade_date
+            else []
+        )
+        precheck = _build_execution_precheck(effective_trade_date, account_id=_resolve_account_id()) if candidate_case_service else {}
+        pending_intents = [dict(item) for item in list(_get_pending_execution_intents() or [])]
+        intent_history = [dict(item) for item in list(_get_execution_intent_history() or [])]
+        receipt_history = [dict(item) for item in list(_get_execution_gateway_receipt_history() or [])]
+        latest_dispatch = dict(_get_execution_dispatch_payload(effective_trade_date) or {})
+        latest_reconciliation = (
+            dict(meeting_state_store.get("latest_execution_reconciliation", {}) or {})
+            if meeting_state_store
+            else {}
+        )
+        attribution_report = trade_attribution_service.build_report(
+            trade_date=source_trade_date or effective_trade_date,
+        )
+        attribution_items = [
+            item.model_dump() if hasattr(item, "model_dump") else dict(item)
+            for item in list(attribution_report.items or [])
+        ]
+
+        precheck_by_symbol = {
+            str(item.get("symbol") or "").strip().upper(): dict(item)
+            for item in list(precheck.get("items") or [])
+            if str(item.get("symbol") or "").strip()
+        }
+        attribution_by_symbol = {
+            str(item.get("symbol") or "").strip().upper(): dict(item)
+            for item in attribution_items
+            if str(item.get("symbol") or "").strip()
+        }
+
+        latest_intent_by_symbol: dict[str, dict[str, Any]] = {}
+        latest_intent_by_trace: dict[str, dict[str, Any]] = {}
+        for item in [*intent_history, *pending_intents]:
+            resolved_symbol = str(item.get("symbol") or "").strip().upper()
+            resolved_trace_id = str(item.get("trace_id") or "").strip()
+            if resolved_symbol:
+                latest_intent_by_symbol[resolved_symbol] = dict(item)
+            if resolved_trace_id:
+                latest_intent_by_trace[resolved_trace_id] = dict(item)
+
+        latest_receipt_by_symbol: dict[str, dict[str, Any]] = {}
+        latest_receipt_by_trace: dict[str, dict[str, Any]] = {}
+        for item in receipt_history:
+            resolved_symbol = str(item.get("symbol") or "").strip().upper()
+            resolved_trace_id = str(item.get("trace_id") or "").strip()
+            if resolved_symbol:
+                latest_receipt_by_symbol[resolved_symbol] = dict(item)
+            if resolved_trace_id:
+                latest_receipt_by_trace[resolved_trace_id] = dict(item)
+
+        reconciliation_by_symbol = {
+            str(item.get("symbol") or "").strip().upper(): dict(item)
+            for item in list(latest_reconciliation.get("items") or [])
+            if str(item.get("symbol") or "").strip()
+        }
+
+        items: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str]] = set()
+        symbol_universe = set(
+            [str(item.symbol).strip().upper() for item in cases if str(item.symbol).strip()]
+            + list(precheck_by_symbol.keys())
+            + list(latest_intent_by_symbol.keys())
+            + list(latest_receipt_by_symbol.keys())
+            + list(attribution_by_symbol.keys())
+            + list(reconciliation_by_symbol.keys())
+        )
+        if requested_symbol:
+            symbol_universe = {item for item in symbol_universe if item == requested_symbol}
+
+        for resolved_symbol in sorted(symbol_universe):
+            case = next((item for item in cases if str(item.symbol).strip().upper() == resolved_symbol), None)
+            precheck_item = dict(precheck_by_symbol.get(resolved_symbol) or {})
+            intent_item = dict(latest_intent_by_symbol.get(resolved_symbol) or {})
+            receipt_item = dict(latest_receipt_by_symbol.get(resolved_symbol) or {})
+            attribution_item = dict(attribution_by_symbol.get(resolved_symbol) or {})
+            reconciliation_item = dict(reconciliation_by_symbol.get(resolved_symbol) or {})
+            resolved_trace_id = (
+                str(intent_item.get("trace_id") or "").strip()
+                or str(receipt_item.get("trace_id") or "").strip()
+            )
+            if requested_trace_id and resolved_trace_id != requested_trace_id:
+                continue
+            key = (resolved_symbol, resolved_trace_id or "-")
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            case_stage = "missing"
+            if case is not None:
+                final_status = str(getattr(case, "final_status", "") or "").strip().lower()
+                if final_status in {"selected", "approved", "allow"}:
+                    case_stage = "selected"
+                elif final_status in {"watch", "watchlist"}:
+                    case_stage = "watch"
+                elif final_status in {"rejected", "reject"}:
+                    case_stage = "rejected"
+                else:
+                    case_stage = final_status or "captured"
+
+            precheck_stage = "not_started"
+            if precheck_item:
+                precheck_stage = "approved" if bool(precheck_item.get("approved")) else "blocked"
+
+            intent_stage = str(intent_item.get("status") or "").strip() or ("generated" if intent_item else "not_generated")
+            receipt_stage = str(receipt_item.get("status") or "").strip() or "pending_receipt"
+            fill_stage = "not_filled"
+            if int(reconciliation_item.get("filled_quantity", 0) or 0) > 0:
+                fill_stage = "filled"
+            elif receipt_stage in {"filled", "partial_filled"}:
+                fill_stage = receipt_stage
+            elif receipt_stage in {"submitted", "claimed"}:
+                fill_stage = "submitted"
+
+            summary_lines = [
+                f"candidate={case_stage}",
+                f"precheck={precheck_stage}",
+                f"intent={intent_stage}",
+                f"receipt={receipt_stage}",
+                f"fill={fill_stage}",
+            ]
+            if precheck_item.get("primary_blocker_label"):
+                summary_lines.append(f"blocker={precheck_item.get('primary_blocker_label')}")
+            if attribution_item.get("next_day_close_pct") is not None:
+                summary_lines.append(
+                    f"attribution={float(attribution_item.get('next_day_close_pct', 0.0) or 0.0):+.2%}"
+                )
+
+            items.append(
+                {
+                    "symbol": resolved_symbol,
+                    "name": (
+                        str(getattr(case, "name", "") or "").strip()
+                        or str(precheck_item.get("name") or "").strip()
+                        or str(attribution_item.get("name") or "").strip()
+                        or resolved_symbol
+                    ),
+                    "trace_id": resolved_trace_id or None,
+                    "case_id": (getattr(case, "case_id", None) if case is not None else None),
+                    "candidate_stage": case_stage,
+                    "discussion_stage": {
+                        "final_status": (getattr(case, "final_status", "") if case is not None else ""),
+                        "risk_gate": (getattr(case, "risk_gate", "") if case is not None else ""),
+                        "audit_gate": (getattr(case, "audit_gate", "") if case is not None else ""),
+                    },
+                    "precheck_stage": precheck_stage,
+                    "precheck": precheck_item,
+                    "intent_stage": intent_stage,
+                    "intent": intent_item,
+                    "receipt_stage": receipt_stage,
+                    "receipt": receipt_item,
+                    "fill_stage": fill_stage,
+                    "reconciliation": reconciliation_item,
+                    "attribution": attribution_item,
+                    "summary_lines": summary_lines,
+                }
+            )
+
+        if requested_trace_id and requested_trace_id not in latest_intent_by_trace and requested_trace_id not in latest_receipt_by_trace:
+            trace_payload = trace_service.get_trace(requested_trace_id)
+        else:
+            trace_payload = trace_service.get_trace(requested_trace_id) if requested_trace_id else {}
+
+        summary_lines = [
+            f"主链追踪: candidate={len(cases)} precheck={len(list(precheck.get('items') or []))} intents={len(pending_intents) + len(intent_history)} receipts={len(receipt_history)}。",
+            f"当前运营交易日={effective_trade_date}，候选来源交易日={source_trade_date}。",
+            f"latest_dispatch={latest_dispatch.get('status') or 'unknown'} attribution_trades={int(attribution_report.trade_count or 0)}。",
+        ]
+        if requested_symbol:
+            summary_lines.append(f"已按 symbol={requested_symbol} 过滤。")
+        if requested_trace_id:
+            summary_lines.append(f"已按 trace_id={requested_trace_id} 过滤。")
+
+        return {
+            "trade_date": effective_trade_date,
+            "effective_trade_date": effective_trade_date,
+            "source_trade_date": source_trade_date,
+            "source_trade_date_stale": source_trade_date != effective_trade_date,
+            "generated_at": datetime.now().isoformat(),
+            "filters": {
+                "symbol": requested_symbol or None,
+                "trace_id": requested_trace_id or None,
+            },
+            "summary_lines": summary_lines,
+            "precheck_overview": {
+                "status": precheck.get("status"),
+                "approved_count": int(precheck.get("approved_count", 0) or 0),
+                "blocked_count": int(precheck.get("blocked_count", 0) or 0),
+            },
+            "dispatch_overview": latest_dispatch,
+            "reconciliation_overview": latest_reconciliation,
+            "items": items,
+            "count": len(items),
+            "trace": trace_payload,
+        }
+
+    def _build_mainline_workflow_payload(trade_date: str | None = None) -> dict[str, Any]:
+        trade_context = _resolve_user_facing_trade_context(trade_date)
+        effective_trade_date = str(trade_context.get("effective_trade_date") or "").strip() or None
+        cycle = discussion_cycle_service.get_cycle(effective_trade_date) if (effective_trade_date and discussion_cycle_service) else None
+        execution_summary = _build_supervision_execution_summary(effective_trade_date, cycle)
+        compose_metrics = _compose_evaluation_metrics_for_trade_date(effective_trade_date)
+        current_stage = _resolve_mainline_stage_payload(
+            effective_trade_date,
+            cycle_state=(cycle.discussion_state if cycle else None),
+            execution_summary=execution_summary,
+            compose_metrics=compose_metrics,
+        )
+        return {
+            "trade_date": effective_trade_date,
+            "effective_trade_date": effective_trade_date,
+            "source_trade_date": trade_context.get("source_trade_date"),
+            "source_trade_date_stale": trade_context.get("source_trade_date_stale"),
             "title": "量化交易台主线流程",
+            "current_stage": current_stage,
             "principles": [
                 "agent 是大脑，程序是手脚、监督系统和电子围栏。",
                 "先全局，后分工；先事实，后判断；先预演，后正式执行。",
@@ -6356,6 +8403,20 @@ def build_router(
         summary = candidate_case_service.build_trade_date_summary(resolved_trade_date) if (resolved_trade_date and candidate_case_service) else {}
         execution_summary = _build_supervision_execution_summary(resolved_trade_date, cycle)
         execution_dispatch = execution_summary.get("latest_dispatch")
+        source_counts = dict(summary.get("source_counts") or {})
+        agent_proposed_count = int(source_counts.get("agent_proposed", 0) or 0)
+        compose_metrics = _compose_evaluation_metrics_for_trade_date(resolved_trade_date)
+        mainline_stage = _resolve_mainline_stage_payload(
+            resolved_trade_date,
+            cycle_state=(cycle.discussion_state if cycle else None),
+            execution_summary=execution_summary,
+            compose_metrics=compose_metrics,
+        )
+        autonomy_summary = _build_autonomy_progress_snapshot(
+            compose_metrics=compose_metrics,
+            agent_proposed_count=agent_proposed_count,
+            mainline_stage=mainline_stage,
+        )
 
         items: list[dict[str, Any]] = []
         important_message_policy = {
@@ -6378,7 +8439,6 @@ def build_router(
         latest_runtime_report = _latest_runtime()
         latest_runtime_context = serving_store.get_latest_runtime_context() or {}
         latest_monitor_context = serving_store.get_latest_monitor_context() or {}
-        compose_metrics = _compose_evaluation_metrics_for_trade_date(resolved_trade_date)
         position_context: dict[str, Any] = {}
         if account_state_service:
             latest_account_state = dict(account_state_service.latest() or {})
@@ -6498,6 +8558,14 @@ def build_router(
                                 trade_date=resolved_trade_date,
                             ),
                         ),
+                        (
+                            "agent_proposed_ticket",
+                            _latest_state_store_activity(
+                                meeting_state_store,
+                                ("latest_opportunity_ticket_ingress",),
+                                trade_date=resolved_trade_date,
+                            ),
+                        ),
                     ],
                 ),
             },
@@ -6539,6 +8607,10 @@ def build_router(
                                 ("latest_nightly_sandbox",),
                                 trade_date=resolved_trade_date,
                             ),
+                        ),
+                        (
+                            "compose_replan",
+                            compose_metrics.get("latest_retry_generated_at"),
                         ),
                     ],
                 ),
@@ -6619,8 +8691,8 @@ def build_router(
 
         discussion_agents = ("ashare-research", "ashare-strategy", "ashare-risk", "ashare-audit")
         mainline_signal_sources = {
-            "ashare-research": {"research_summary", "dossier_or_behavior", "intraday_or_tail_scan"},
-            "ashare-strategy": {"compose_evaluation", "proposal_packet", "playbook_override", "nightly_sandbox"},
+            "ashare-research": {"research_summary", "dossier_or_behavior", "intraday_or_tail_scan", "agent_proposed_ticket"},
+            "ashare-strategy": {"compose_evaluation", "proposal_packet", "playbook_override", "nightly_sandbox", "compose_replan"},
             "ashare-risk": {"execution_precheck", "execution_reconciliation", "tail_market_scan"},
             "ashare-audit": {"audit_records", "execution_dispatch"},
         }
@@ -6653,6 +8725,9 @@ def build_router(
             ]
             mainline_output_count = len(mainline_signals)
             mainline_output_hint = str(mainline_signal_hint.get(agent_id) or "主线产物")
+            latest_retry_triggered = bool(compose_metrics.get("latest_retry_triggered")) if agent_id == "ashare-strategy" else False
+            latest_retry_reason_summary = str(compose_metrics.get("latest_retry_reason_summary") or "").strip() if agent_id == "ashare-strategy" else ""
+            latest_autonomy_trace = dict(compose_metrics.get("latest_autonomy_trace") or {}) if agent_id == "ashare-strategy" else {}
             for case_id in expected_case_ids:
                 case = case_map.get(case_id)
                 if not case:
@@ -6692,7 +8767,12 @@ def build_router(
             else:
                 activity_age = _seconds_since(activity_last_active_at)
                 if activity_last_active_at:
-                    if session_open and mainline_output_count <= 0:
+                    if agent_id == "ashare-strategy" and latest_retry_triggered:
+                        status = "needs_work"
+                        reasons.append("上一轮 compose 已触发第二轮重编排建议，当前主线不能停在第一次失败")
+                        if latest_retry_reason_summary:
+                            reasons.append("重编排原因：" + latest_retry_reason_summary)
+                    elif session_open and mainline_output_count <= 0:
                         status = "overdue" if (activity_age is not None and activity_age > activity_window_seconds) else "needs_work"
                         reasons.append(f"最近{activity_label}={activity_last_active_at}，但今日尚无{mainline_output_hint}")
                         if agent_id == "ashare-strategy" and int(compose_metrics.get("count", 0) or 0) <= 0:
@@ -6708,6 +8788,33 @@ def build_router(
                     reasons.append(f"交易时段内尚未观察到{activity_label}")
                 else:
                     reasons.append("当前无进行中的讨论轮次")
+            if agent_id == "ashare-research" and agent_proposed_count > 0:
+                reasons.append(f"今日已有 {agent_proposed_count} 只 agent_proposed 自提票进入讨论主线")
+            if agent_id == "ashare-strategy" and agent_proposed_count > 0:
+                reasons.append(f"当前需把 {agent_proposed_count} 只 agent_proposed 自提票纳入编排与筛选比较")
+            mainline_action_ready = bool((latest_autonomy_trace or {}).get("mainline_action_ready")) if agent_id == "ashare-strategy" else bool(agent_proposed_count > 0)
+            autonomy_metrics = {
+                "market_hypothesis_formed": bool((latest_autonomy_trace or {}).get("market_hypothesis_present")) if agent_id == "ashare-strategy" else None,
+                "compose_formed": bool(int(compose_metrics.get("count", 0) or 0) > 0) if agent_id == "ashare-strategy" else None,
+                "retry_required": latest_retry_triggered if agent_id == "ashare-strategy" else None,
+                "retry_generated": bool((latest_autonomy_trace or {}).get("retry_generated")) if agent_id == "ashare-strategy" else None,
+                "hypothesis_revised": bool((latest_autonomy_trace or {}).get("hypothesis_revised")) if agent_id == "ashare-strategy" else None,
+                "new_opportunity_ticket_generated": bool(agent_proposed_count > 0) if agent_id in {"ashare-research", "ashare-strategy"} else None,
+                "agent_proposed_count": agent_proposed_count if agent_id in {"ashare-research", "ashare-strategy"} else None,
+                "mainline_action_ready": mainline_action_ready if agent_id in {"ashare-research", "ashare-strategy"} else None,
+                "mainline_action_type": str((latest_autonomy_trace or {}).get("mainline_action_type") or "").strip() if agent_id == "ashare-strategy" else None,
+                "mainline_action_summary": str((latest_autonomy_trace or {}).get("mainline_action_summary") or "").strip() if agent_id == "ashare-strategy" else None,
+                "learning_feedback_applied_count": int((latest_autonomy_trace or {}).get("learning_feedback_applied_count", 0) or 0) if agent_id == "ashare-strategy" else None,
+                "mainline_stage": {
+                    "code": mainline_stage.get("code"),
+                    "label": mainline_stage.get("label"),
+                },
+            }
+            autonomy_progress = _build_autonomy_progress_snapshot(
+                compose_metrics=compose_metrics,
+                agent_proposed_count=agent_proposed_count,
+                mainline_stage=mainline_stage,
+            ) if agent_id in {"ashare-research", "ashare-strategy"} else {}
             items.append(
                 {
                     "agent_id": agent_id,
@@ -6721,6 +8828,8 @@ def build_router(
                     "activity_signal_count": len(activity_signals),
                     "mainline_output_count": mainline_output_count,
                     "mainline_output_hint": mainline_output_hint,
+                    "autonomy_metrics": autonomy_metrics,
+                    "autonomy_progress": autonomy_progress,
                 }
             )
 
@@ -6728,12 +8837,16 @@ def build_router(
         executor_status = "standby"
         intent_count = int(execution_summary.get("intent_count", 0) or 0)
         dispatch_status = str(execution_summary.get("dispatch_status") or "")
+        precheck_approved_count = int(execution_summary.get("precheck_approved_count", 0) or 0)
         if intent_count > 0 and dispatch_status not in {"submitted", "preview"}:
             executor_status = "needs_work"
             executor_reasons.append(f"当前 execution intents={intent_count}，尚无最新 dispatch 回执")
         elif dispatch_status:
             executor_status = "working"
             executor_reasons.append(f"最新 dispatch 状态={dispatch_status}")
+        elif precheck_approved_count > 0:
+            executor_status = "needs_work"
+            executor_reasons.append(f"执行预检已通过 {precheck_approved_count} 只，但尚未形成新的执行派发")
         else:
             executor_reasons.append("当前无待执行回执")
         items.append(
@@ -6748,11 +8861,19 @@ def build_router(
         attention_items = [item for item in items if item.get("status") in {"needs_work", "overdue"}]
         summary_lines = [
             f"trade_date={resolved_trade_date or 'unknown'} supervision_items={len(items)} attention={len(attention_items)}",
+            f"当前主线阶段={mainline_stage.get('label') or '-'} next={mainline_stage.get('next_stage_code') or '-'}",
+            "自治进度: " + str(autonomy_summary.get("summary_line") or ""),
             "人工默认只接重要业务消息；催办和升级由机器人自动完成。",
             "监督重点是 agent 的主线产物、真实活动痕迹与响应迟滞，不是机械催工具调用次数。",
         ]
         if int(compose_metrics.get("count", 0) or 0) <= 0:
             summary_lines.append("今日 compose 评估账本=0；若策略侧只有调参痕迹而无编排产物，按未完成主线处理。")
+        elif bool(compose_metrics.get("latest_retry_triggered")):
+            summary_lines.append(
+                "上一轮 compose 已触发第二轮重编排建议；当前不能停在第一次失败结果。"
+            )
+        if agent_proposed_count > 0:
+            summary_lines.append(f"今日 agent_proposed 自提入池={agent_proposed_count}，已进入 discussion/supervision 主线。")
         summary_lines.extend(
             f"{item['agent_id']}={item['status']}" for item in attention_items[:6]
         )
@@ -6762,6 +8883,8 @@ def build_router(
                 "overdue_after_seconds": overdue_after_seconds,
                 "cycle_state": (cycle.discussion_state if cycle else None),
                 "round": current_round,
+                "mainline_stage": mainline_stage,
+                "autonomy_summary": autonomy_summary,
                 "round_coverage": summary.get("round_coverage", {}),
                 "items": items,
                 "attention_items": attention_items,
@@ -6783,6 +8906,7 @@ def build_router(
         payload["notify_items"] = task_plan.get("notify_items", payload.get("notify_items", []))
         payload["task_dispatch_plan"] = {
             "phase": task_plan.get("phase"),
+            "mainline_stage": mainline_stage,
             "position_context": position_context,
             "summary_lines": task_plan.get("summary_lines", []),
             "recommended_count": len(task_plan.get("recommended_tasks", [])),
@@ -6824,6 +8948,24 @@ def build_router(
             "max_single_amount": round(float(max_single_amount or 0.0), 2),
         }
 
+    def _is_tail_window_task_signal(*texts: str) -> bool:
+        strong_patterns = (
+            "尾盘窗口",
+            "尾盘承接",
+            "尾盘潜伏",
+            "尾盘换仓",
+            "尾盘预案",
+            "临近收盘",
+            "收盘前",
+        )
+        for raw in texts:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            if any(pattern in text for pattern in strong_patterns):
+                return True
+        return False
+
     def _build_compose_brief_hint(
         trade_date: str,
         *,
@@ -6855,15 +8997,26 @@ def build_router(
         )
         workspace_context = _resolve_workspace_context_for_trade_date(trade_date)
         market_context = dict((workspace_context or {}).get("market_context") or {})
+        runtime_context = dict((workspace_context or {}).get("runtime_context") or {})
+        if not runtime_context:
+            runtime_context = _sanitize_json_compatible(serving_store.get_latest_runtime_context() or {})
         hot_sectors = [
             str(item).strip()
             for item in list((market_context.get("market_profile") or {}).get("hot_sectors") or [])
+            if str(item).strip()
+        ]
+        runtime_pool_symbols = [
+            str(item).strip()
+            for item in list(
+                (((runtime_context.get("pool") or {}).get("symbols")) or runtime_context.get("selected_symbols") or [])
+            )
             if str(item).strip()
         ]
         runtime_preferences = _resolve_compose_runtime_preferences()
         task = dict(task or {})
         position_context = dict(position_context or {})
         focus_sectors = list(dict.fromkeys([*focus_sectors, *hot_sectors]))[:5]
+        compose_symbol_pool = list(dict.fromkeys([*focus_symbols, *runtime_pool_symbols]))[:40]
         task_reason = str(task.get("task_reason") or "").strip()
         task_prompt = str(task.get("task_prompt") or "").strip()
         phase_code = str(task.get("phase_code") or "").strip()
@@ -6883,10 +9036,10 @@ def build_router(
             "agent": {"agent_id": agent_id, "role": "controller"},
             "trade_horizon": "intraday_to_overnight",
             "universe_scope": "main-board",
-            "symbol_pool": focus_symbols[:15],
+            "symbol_pool": compose_symbol_pool,
             "focus_sectors": focus_sectors,
             "excluded_theme_keywords": list(runtime_preferences.get("excluded_theme_keywords") or []),
-            "max_candidates": min(max(len(focus_symbols[:15]), 8), 15),
+            "max_candidates": min(max(len(compose_symbol_pool[:20]), 8), 15),
             "equity_position_limit": runtime_preferences.get("equity_position_limit"),
             "max_single_amount": runtime_preferences.get("max_single_amount"),
             "notes": [
@@ -6894,6 +9047,10 @@ def build_router(
                 "基本面只用于排雷，不单独作为主要进攻依据。",
             ],
         }
+        if len(runtime_pool_symbols) > len(focus_symbols):
+            base_payload["notes"].append(
+                f"已注入更宽的 runtime 候选宇宙 {len(compose_symbol_pool)} 只，避免只在 focus_pool 小样本里盲选。"
+            )
         if task_reason:
             base_payload["notes"].append("当前任务: " + task_reason)
         if task_prompt:
@@ -6947,7 +9104,9 @@ def build_router(
             near_full_position
             or position_count > 0 and ("替换" in task_reason or "换仓" in task_prompt or "做 T" in task_prompt or "持仓" in task_prompt)
         )
-        select_tail_ambush = phase_code == "tail_session" or "尾盘" in task_prompt or "尾盘" in task_reason
+        select_tail_ambush = phase_code == "tail_session" or (
+            not phase_code and _is_tail_window_task_signal(task_prompt, task_reason)
+        )
         select_defensive = "风险" in task_reason or "阻断" in task_prompt or "减仓" in task_prompt
         select_postclose = phase_code in {"post_close", "night_review"} or not is_trading_session(datetime.now())
 
@@ -7527,7 +9686,11 @@ def build_router(
             response["summary_lines"] = ["risk writeback skipped: no candidate cases"]
             return response
 
-        precheck = _build_execution_precheck(trade_date)
+        precheck = _build_execution_precheck(
+            trade_date,
+            candidate_case_ids=[case.case_id for case in scoped_cases],
+            ignore_discussion_gate_blockers=True,
+        )
         precheck_items = {
             str(item.get("symbol") or "").strip(): dict(item)
             for item in list(precheck.get("items") or [])
@@ -7655,6 +9818,17 @@ def build_router(
                 if int(opinion.round or 0) == resolved_round and opinion.agent_id in {"ashare-research", "ashare-strategy", "ashare-risk"}
             ]
             covered_agents = {opinion.agent_id for opinion in round_opinions}
+            support_votes = sum(1 for opinion in round_opinions if opinion.stance in {"support", "selected"})
+            blocking_votes = sum(1 for opinion in round_opinions if opinion.stance in {"question", "hold", "rejected"})
+            unresolved_round_issues = any(
+                list(opinion.remaining_disputes or []) or list(opinion.challenged_points or [])
+                for opinion in round_opinions
+            )
+            round_2_substantive_ready = bool(
+                resolved_round >= 2
+                and candidate_case_service
+                and candidate_case_service.round_2_has_substantive_response(case)
+            )
             reasons: list[str] = []
             key_evidence: list[str] = []
             evidence_gaps: list[str] = []
@@ -7664,6 +9838,24 @@ def build_router(
             if len(covered_agents) < 3:
                 _append_unique_text(reasons, "前置三席尚未全部完成本轮观点写回，审计先不放行")
                 _append_unique_text(evidence_gaps, "需先补齐 research / strategy / risk 本轮材料")
+            elif case.risk_gate == "reject":
+                stance = "hold"
+                confidence = "high"
+                _append_unique_text(reasons, "风控已给出 reject，审计不继续放行")
+                _append_unique_text(key_evidence, "risk_gate=reject")
+            elif (
+                resolved_round >= 2
+                and case.risk_gate == "allow"
+                and round_2_substantive_ready
+                and support_votes >= 2
+                and blocking_votes == 0
+                and not unresolved_round_issues
+            ):
+                stance = "support"
+                confidence = "high"
+                _append_unique_text(reasons, "Round 2 已形成实质回应，策略与风控形成执行多数，审计同意放行")
+                _append_unique_text(key_evidence, f"support_votes={support_votes} blocking_votes={blocking_votes}")
+                _append_unique_text(key_evidence, "risk_gate=allow")
             elif case.contradictions or (
                 case.round_1_summary.questions_for_round_2 and case.risk_gate != "allow"
             ):
@@ -7674,11 +9866,6 @@ def build_router(
                     _append_unique_text(key_evidence, item)
                 for item in list(case.round_1_summary.questions_for_round_2 or [])[:2]:
                     _append_unique_text(questions_to_others, item)
-            elif case.risk_gate == "reject":
-                stance = "hold"
-                confidence = "high"
-                _append_unique_text(reasons, "风控已给出 reject，审计不继续放行")
-                _append_unique_text(key_evidence, "risk_gate=reject")
             else:
                 stance = "support"
                 confidence = "medium"
@@ -7729,6 +9916,52 @@ def build_router(
                 cycle.updated_at = datetime.now().isoformat()
                 discussion_cycle_service._upsert(cycle)
         return response
+
+    def _refresh_strategy_dependent_writebacks(
+        trade_date: str,
+        *,
+        expected_round: int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "available": False,
+            "trade_date": trade_date,
+            "round": expected_round,
+            "risk": {},
+            "audit": {},
+            "refreshed_case_ids": [],
+        }
+        if not discussion_cycle_service or not candidate_case_service:
+            return payload
+        risk_response = _build_risk_auto_writeback(
+            trade_date,
+            expected_round=expected_round,
+            expected_agent_id="ashare-risk",
+            auto_rebuild=True,
+        )
+        audit_response = _build_audit_auto_writeback(
+            trade_date,
+            expected_round=expected_round,
+            expected_agent_id="ashare-audit",
+            auto_rebuild=True,
+        )
+        refreshed_case_ids = list(
+            dict.fromkeys(
+                [
+                    *[str(item) for item in list(risk_response.get("written_case_ids") or []) if str(item).strip()],
+                    *[str(item) for item in list(audit_response.get("written_case_ids") or []) if str(item).strip()],
+                ]
+            )
+        )
+        payload.update(
+            {
+                "available": bool(refreshed_case_ids),
+                "round": risk_response.get("round") or audit_response.get("round") or expected_round,
+                "risk": risk_response,
+                "audit": audit_response,
+                "refreshed_case_ids": refreshed_case_ids,
+            }
+        )
+        return payload
 
     def _handle_natural_language_adjustment(payload: NaturalLanguageAdjustmentInput) -> dict[str, Any]:
         if not parameter_service or not adjustment_interpreter:
@@ -7866,6 +10099,8 @@ def build_router(
         trade_date = str(payload.get("trade_date") or "").strip() or "-"
         phase = dict((payload.get("task_dispatch_plan") or {}).get("phase") or {})
         phase_label = str(phase.get("label") or "").strip() or "未知阶段"
+        mainline_stage = dict(payload.get("mainline_stage") or {})
+        autonomy_summary = dict(payload.get("autonomy_summary") or {})
         attention_items = [dict(item) for item in list(payload.get("attention_items") or [])]
         notify_items = [dict(item) for item in list(payload.get("notify_items") or [])]
         acknowledged_items = [dict(item) for item in list(payload.get("acknowledged_items") or [])]
@@ -7880,6 +10115,12 @@ def build_router(
         ]
         quality_summary_lines = [str(item).strip() for item in list(payload.get("quality_summary_lines") or []) if str(item).strip()]
         progress_blockers = [str(item).strip() for item in list(payload.get("progress_blockers") or []) if str(item).strip()]
+        if mainline_stage:
+            lines.append(
+                f"当前主线: {mainline_stage.get('label') or '-'} -> {mainline_stage.get('next_stage_code') or '-'}。"
+            )
+        if autonomy_summary.get("summary_line"):
+            lines.append("自治进度: " + str(autonomy_summary.get("summary_line")))
         if quality_summary_lines:
             lines.append("推进质量: " + "；".join(quality_summary_lines[:2]))
         if payload.get("escalated"):
@@ -7938,9 +10179,17 @@ def build_router(
         cadence = dict(payload.get("cadence") or {})
         client_brief = dict(payload.get("client_brief") or {})
         execution_dispatch = dict(payload.get("execution_dispatch") or {})
+        mainline_stage = dict(payload.get("mainline_stage") or {})
+        autonomy_summary = dict(payload.get("autonomy_summary") or {})
         lines = [
             f"交易台总览: trade_date={trade_date} selected={client_brief.get('selected_count', 0)} watchlist={client_brief.get('watchlist_count', 0)}。",
         ]
+        if mainline_stage:
+            lines.append(
+                f"当前主线: {mainline_stage.get('label') or '-'} -> {mainline_stage.get('next_stage_code') or '-'}。"
+            )
+        if autonomy_summary.get("summary_line"):
+            lines.append("自治进度: " + str(autonomy_summary.get("summary_line")))
         cadence_lines = [str(item).strip() for item in list(cadence.get("summary_lines") or []) if str(item).strip()]
         if cadence_lines:
             lines.append("节奏观察: " + "；".join(cadence_lines[:2]))
@@ -8115,7 +10364,7 @@ def build_router(
         watchlist_lines = [str(item).strip() for item in list(payload.get("watchlist_lines") or []) if str(item).strip()]
         overview_lines = [str(item).strip() for item in list(payload.get("overview_lines") or []) if str(item).strip()]
         lines = [
-            f"机会席位: selected={payload.get('selected_count', 0)} watchlist={payload.get('watchlist_count', 0)} rejected={payload.get('rejected_count', 0)}。",
+            f"机会票概览: selected={payload.get('selected_count', 0)} watchlist={payload.get('watchlist_count', 0)} rejected={payload.get('rejected_count', 0)}。",
         ]
         if selected_lines:
             lines.append("优先机会: " + "；".join(selected_lines[:3]))
@@ -8220,6 +10469,23 @@ def build_router(
             lines.append("可复核信号: 当前没有已落库的日内 T / 尾盘处理信号。")
         return lines
 
+    def _get_latest_position_watch_payload() -> dict[str, Any]:
+        if position_watch_state_store:
+            latest = dict(position_watch_state_store.get("latest_position_watch_scan", {}) or {})
+            if latest:
+                return latest
+        if not meeting_state_store:
+            return {}
+        return (
+            dict(meeting_state_store.get("latest_position_watch_scan", {}) or {})
+            or dict(meeting_state_store.get("latest_tail_market_scan", {}) or {})
+        )
+
+    def _get_latest_fast_opportunity_payload() -> dict[str, Any]:
+        if not position_watch_state_store:
+            return {}
+        return dict(position_watch_state_store.get("latest_fast_opportunity_scan", {}) or {})
+
     def _append_symbol_trade_advice_lines(answer_lines: list[str], advice: dict[str, Any], *, title_prefix: str = "交易台") -> None:
         answer_lines.append(
             f"{title_prefix}建议级别：{advice.get('recommendation_level')}，立场={advice.get('stance')}。"
@@ -8306,6 +10572,145 @@ def build_router(
                     f"日内/尾盘信号：{item.get('exit_reason') or 'signal'}，tags={','.join(str(tag) for tag in list(item.get('review_tags') or [])[:3]) or 'none'}。"
                 )
         return lines
+
+    def _normalize_feishu_bot_role(role: str | None) -> str:
+        normalized = str(role or "main").strip().lower()
+        if normalized in {"督办", "supervision", "monitor"}:
+            return "supervision"
+        if normalized in {"回执", "execution", "trade"}:
+            return "execution"
+        return "main"
+
+    def _looks_like_supervision_question(question: str) -> bool:
+        normalized = str(question or "").strip().lower()
+        markers = (
+            "督办",
+            "催办",
+            "超时",
+            "ack",
+            "收到催办",
+            "已处理",
+            "谁在忙",
+            "谁没工作",
+            "履职",
+            "监督",
+            "作业",
+            "怠工",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _looks_like_execution_question(question: str) -> bool:
+        normalized = str(question or "").strip().lower()
+        markers = (
+            "执行",
+            "回执",
+            "报单",
+            "下单",
+            "成交",
+            "撤单",
+            "桥接",
+            "预检",
+            "买入",
+            "卖出",
+            "持仓",
+            "仓位",
+            "做t",
+            "日内t",
+            "风控",
+            "阻断",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _build_feishu_role_redirect_answer(
+        *,
+        receiver_role: str,
+        target_role: str,
+        trade_date: str | None,
+        question: str,
+    ) -> dict[str, Any]:
+        role_labels = {
+            "main": "Hermes主控",
+            "supervision": "Hermes督办",
+            "execution": "Hermes回执",
+        }
+        target_refs = {
+            "main": ["/system/dashboard/mission-control", "/system/dashboard/opportunity-flow"],
+            "supervision": ["/system/agents/supervision-board", "/system/feishu/bots"],
+            "execution": ["/system/discussions/execution-precheck", "/system/discussions/execution-dispatch/latest"],
+        }
+        scope_lines = {
+            "main": "主控负责自然语言问答、状态查询、机会追问、持仓体检和调参预判。",
+            "supervision": "督办负责催办、ACK、作业追踪和超时升级。",
+            "execution": "回执负责预检结果、派发回执、成交撤单和桥接异常。",
+        }
+        answer_lines = [
+            f"当前接收机器人：{role_labels.get(receiver_role, receiver_role)}。",
+            f"这条问题更适合由 {role_labels.get(target_role, target_role)} 接手，我这边不抢答，避免同群职责混杂。",
+            scope_lines.get(target_role, "请切换到更匹配的机器人继续追问。"),
+            f"原问题已识别：{question}",
+        ]
+        return {
+            "topic": "handoff",
+            "trade_date": _resolve_reference_trade_date(trade_date),
+            "receiver_role": receiver_role,
+            "target_role": target_role,
+            "answer_lines": answer_lines,
+            "data_refs": target_refs.get(target_role, ["/system/feishu/bots"]),
+        }
+
+    def _build_symbol_desk_brief_payload(symbol: str, trade_date: str | None = None) -> dict[str, Any]:
+        facts = _build_symbol_fact_bundle(symbol, trade_date=trade_date)
+        facts["market_texture"] = _build_symbol_market_texture(symbol)
+        position_item = dict(facts.get("position_item") or {})
+        precheck_item = dict(facts.get("precheck_item") or {})
+        if position_item:
+            advice_topic = "holding_review"
+        elif precheck_item:
+            advice_topic = "replacement" if precheck_item.get("primary_blocker_label") else "position"
+        else:
+            advice_topic = "generic"
+        trade_advice = _build_symbol_trade_advice(facts, topic=advice_topic)
+        summary_lines = _build_symbol_common_brief_lines(facts)
+        blockers: list[str] = []
+        blocker_label = str(precheck_item.get("primary_blocker_label") or "").strip()
+        if blocker_label:
+            blockers.append(blocker_label)
+        if str(trade_advice.get("stance") or "") == "insufficient_evidence":
+            blockers.append("证据仍偏少，暂不宜给强交易结论。")
+        related_candidates = [
+            {
+                "symbol": item.get("symbol"),
+                "name": item.get("name"),
+                "final_status": item.get("final_status"),
+                "selected_reason": item.get("selected_reason"),
+                "risk_gate": item.get("risk_gate"),
+                "audit_gate": item.get("audit_gate"),
+            }
+            for item in list(facts.get("other_candidates") or [])
+        ]
+        return {
+            "trade_date": facts.get("trade_date"),
+            "symbol": symbol,
+            "name": facts.get("name") or symbol,
+            "summary_lines": summary_lines,
+            "trade_advice": trade_advice,
+            "blockers": blockers,
+            "risk_notes": list(trade_advice.get("risk_notes") or []),
+            "next_actions": list(trade_advice.get("next_actions") or []),
+            "trigger_conditions": list(trade_advice.get("trigger_conditions") or []),
+            "position": position_item,
+            "precheck_item": precheck_item,
+            "candidate_case": (
+                facts.get("candidate_case").model_dump()
+                if getattr(facts.get("candidate_case"), "model_dump", None)
+                else None
+            ),
+            "related_candidates": related_candidates,
+            "market_texture": facts.get("market_texture") or {},
+            "research": facts.get("research") or {},
+            "sector_relative": facts.get("sector_relative") or {},
+            "tail_review": facts.get("tail_review") or {},
+        }
 
     def _is_feishu_adjustment_request(text: str) -> bool:
         normalized = str(text or "").strip()
@@ -8422,7 +10827,7 @@ def build_router(
         )
         execution_reconciliation = meeting_state_store.get("latest_execution_reconciliation", {}) if meeting_state_store else {}
         position_item = _find_symbol_position_item(account_state, execution_reconciliation, symbol)
-        tail_market_latest = meeting_state_store.get("latest_tail_market_scan", {}) if meeting_state_store else {}
+        tail_market_latest = _get_latest_position_watch_payload()
         tail_review = _build_tail_market_review_summary(
             scan_payloads=[tail_market_latest] if tail_market_latest else [],
             symbol=symbol,
@@ -8689,8 +11094,140 @@ def build_router(
             return candidates[0]
         return None
 
-    def _looks_like_casual_chat(question: str) -> bool:
+    def _normalize_casual_chat_text(question: str) -> str:
         normalized = re.sub(r"\s+", "", str(question or "").lower())
+        normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "", normalized)
+        return normalized
+
+    def _split_hermes_answer_lines(text: str, limit: int = 6) -> list[str]:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return []
+        lines = [re.sub(r"\s+", " ", item).strip() for item in normalized.splitlines() if re.sub(r"\s+", " ", item).strip()]
+        if len(lines) == 1:
+            fragments = [
+                fragment.strip()
+                for fragment in re.split(r"(?<=[。！？!?])", lines[0])
+                if fragment.strip()
+            ]
+            if len(fragments) > 1:
+                lines = fragments
+        return lines[:limit]
+
+    def _requires_hermes_deep_reasoning(question: str) -> bool:
+        normalized = _normalize_casual_chat_text(question)
+        deep_markers = (
+            "分析",
+            "解释",
+            "原因",
+            "为什么",
+            "如何",
+            "方案",
+            "设计",
+            "评估",
+            "比较",
+            "推演",
+            "复盘",
+            "研究",
+            "策略",
+            "风控",
+            "执行",
+            "系统",
+            "架构",
+        )
+        if len(str(question or "").strip()) >= 60:
+            return True
+        return any(marker in normalized for marker in deep_markers)
+
+    def _try_hermes_free_chat(
+        question: str,
+        *,
+        trade_date: str | None = None,
+        bot_role: str = "main",
+        prefer_fast: bool = False,
+        require_deep_reasoning: bool = False,
+        context_lines: list[str] | None = None,
+    ) -> dict[str, Any]:
+        resolved_trade_date = _resolve_reference_trade_date(trade_date)
+        resolved_bot_role = _normalize_feishu_bot_role(bot_role)
+        role_labels = {
+            "main": "Hermes主控",
+            "supervision": "Hermes督办",
+            "execution": "Hermes回执",
+        }
+        role_label = role_labels.get(resolved_bot_role, "Hermes")
+        system_prompt = (
+            f"你是{role_label}，运行在 A 股交易控制面里。"
+            "当前任务是回答用户的自然语言问题，不要伪造行情、成交、仓位、策略结论。"
+            "如果上下文不足，就明确说明边界。"
+            "除非用户明确要求，不要输出卡片格式，也不要暴露密钥、内部令牌或敏感配置。"
+        )
+        role = "main"
+        task_kind = "chat"
+        risk_level = "low"
+        if resolved_bot_role == "supervision":
+            role = "runtime_scout"
+            task_kind = "summary" if not require_deep_reasoning else "research"
+            risk_level = "medium"
+        elif resolved_bot_role == "execution":
+            role = "execution_operator"
+            task_kind = "receipt" if not require_deep_reasoning else "execution"
+            risk_level = "medium" if not require_deep_reasoning else "high"
+        elif require_deep_reasoning:
+            role = "strategy_analyst"
+            task_kind = "research"
+            risk_level = "medium"
+        elif prefer_fast:
+            role = "runtime_scout"
+            task_kind = "receipt"
+        result = hermes_inference_client.complete(
+            question=question,
+            role=role,
+            task_kind=task_kind,
+            risk_level=risk_level,
+            prefer_fast=prefer_fast,
+            require_deep_reasoning=require_deep_reasoning,
+            system_prompt=system_prompt,
+            context_lines=[
+                f"参考交易日={resolved_trade_date}" if resolved_trade_date else "",
+                f"当前席位={role_label}",
+                *(context_lines or []),
+            ],
+            temperature=0.2,
+            max_tokens=420 if prefer_fast and not require_deep_reasoning else 720,
+        )
+        answer_lines = _split_hermes_answer_lines(result.text)
+        if not result.ok or not answer_lines:
+            return {"ok": False, "inference": result.to_dict()}
+        return {"ok": True, "answer_lines": answer_lines, "inference": result.to_dict()}
+
+    def _normalize_feishu_bot_alias(value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        normalized = re.sub(r"[\s·•\-_]+", "", normalized)
+        normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "", normalized)
+        return normalized
+
+    def _resolve_feishu_bot_aliases(
+        *,
+        bot_role: str = "main",
+        bot_name: str = "",
+        bot_id: str = "",
+    ) -> set[str]:
+        resolved_bot_role = _normalize_feishu_bot_role(bot_role)
+        aliases = {
+            _normalize_feishu_bot_alias(bot_name),
+            _normalize_feishu_bot_alias(bot_id),
+        }
+        role_aliases = {
+            "main": ("Hermes主控", "Hermes·主控", "主控", "量化主控"),
+            "supervision": ("Hermes督办", "Hermes·督办", "督办", "催办", "催办任务"),
+            "execution": ("Hermes回执", "Hermes·回执", "回执", "执行回执"),
+        }
+        aliases.update(_normalize_feishu_bot_alias(item) for item in role_aliases.get(resolved_bot_role, ()))
+        return {item for item in aliases if item}
+
+    def _looks_like_casual_chat(question: str) -> bool:
+        normalized = _normalize_casual_chat_text(question)
         if not normalized:
             return True
         casual_patterns = (
@@ -8714,14 +11251,32 @@ def build_router(
             "试试",
             "能聊天吗",
             "你是谁",
+            "你是哪里人",
+            "哪里人",
+            "真人吗",
+            "你是人吗",
+            "男的女的",
+            "你多大",
+            "几岁",
         )
         if normalized in casual_patterns:
             return True
-        short_casual_markers = ("谢谢你", "收到啦", "先这样", "晚点再说", "辛苦", "打扰了")
+        short_casual_markers = ("谢谢你", "收到啦", "先这样", "晚点再说", "辛苦", "打扰了", "哪里人", "真人", "天气")
         return any(marker in normalized for marker in short_casual_markers)
 
-    def _build_casual_chat_answer(question: str, trade_date: str | None = None) -> dict[str, Any]:
-        normalized = re.sub(r"\s+", "", str(question or "").lower())
+    def _build_casual_chat_answer(
+        question: str,
+        trade_date: str | None = None,
+        *,
+        bot_role: str = "main",
+    ) -> dict[str, Any]:
+        normalized = _normalize_casual_chat_text(question)
+        resolved_bot_role = _normalize_feishu_bot_role(bot_role)
+        role_identity_lines = {
+            "main": "我是 Hermes主控，负责状态查询、机会追问、持仓体检和调参预判。不是 OpenClaw 展示页里的旧称呼。",
+            "supervision": "我是 Hermes督办，负责催办、ACK、作业追踪和超时升级。",
+            "execution": "我是 Hermes回执，负责执行预检、派发回执、成交撤单和桥接异常。",
+        }
         answer_lines = ["我在。"]
         if any(keyword in normalized for keyword in ("谢谢", "多谢", "辛苦")):
             answer_lines = ["收到。你继续发问题或指令就行。"]
@@ -8730,13 +11285,374 @@ def build_router(
         elif any(keyword in normalized for keyword in ("测试", "试试", "在吗", "在不在")):
             answer_lines = ["在线。你可以直接发股票、参数指令、执行问题或随便聊两句。"]
         elif any(keyword in normalized for keyword in ("你是谁", "能聊天吗")):
-            answer_lines = ["我是量化交易台主控。闲聊可以，问到股票、仓位、执行、风控、研究时我会切到真实工具和协作链来回答。"]
+            answer_lines = [
+                role_identity_lines.get(resolved_bot_role, role_identity_lines["main"]),
+                "闲聊可以，问到股票、仓位、执行、风控、研究时我会切到真实工具和协作链来回答。",
+            ]
+        elif any(keyword in normalized for keyword in ("哪里人", "真人", "你是人吗", "男的女的", "多大", "几岁")):
+            answer_lines = [
+                role_identity_lines.get(resolved_bot_role, role_identity_lines["main"]),
+                "我是运行在交易系统里的机器人，不是自然人，没有籍贯、年龄和性别。",
+            ]
         return {
             "topic": "casual_chat",
             "trade_date": _resolve_reference_trade_date(trade_date),
             "question": question,
             "answer_lines": answer_lines,
             "data_refs": [],
+        }
+
+    def _looks_like_general_non_business_question(question: str) -> bool:
+        normalized = _normalize_casual_chat_text(question)
+        general_markers = (
+            "天气",
+            "下雨",
+            "温度",
+            "几度",
+            "冷不冷",
+            "热不热",
+            "几点",
+            "星期几",
+            "吃饭",
+            "睡觉",
+            "哪里玩",
+            "星星",
+            "太阳",
+            "月亮",
+            "宇宙",
+            "演唱会",
+            "空调",
+            "寿命",
+            "发光",
+            "地球",
+            "刘德华",
+        )
+        business_markers = (
+            "股票",
+            "个股",
+            "仓位",
+            "持仓",
+            "执行",
+            "回执",
+            "督办",
+            "主控",
+            "风控",
+            "买入",
+            "卖出",
+            "下单",
+            "成交",
+            "盯盘",
+            "调参",
+            "参数",
+            "策略",
+            "因子",
+            "agent",
+            "讨论",
+            "候选",
+            "机会",
+            "市场",
+            "盘面",
+            "评分",
+            "仓库",
+            "系统",
+            "qmt",
+            "飞书",
+        )
+        return any(marker in normalized for marker in general_markers) and not any(
+            marker in normalized for marker in business_markers
+        )
+
+    def _looks_like_general_reasoning_question(question: str) -> bool:
+        normalized = _normalize_casual_chat_text(question)
+        reasoning_markers = (
+            "是什么",
+            "为什么",
+            "如何",
+            "怎么理解",
+            "差别",
+            "区别",
+            "本质",
+            "原理",
+            "说明",
+            "举例",
+        )
+        runtime_markers = (
+            "今天",
+            "当前",
+            "现在",
+            "买",
+            "卖",
+            "下单",
+            "成交",
+            "持仓",
+            "仓位",
+            "候选",
+            "推荐",
+            "股票",
+            "个股",
+            "代码",
+            "盘面",
+            "市场",
+            "风控",
+            "参数",
+            "agent",
+            "讨论",
+            "cycle",
+            "桥接",
+            "机器人",
+            "飞书",
+        )
+        return any(marker in normalized for marker in reasoning_markers) and not any(
+            marker in normalized for marker in runtime_markers
+        )
+
+    def _looks_like_lightweight_general_chat(question: str) -> bool:
+        normalized = _normalize_casual_chat_text(question)
+        markers = (
+            "什么模型",
+            "用的什么模型",
+            "你用的是什么模型",
+            "会不会说话",
+            "会回答问题吗",
+            "不会说话",
+            "没反应",
+            "不回消息",
+            "不说话",
+            "说话呀",
+            "怎么不回答",
+            "怎么不说话",
+            "忽略我的消息",
+            "不发卡片",
+            "带个卡片",
+            "都带卡片",
+            "带卡片",
+            "你也带卡片",
+            "不会带卡片吧",
+            "为什么带卡片",
+            "我找你说说话",
+            "你呢",
+            "还是不太正常",
+            "太阳大还是月亮大",
+            "天上有多少星星",
+            "几点",
+            "星期几",
+            "天气",
+            "下雨",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _build_lightweight_general_chat_answer(
+        question: str,
+        trade_date: str | None = None,
+        *,
+        bot_role: str = "main",
+    ) -> dict[str, Any]:
+        normalized = _normalize_casual_chat_text(question)
+        resolved_bot_role = _normalize_feishu_bot_role(bot_role)
+        now = datetime.now()
+        answer_lines = ["我在。"]
+        data_refs: list[str] = []
+        if "模型" in normalized:
+            role_label = {
+                "main": "Hermes主控",
+                "supervision": "Hermes督办",
+                "execution": "Hermes回执",
+            }.get(resolved_bot_role, "Hermes")
+            answer_lines = [
+                f"{role_label} 当前走 Hermes 控制面问答链路。",
+                "控制台默认展示的模型槽位别名是 gpt-5.4，但这里不直接暴露底层 provider 机密配置。",
+            ]
+            data_refs = ["/dashboard/hermes/models"]
+        elif "几点" in normalized or "星期几" in normalized:
+            weekday_map = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+            answer_lines = [
+                f"现在是 {now.strftime('%Y-%m-%d %H:%M:%S')}。",
+                weekday_map[now.weekday()],
+            ]
+        elif "太阳大还是月亮大" in normalized:
+            answer_lines = [
+                "太阳大得多。",
+                "太阳直径约 139 万公里，月亮直径约 3475 公里。",
+            ]
+        elif "天上有多少星星" in normalized:
+            answer_lines = [
+                "肉眼在理想夜空通常能看到几千颗恒星。",
+                "如果算整个可观测宇宙，恒星数量大致在 10^22 到 10^24 量级。",
+            ]
+        elif "天气" in normalized or "下雨" in normalized:
+            answer_lines = [
+                "我这条轻量聊天链路没有接实时天气数据源。",
+                "问交易、状态、执行、仓位会更准；天气如果要精确回答，需要单独接天气接口。",
+            ]
+        elif "卡片" in normalized and any(
+            marker in normalized
+            for marker in (
+                "不发",
+                "带个",
+                "都带",
+                "带卡片",
+                "为什么",
+                "每次",
+                "不会带",
+                "你也带",
+            )
+        ):
+            answer_lines = [
+                "闲聊默认应该直接文字回复，不该每次都带卡片。",
+                "你刚才如果看到卡片，说明那条消息被误判成业务问答；现在已经切到轻量文本优先。",
+                "只有执行回执、风控阻断、讨论进展这类结构化结果，我才会发卡片。",
+            ]
+        elif "不发卡片" in normalized:
+            answer_lines = [
+                "我会说话，也能发卡片。",
+                "刚才如果你看到的是纯文本，多半是那条消息走了轻量回包或上一轮超时后的补回，不是功能被关掉。",
+            ]
+        elif any(
+            marker in normalized
+            for marker in (
+                "会不会说话",
+                "会回答问题吗",
+                "不会说话",
+                "没反应",
+                "不回消息",
+                "不说话",
+                "忽略我的消息",
+                "我找你说说话",
+                "你呢",
+                "还是不太正常",
+            )
+        ):
+            answer_lines = [
+                "会，我在。",
+                "刚才没及时回，多半是那条消息落进了重链路或碰上重启窗口，不是彻底失声。",
+            ]
+        elif "说话呀" in normalized or "怎么不回答" in normalized or "怎么不说话" in normalized:
+            answer_lines = [
+                "我在，已经收到。",
+                "你继续直接问就行，我会优先走轻量回答或真实业务链路。",
+            ]
+        elif answer_lines == ["我在。"]:
+            require_deep_reasoning = _requires_hermes_deep_reasoning(question)
+            llm_reply = _try_hermes_free_chat(
+                question,
+                trade_date=trade_date,
+                bot_role=resolved_bot_role,
+                prefer_fast=not require_deep_reasoning,
+                require_deep_reasoning=require_deep_reasoning,
+                context_lines=["这是通用自然语言问答；若缺少实时业务上下文，就按概念解释回答。"],
+            )
+            if llm_reply.get("ok"):
+                answer_lines = list(llm_reply.get("answer_lines") or [])
+                data_refs = ["/dashboard/hermes/chat"]
+        return {
+            "topic": "casual_chat",
+            "trade_date": _resolve_reference_trade_date(trade_date),
+            "question": question,
+            "answer_lines": answer_lines,
+            "data_refs": data_refs,
+            "prefer_plain_text": True,
+        }
+
+    def _looks_like_status_question(question: str) -> bool:
+        normalized = _normalize_casual_chat_text(question)
+        status_markers = ("状态", "总览", "概况", "现在", "盘面", "运行")
+        return any(marker in normalized for marker in status_markers)
+
+    def _build_open_ended_feishu_answer(
+        question: str,
+        trade_date: str | None = None,
+        *,
+        bot_role: str = "main",
+    ) -> dict[str, Any]:
+        resolved_trade_date = _resolve_reference_trade_date(trade_date)
+        resolved_bot_role = _normalize_feishu_bot_role(bot_role)
+        briefing = _build_feishu_briefing_payload(resolved_trade_date)
+        client_brief = _build_client_brief(resolved_trade_date) if resolved_trade_date and candidate_case_service else {}
+        supervision = _build_agent_supervision_payload(resolved_trade_date) if resolved_bot_role == "supervision" else {}
+        execution_precheck = _build_execution_precheck(resolved_trade_date) if resolved_bot_role == "execution" else {}
+        llm_context_lines: list[str] = []
+        llm_context_lines.extend(list((briefing.get("summary_lines") or [])[:4]))
+        if client_brief:
+            llm_context_lines.append(
+                "讨论概况="
+                f"selected={client_brief.get('selected_count', 0)} "
+                f"watchlist={client_brief.get('watchlist_count', 0)} "
+                f"rejected={client_brief.get('rejected_count', 0)}"
+            )
+        if supervision:
+            llm_context_lines.extend(list((supervision.get("summary_lines") or [])[:3]))
+        if execution_precheck:
+            llm_context_lines.extend(list((execution_precheck.get("summary_lines") or [])[:3]))
+        data_refs = [
+            (
+                f"/system/feishu/briefing?trade_date={resolved_trade_date}"
+                if resolved_trade_date
+                else "/system/feishu/briefing"
+            ),
+            "/system/dashboard/mission-control",
+        ]
+        if resolved_bot_role == "supervision":
+            data_refs = [f"/system/agents/supervision-board?trade_date={resolved_trade_date}&overdue_after_seconds=180"]
+        elif resolved_bot_role == "execution":
+            data_refs = [
+                f"/system/discussions/execution-precheck?trade_date={resolved_trade_date}",
+                f"/system/discussions/execution-dispatch/latest?trade_date={resolved_trade_date}",
+            ]
+        llm_reply = _try_hermes_free_chat(
+            question,
+            trade_date=resolved_trade_date,
+            bot_role=resolved_bot_role,
+            prefer_fast=False,
+            require_deep_reasoning=_requires_hermes_deep_reasoning(question) or resolved_bot_role != "main",
+            context_lines=llm_context_lines,
+        )
+        if llm_reply.get("ok"):
+            return {
+                "topic": "open_chat",
+                "trade_date": resolved_trade_date,
+                "question": question,
+                "bot_role": resolved_bot_role,
+                "answer_lines": list(llm_reply.get("answer_lines") or []),
+                "data_refs": data_refs,
+                "briefing": briefing,
+                "client_brief": client_brief,
+                "inference": llm_reply.get("inference") or {},
+                "prefer_plain_text": True,
+            }
+        role_openers = {
+            "main": "这句没有命中固定交易动作，我先按主控自由回答。",
+            "supervision": "这句没有命中固定督办口令，我先按督办视角自由回答。",
+            "execution": "这句没有命中固定执行口令，我先按回执视角自由回答。",
+        }
+        role_closers = {
+            "main": "如果你要继续深挖，直接追问某只票、某个阻断、某个 agent，或直接下调参/执行指令。",
+            "supervision": "如果你要落到督办动作，直接说谁超时了、谁要 ACK、哪条作业要催办。",
+            "execution": "如果你要落到执行动作，直接说为什么没买、这只票能不能上、当前有哪些阻断或挂单异常。",
+        }
+        answer_lines = [role_openers.get(resolved_bot_role, role_openers["main"])]
+        if resolved_bot_role == "supervision":
+            answer_lines.extend(_build_supervision_answer_lines(supervision)[:3])
+        elif resolved_bot_role == "execution":
+            answer_lines.extend(_build_execution_answer_lines(execution_precheck, _get_execution_dispatch_payload(resolved_trade_date))[:3])
+        else:
+            answer_lines.extend(_build_status_answer_lines(briefing)[:3])
+            if client_brief:
+                answer_lines.append(
+                    "机会面: "
+                    f"selected={client_brief.get('selected_count', 0)} "
+                    f"watchlist={client_brief.get('watchlist_count', 0)} "
+                    f"rejected={client_brief.get('rejected_count', 0)}。"
+                )
+        answer_lines.append(role_closers.get(resolved_bot_role, role_closers["main"]))
+        return {
+            "topic": "open_chat",
+            "trade_date": resolved_trade_date,
+            "question": question,
+            "bot_role": resolved_bot_role,
+            "answer_lines": answer_lines,
+            "data_refs": data_refs,
+            "briefing": briefing,
+            "client_brief": client_brief,
         }
 
     def _build_symbol_market_texture(symbol: str) -> dict[str, Any]:
@@ -9037,12 +11953,293 @@ def build_router(
         payload["trade_advice"] = advice
         return payload
 
-    def _answer_feishu_question(question: str, trade_date: str | None = None) -> dict[str, Any]:
-        resolved_trade_date = _resolve_reference_trade_date(trade_date)
+    def _looks_like_discussion_bootstrap_command(question: str) -> bool:
         normalized = str(question or "").strip().lower()
-        topic = "help"
+        if not normalized:
+            return False
+        explicit_phrases = (
+            "开始今日选股",
+            "启动今日选股",
+            "开始选股",
+            "启动选股",
+            "开始今日流程",
+            "启动今日流程",
+            "开始今天流程",
+            "启动今天流程",
+            "开始讨论",
+            "启动讨论",
+            "开始今日讨论",
+            "启动今日讨论",
+            "开始吧",
+            "启动吧",
+            "启动一下",
+            "开始一下",
+            "那你启动啊",
+            "你启动啊",
+        )
+        if any(token in normalized for token in explicit_phrases):
+            return True
+        action_tokens = ("启动", "开始", "安排", "跑起来", "推起来")
+        subject_tokens = ("选股", "流程", "讨论", "机会池", "cycle", "round")
+        return any(token in normalized for token in action_tokens) and any(token in normalized for token in subject_tokens)
+
+    def _looks_like_market_watch_command(question: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(question or "").lower())
+        if not normalized:
+            return False
+        explicit_phrases = (
+            "盯盘",
+            "盯一下盘面",
+            "盯着盘面",
+            "看盘",
+            "看着盘面",
+            "帮我盯着",
+            "你先盯着",
+            "你先自己盯一下盘面",
+            "有异常直接安排",
+            "有情况直接安排",
+            "有异动直接安排",
+            "发现异常直接安排",
+            "异常直接处理",
+            "异常你就安排",
+        )
+        if any(token in normalized for token in explicit_phrases):
+            return True
+        watch_tokens = ("盯", "看着", "照看", "安排", "处理")
+        market_tokens = ("盘面", "行情", "市场", "盘中", "盯盘")
+        return any(token in normalized for token in watch_tokens) and any(token in normalized for token in market_tokens)
+
+    def _prepare_feishu_discussion_runtime(trade_date: str | None = None) -> dict[str, Any]:
+        resolved_trade_date = _resolve_reference_trade_date(trade_date) or datetime.now().date().isoformat()
+        if not candidate_case_service or not discussion_cycle_service:
+            return {
+                "trade_date": resolved_trade_date,
+                "service_ready": False,
+                "cases_available": False,
+                "case_count": 0,
+                "cycle_before_exists": False,
+                "round_started": False,
+                "cycle": None,
+                "brief": {},
+            }
+
+        cases = candidate_case_service.list_cases(trade_date=resolved_trade_date, limit=500)
+        if not cases:
+            return {
+                "trade_date": resolved_trade_date,
+                "service_ready": True,
+                "cases_available": False,
+                "case_count": 0,
+                "cycle_before_exists": False,
+                "round_started": False,
+                "cycle": None,
+                "brief": {},
+            }
+
+        cycle_before = discussion_cycle_service.get_cycle(resolved_trade_date)
+        cycle = cycle_before or discussion_cycle_service.bootstrap_cycle(resolved_trade_date)
+        round_started = False
+        if str(cycle.discussion_state or "").strip() == "idle":
+            cycle = discussion_cycle_service.start_round(resolved_trade_date, 1)
+            round_started = True
+        _persist_discussion_context(_build_discussion_context_payload(resolved_trade_date, cycle_payload=cycle.model_dump()))
+        brief = _build_client_brief(resolved_trade_date)
+        return {
+            "trade_date": resolved_trade_date,
+            "service_ready": True,
+            "cases_available": True,
+            "case_count": len(cases),
+            "cycle_before_exists": cycle_before is not None,
+            "round_started": round_started,
+            "cycle": cycle,
+            "brief": brief,
+        }
+
+    def _execute_feishu_discussion_bootstrap(question: str, trade_date: str | None = None) -> dict[str, Any]:
+        if not _looks_like_discussion_bootstrap_command(question):
+            return {"matched": False}
+        runtime = _prepare_feishu_discussion_runtime(trade_date)
+        resolved_trade_date = str(runtime.get("trade_date") or datetime.now().date().isoformat())
+        if not runtime.get("service_ready"):
+            return {
+                "matched": True,
+                "ok": False,
+                "topic": "action",
+                "trade_date": resolved_trade_date,
+                "reply_lines": ["当前 discussion 服务未初始化，无法执行今日流程启动。"],
+                "data_refs": [],
+            }
+        if not runtime.get("cases_available"):
+            return {
+                "matched": True,
+                "ok": False,
+                "topic": "action",
+                "trade_date": resolved_trade_date,
+                "reply_lines": [
+                    f"{resolved_trade_date} 还没有候选池数据，当前无法直接启动讨论流程。",
+                    "先补 runtime 候选刷新，再启动 discussion cycle。",
+                ],
+                "data_refs": ["/dashboard/overview"],
+            }
+
+        cycle = runtime.get("cycle")
+        brief = dict(runtime.get("brief") or {})
+        cycle_before_exists = bool(runtime.get("cycle_before_exists"))
+        round_started = bool(runtime.get("round_started"))
+        selected_preview = [str(item).strip() for item in list(brief.get("selected_display") or []) if str(item).strip()]
+        watchlist_preview = [str(item).strip() for item in list(brief.get("watchlist_display") or []) if str(item).strip()]
+        reply_lines = [
+            f"已按当前真实运行态检查并接管 {resolved_trade_date} 的选股流程。",
+            (
+                "discussion cycle 已初始化并启动 round 1。"
+                if not cycle_before_exists and round_started
+                else "discussion cycle 已初始化。"
+                if not cycle_before_exists
+                else "当前 discussion cycle 已存在，已按现状继续推进。"
+            ),
+            (
+                f"当前阶段: pool={cycle.pool_state} discussion={cycle.discussion_state} round={int(cycle.current_round or 0)}。"
+            ),
+            f"候选概览: selected={brief.get('selected_count', 0)} watchlist={brief.get('watchlist_count', 0)} rejected={brief.get('rejected_count', 0)}。",
+        ]
+        if selected_preview:
+            reply_lines.append("当前优先票: " + "；".join(selected_preview[:3]))
+        if watchlist_preview:
+            reply_lines.append("观察票: " + "；".join(watchlist_preview[:3]))
+        return {
+            "matched": True,
+            "ok": True,
+            "topic": "action",
+            "trade_date": resolved_trade_date,
+            "cycle": _serialize_cycle_compact(cycle),
+            "client_brief": brief,
+            "reply_lines": reply_lines,
+            "answer_lines": reply_lines,
+            "data_refs": [
+                f"/system/discussions/client-brief?trade_date={resolved_trade_date}",
+                f"/system/discussions/cycles/{resolved_trade_date}",
+            ],
+        }
+
+    def _execute_feishu_market_watch_command(question: str, trade_date: str | None = None) -> dict[str, Any]:
+        if not _looks_like_market_watch_command(question):
+            return {"matched": False}
+        runtime = _prepare_feishu_discussion_runtime(trade_date)
+        resolved_trade_date = str(runtime.get("trade_date") or datetime.now().date().isoformat())
+        supervision = _build_agent_supervision_payload(resolved_trade_date)
+        reply_lines = [
+            f"已接管 {resolved_trade_date} 的盘中盯盘与异常联动。",
+        ]
+        if not runtime.get("service_ready"):
+            reply_lines.append("当前 discussion 服务未初始化，我先保留监控与催办口径，但还无法自动推进今日讨论。")
+            data_refs = ["/system/agents/supervision-board"]
+            return {
+                "matched": True,
+                "ok": False,
+                "topic": "action",
+                "trade_date": resolved_trade_date,
+                "reply_lines": reply_lines,
+                "answer_lines": reply_lines,
+                "data_refs": data_refs,
+            }
+
+        if runtime.get("cases_available"):
+            cycle = runtime.get("cycle")
+            brief = dict(runtime.get("brief") or {})
+            reply_lines.append(
+                f"当前阶段: pool={cycle.pool_state} discussion={cycle.discussion_state} round={int(cycle.current_round or 0)}。"
+            )
+            reply_lines.append(
+                f"候选概览: selected={brief.get('selected_count', 0)} watchlist={brief.get('watchlist_count', 0)} rejected={brief.get('rejected_count', 0)}。"
+            )
+            selected_preview = [str(item).strip() for item in list(brief.get("selected_display") or []) if str(item).strip()]
+            if selected_preview:
+                reply_lines.append("当前优先票: " + "；".join(selected_preview[:3]))
+        else:
+            reply_lines.append("当前候选池还没生成，先维持运行监控、监督催办和执行看门。")
+
+        notify_items = [dict(item) for item in list(supervision.get("notify_items") or [])]
+        attention_items = [dict(item) for item in list(supervision.get("attention_items") or [])]
+        if notify_items:
+            lead = notify_items[0]
+            reply_lines.append(
+                f"当前催办: {lead.get('agent_id')} {lead.get('supervision_tier') or lead.get('status') or '待处理'}。"
+            )
+        elif attention_items:
+            lead = attention_items[0]
+            reply_lines.append(f"监督关注: {lead.get('agent_id')} {lead.get('status') or 'attention'}。")
+        else:
+            reply_lines.append("当前自动监督与风控巡检保持开启。")
+        reply_lines.append("如出现新候选、风控阻断或执行异常，我会按现有流程继续推进并回写。")
+        return {
+            "matched": True,
+            "ok": True,
+            "topic": "action",
+            "trade_date": resolved_trade_date,
+            "cycle": _serialize_cycle_compact(runtime.get("cycle")) if runtime.get("cycle") else None,
+            "client_brief": dict(runtime.get("brief") or {}),
+            "supervision": supervision,
+            "reply_lines": reply_lines,
+            "answer_lines": reply_lines,
+            "data_refs": [
+                f"/system/discussions/client-brief?trade_date={resolved_trade_date}",
+                f"/system/agents/supervision-board?trade_date={resolved_trade_date}&overdue_after_seconds=180",
+            ],
+        }
+
+    def _answer_feishu_question(
+        question: str,
+        trade_date: str | None = None,
+        *,
+        bot_role: str = "main",
+    ) -> dict[str, Any]:
+        resolved_trade_date = _resolve_reference_trade_date(trade_date)
+        resolved_bot_role = _normalize_feishu_bot_role(bot_role)
+        normalized = str(question or "").strip().lower()
+        topic = "status"
+        if resolved_bot_role != "main" and (
+            _looks_like_discussion_bootstrap_command(question) or _looks_like_market_watch_command(question)
+        ):
+            return _build_feishu_role_redirect_answer(
+                receiver_role=resolved_bot_role,
+                target_role="main",
+                trade_date=resolved_trade_date,
+                question=question,
+            )
+        if resolved_bot_role == "main":
+            command_result = _execute_feishu_discussion_bootstrap(question, trade_date=resolved_trade_date)
+            if command_result.get("matched"):
+                return command_result
+            market_watch_result = _execute_feishu_market_watch_command(question, trade_date=resolved_trade_date)
+            if market_watch_result.get("matched"):
+                return market_watch_result
         if _looks_like_casual_chat(question):
-            return _build_casual_chat_answer(question, trade_date=resolved_trade_date)
+            return _build_casual_chat_answer(question, trade_date=resolved_trade_date, bot_role=resolved_bot_role)
+        if _looks_like_lightweight_general_chat(question):
+            return _build_lightweight_general_chat_answer(
+                question,
+                trade_date=resolved_trade_date,
+                bot_role=resolved_bot_role,
+            )
+        if _looks_like_general_non_business_question(question):
+            return _build_lightweight_general_chat_answer(
+                question,
+                trade_date=resolved_trade_date,
+                bot_role=resolved_bot_role,
+            )
+        if _looks_like_general_reasoning_question(question):
+            return _build_lightweight_general_chat_answer(
+                question,
+                trade_date=resolved_trade_date,
+                bot_role=resolved_bot_role,
+            )
+        if resolved_bot_role != "main" and _looks_like_general_non_business_question(question):
+            return _build_feishu_role_redirect_answer(
+                receiver_role=resolved_bot_role,
+                target_role="main",
+                trade_date=resolved_trade_date,
+                question=question,
+            )
         symbol_analysis = _build_symbol_analysis_answer(question, trade_date=resolved_trade_date)
         symbol_semantic_topic = None
         if any(keyword in normalized for keyword in ("持仓复核", "持仓明细", "当前持仓", "有哪些持仓", "持仓列表")):
@@ -9076,7 +12273,7 @@ def build_router(
             and any(keyword in normalized for keyword in ("推荐", "方向", "机会", "优先"))
         ):
             topic = "sandbox"
-        elif any(keyword in normalized for keyword in ("执行", "回执", "报单", "下单", "成交", "预演")):
+        elif any(keyword in normalized for keyword in ("执行", "回执", "报单", "下单", "成交", "预演", "没买入", "没有买入", "为什么没有买入", "为什么没买")):
             topic = "execution"
         elif any(keyword in normalized for keyword in ("持仓复核", "持仓明细", "当前持仓", "有哪些持仓", "持仓列表")):
             topic = "holding_review"
@@ -9100,16 +12297,60 @@ def build_router(
             topic = "params"
         elif any(keyword in normalized for keyword in ("评分", "分数", "考核", "权重", "agent")):
             topic = "scores"
+        elif any(keyword in normalized for keyword in ("推荐股票", "推荐的什么股票", "什么股票", "机会票", "新机会", "优先票")):
+            topic = "opportunity"
         elif any(keyword in normalized for keyword in ("推荐", "候选", "讨论", "观察", "淘汰", "入选", "机会票", "新机会")):
             topic = "discussion"
         elif any(keyword in normalized for keyword in ("状态", "总览", "概况", "现在", "盘面", "运行")):
             topic = "status"
         elif any(keyword in normalized for keyword in ("能做什么", "会什么", "怎么用", "帮什么", "支持什么")):
-            topic = "help"
+            topic = "capabilities"
+
+        if topic == "status" and not _looks_like_status_question(question):
+            return _build_open_ended_feishu_answer(
+                question,
+                trade_date=resolved_trade_date,
+                bot_role=resolved_bot_role,
+            )
+
+        if resolved_bot_role == "supervision":
+            if topic == "status":
+                topic = "supervision"
+            elif topic in {"execution", "risk", "position", "holding_review", "day_trading", "replacement"}:
+                return _build_feishu_role_redirect_answer(
+                    receiver_role=resolved_bot_role,
+                    target_role="execution",
+                    trade_date=resolved_trade_date,
+                    question=question,
+                )
+            elif topic not in {"supervision", "cycle", "capabilities"} and not _looks_like_supervision_question(question):
+                return _build_feishu_role_redirect_answer(
+                    receiver_role=resolved_bot_role,
+                    target_role="main",
+                    trade_date=resolved_trade_date,
+                    question=question,
+                )
+        elif resolved_bot_role == "execution":
+            if topic == "status":
+                topic = "execution"
+            elif topic == "supervision" or _looks_like_supervision_question(question):
+                return _build_feishu_role_redirect_answer(
+                    receiver_role=resolved_bot_role,
+                    target_role="supervision",
+                    trade_date=resolved_trade_date,
+                    question=question,
+                )
+            elif topic not in {"execution", "risk", "position", "holding_review", "day_trading", "replacement", "capabilities"} and not _looks_like_execution_question(question):
+                return _build_feishu_role_redirect_answer(
+                    receiver_role=resolved_bot_role,
+                    target_role="main",
+                    trade_date=resolved_trade_date,
+                    question=question,
+                )
 
         answer_lines: list[str] = []
         data_refs: list[str] = []
-        payload: dict[str, Any] = {"topic": topic, "trade_date": resolved_trade_date}
+        payload: dict[str, Any] = {"topic": topic, "trade_date": resolved_trade_date, "bot_role": resolved_bot_role}
 
         if topic == "status":
             briefing = _build_feishu_briefing_payload(resolved_trade_date)
@@ -9195,7 +12436,7 @@ def build_router(
             payload["account_state"] = account_state
             payload["execution_reconciliation"] = latest_reconciliation
         elif topic == "day_trading":
-            latest_tail_market = meeting_state_store.get("latest_tail_market_scan", {}) if meeting_state_store else {}
+            latest_tail_market = _get_latest_position_watch_payload()
             tail_review = _build_tail_market_review_section(source="latest", limit=5)
             answer_lines = _build_day_trading_answer_lines(latest_tail_market, tail_review)
             data_refs = [
@@ -9288,16 +12529,66 @@ def build_router(
             answer_lines = _build_scores_answer_lines(scores)
             data_refs = [f"/system/agent-scores?score_date={score_date}"]
             payload["scores"] = scores
-        else:
-            rights = _build_feishu_rights_payload(resolved_trade_date)
+        elif topic == "capabilities":
+            briefing = _build_feishu_briefing_payload(resolved_trade_date)
+            client_brief = _build_client_brief(resolved_trade_date) if resolved_trade_date and candidate_case_service else {}
             answer_lines = [
-                "我不是固定五类主题问答器。你可以直接问状态、执行、风控、参数、agent 活跃度、研究结论、机会票，也可以随手点名一只股票让我临时体检。",
-                "如果你点名某只股票，我会优先组合研究、策略、风控、执行预检、持仓与日内信号来回答，而不是只回固定分类口径。",
-                "你也可以直接下自然语言指令调参，例如：把测试仓位改到三成、今天先不买白酒股、逆回购保留改成 0。",
-                "如果你只是闲聊、问候或测试在线状态，我也会自然回复；遇到交易问题再切到真实工具和协作链。",
+                (
+                    "主控负责自然语言问答、状态查询、机会追问、持仓体检与调参预判。"
+                    if resolved_bot_role == "main"
+                    else (
+                        "督办负责催办、ACK、作业追踪与超时升级。"
+                        if resolved_bot_role == "supervision"
+                        else "回执负责预检结果、执行派发、成交撤单与桥接异常。"
+                    )
+                ),
+                "我会先查真实状态，再给结论、依据、卡点和下一步。",
+                *[str(line).strip() for line in list(briefing.get("summary_lines") or [])[:2] if str(line).strip()],
+                (
+                    f"当前候选概览: selected={client_brief.get('selected_count', 0)} "
+                    f"watchlist={client_brief.get('watchlist_count', 0)} rejected={client_brief.get('rejected_count', 0)}。"
+                    if client_brief
+                    else "当前还没有可复述的候选概览。"
+                ),
+                (
+                    "你可以直接说：开始今日选股、为什么今天没买、看下某只票、把仓位调到四成。"
+                    if resolved_bot_role == "main"
+                    else (
+                        "你可以直接说：谁超时了、研究收到催办、风控已处理。"
+                        if resolved_bot_role == "supervision"
+                        else "你可以直接说：今天为什么没买、现在有哪些阻断、这只持仓要不要做T。"
+                    )
+                ),
             ]
-            data_refs = rights.get("data_refs", [])
-            payload["rights"] = rights
+            data_refs = [
+                (
+                    f"/system/feishu/briefing?trade_date={resolved_trade_date}"
+                    if resolved_trade_date
+                    else "/system/feishu/briefing"
+                ),
+                (
+                    f"/system/discussions/client-brief?trade_date={resolved_trade_date}"
+                    if resolved_trade_date
+                    else "/system/discussions/client-brief"
+                ),
+            ]
+            payload["briefing"] = briefing
+            payload["client_brief"] = client_brief
+        else:
+            briefing = _build_feishu_briefing_payload(resolved_trade_date)
+            answer_lines = [
+                "我先按当前真实运行态给你状态摘要。",
+                *[str(line).strip() for line in list(briefing.get("summary_lines") or [])[:3] if str(line).strip()],
+            ]
+            data_refs = [
+                (
+                    f"/system/feishu/briefing?trade_date={resolved_trade_date}"
+                    if resolved_trade_date
+                    else "/system/feishu/briefing"
+                ),
+                "/system/dashboard/mission-control",
+            ]
+            payload["briefing"] = briefing
 
         if not answer_lines:
             answer_lines = ["当前没有足够真实数据回答这个问题。"]
@@ -9554,18 +12845,49 @@ def build_router(
             "reply_lines": [],
         }
 
-    def _is_feishu_message_addressed(payload: dict[str, Any], text: str = "") -> bool:
+    def _is_feishu_message_addressed(
+        payload: dict[str, Any],
+        text: str = "",
+        *,
+        bot_role: str = "main",
+        bot_name: str = "",
+        bot_id: str = "",
+        bot_app_id: str = "",
+    ) -> tuple[bool, str]:
         message = (payload.get("event") or {}).get("message") or {}
         chat_type = str(message.get("chat_type") or "").strip().lower()
         if chat_type in {"p2p", "single", "private"}:
-            return True
+            return True, "direct_message"
+        aliases = _resolve_feishu_bot_aliases(bot_role=bot_role, bot_name=bot_name, bot_id=bot_id)
+        legacy_single_bot_mode = not str(bot_name or "").strip() and not str(bot_id or "").strip()
         mentions = message.get("mentions") or []
         for item in mentions:
-            if str((item or {}).get("mentioned_type") or "").strip().lower() == "bot":
-                return True
-        if re.match(r"^\s*@\S+", str(text or "")):
-            return True
-        return "@_user_" in str(text or "")
+            mention_kind = str((item or {}).get("mentioned_type") or "").strip().lower()
+            if mention_kind and mention_kind not in {"bot", "app"}:
+                continue
+            if legacy_single_bot_mode:
+                return True, "legacy_single_bot_mode"
+            mention_candidates = [
+                str((item or {}).get("name") or "").strip(),
+                str((item or {}).get("key") or "").strip(),
+                str((item or {}).get("open_id") or "").strip(),
+                str(((item or {}).get("id") or {}).get("open_id") or "").strip(),
+                str(((item or {}).get("id") or {}).get("user_id") or "").strip(),
+                str(((item or {}).get("id") or {}).get("union_id") or "").strip(),
+                str((item or {}).get("user_id") or "").strip(),
+                str((item or {}).get("union_id") or "").strip(),
+                str((item or {}).get("id") or "").strip(),
+            ]
+            if any(_normalize_feishu_bot_alias(candidate) in aliases for candidate in mention_candidates if candidate):
+                return True, "mention_alias_matched"
+        literal_match = re.match(r"^\s*@([^\s:：，,]+)", str(text or ""))
+        if literal_match and legacy_single_bot_mode:
+            return True, "literal_mention_legacy_mode"
+        if literal_match and _normalize_feishu_bot_alias(literal_match.group(1)) in aliases:
+            return True, "literal_mention_alias_matched"
+        if mentions:
+            return False, "mention_not_for_current_bot"
+        return False, "no_bot_mention_detected"
 
     def _normalize_feishu_question_text(payload: dict[str, Any], text: str) -> str:
         normalized = str(text or "")
@@ -9587,11 +12909,44 @@ def build_router(
         question: str,
         trade_date: str | None = None,
         *,
+        bot_role: str = "main",
+        bot_name: str = "",
         control_plane_base_url: str | None = None,
+        answer: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        answer = _answer_feishu_question(question, trade_date=trade_date)
+        resolved_bot_role = _normalize_feishu_bot_role(bot_role)
+        role_labels = {
+            "main": "Hermes主控",
+            "supervision": "Hermes督办",
+            "execution": "Hermes回执",
+        }
+        topic_labels = {
+            "action": "动作执行",
+            "symbol_analysis": "个股体检",
+            "position": "仓位复核",
+            "holding_review": "持仓复核",
+            "day_trading": "做T复核",
+            "opportunity": "机会追问",
+            "discussion": "讨论进展",
+            "execution": "执行回执",
+            "risk": "风控阻断",
+            "supervision": "监督催办",
+            "research": "研究结论",
+            "sandbox": "夜间沙盘",
+            "params": "调参与治理",
+            "scores": "Agent 评分",
+            "status": "运行状态",
+            "capabilities": "能力说明",
+            "handoff": "职责转交",
+            "casual_chat": "即时对话",
+            "open_chat": "自由回答",
+            "cycle": "讨论周期",
+        }
+        answer = dict(answer or _answer_feishu_question(question, trade_date=trade_date, bot_role=resolved_bot_role))
         answer_lines = [str(line or "").strip() for line in answer.get("answer_lines", []) if str(line or "").strip()]
         trade_advice = dict(answer.get("trade_advice") or {})
+        topic_key = str(answer.get("topic") or "status")
+        prefer_plain_text = bool(answer.get("prefer_plain_text")) or topic_key in {"casual_chat", "open_chat"}
         reply_lines: list[str] = []
         if answer.get("symbol"):
             name = str(answer.get("name") or answer.get("symbol") or "").strip()
@@ -9616,7 +12971,7 @@ def build_router(
         elif str(answer.get("topic") or "") == "opportunity":
             brief = dict(answer.get("client_brief") or {})
             reply_lines.append(
-                "交易台机会卡: "
+                "机会票概览: "
                 f"selected={brief.get('selected_count', 0)} watchlist={brief.get('watchlist_count', 0)} rejected={brief.get('rejected_count', 0)}"
             )
             selected_lines = [str(item).strip() for item in list(brief.get("selected_lines") or []) if str(item).strip()]
@@ -9703,12 +13058,21 @@ def build_router(
             cadence = dict(briefing.get("cadence") or {})
             client_brief = dict(briefing.get("client_brief") or {})
             execution_dispatch = dict(briefing.get("execution_dispatch") or {})
+            mainline_stage = dict(briefing.get("mainline_stage") or {})
+            autonomy_summary = dict(briefing.get("autonomy_summary") or {})
             reply_lines.append(
                 "交易台状态卡: "
                 f"trade_date={briefing.get('trade_date') or '-'} "
                 f"selected={client_brief.get('selected_count', 0)} "
                 f"watchlist={client_brief.get('watchlist_count', 0)}"
             )
+            if mainline_stage:
+                reply_lines.append(
+                    "当前主线: "
+                    f"{mainline_stage.get('label') or '-'} -> {mainline_stage.get('next_stage_code') or '-'}"
+                )
+            if autonomy_summary.get("summary_line"):
+                reply_lines.append("自治进度: " + str(autonomy_summary.get("summary_line")))
             if cadence.get("summary_lines"):
                 reply_lines.append("节奏: " + "；".join(str(item).strip() for item in list(cadence.get("summary_lines") or [])[:2] if str(item).strip()))
             if execution_dispatch:
@@ -9778,10 +13142,19 @@ def build_router(
             supervision = dict(answer.get("supervision") or {})
             attention_items = [dict(item) for item in list(supervision.get("attention_items") or [])]
             notify_items = [dict(item) for item in list(supervision.get("notify_items") or [])]
+            mainline_stage = dict(supervision.get("mainline_stage") or {})
+            autonomy_summary = dict(supervision.get("autonomy_summary") or {})
             reply_lines.append(
                 "监督卡: "
                 f"attention={len(attention_items)} notify={len(notify_items)} trade_date={supervision.get('trade_date') or '-'}"
             )
+            if mainline_stage:
+                reply_lines.append(
+                    "当前主线: "
+                    f"{mainline_stage.get('label') or '-'} -> {mainline_stage.get('next_stage_code') or '-'}"
+                )
+            if autonomy_summary.get("summary_line"):
+                reply_lines.append("自治进度: " + str(autonomy_summary.get("summary_line")))
             if notify_items:
                 lead = notify_items[0]
                 reply_lines.append(
@@ -9799,9 +13172,12 @@ def build_router(
                     "当前状态: "
                     + "；".join(str(item).strip() for item in list(supervision.get("summary_lines") or [])[:2] if str(item).strip())
                 )
+        elif str(answer.get("topic") or "") == "handoff":
+            reply_lines = answer_lines
         if not reply_lines:
             reply_lines = answer_lines
-        card_title = f"飞书问答 · {str(answer.get('topic') or 'help')}"
+        role_label = str(bot_name or role_labels.get(resolved_bot_role, resolved_bot_role)).strip()
+        card_title = f"{role_label} · {topic_labels.get(topic_key, topic_key)}"
         card_markdown_lines = [f"**问题**: {question}"]
         card_markdown_lines.extend(f"- {line}" for line in reply_lines if str(line).strip())
         raw_data_refs = [str(item).strip() for item in list(answer.get("data_refs") or []) if str(item).strip()]
@@ -9810,6 +13186,7 @@ def build_router(
             card_markdown_lines.append("**相关入口**")
             card_markdown_lines.extend(f"- {item}" for item in card_data_refs[:4])
         template_map = {
+            "action": "orange",
             "symbol_analysis": "blue",
             "position": "blue",
             "holding_review": "blue",
@@ -9824,6 +13201,11 @@ def build_router(
             "params": "purple",
             "scores": "turquoise",
             "status": "grey",
+            "capabilities": "blue",
+            "handoff": "grey",
+            "casual_chat": "grey",
+            "open_chat": "grey",
+            "cycle": "grey",
         }
         card_elements: list[dict[str, Any]] = [
             {
@@ -9888,7 +13270,10 @@ def build_router(
         return {
             "matched": True,
             "question": question,
-            "topic": str(answer.get("topic") or "help"),
+            "trade_date": answer.get("trade_date"),
+            "topic": topic_key,
+            "bot_role": resolved_bot_role,
+            "reply_mode": "text" if prefer_plain_text else "card",
             "reply_lines": reply_lines,
             "answer_lines": answer_lines,
             "data_refs": raw_data_refs,
@@ -9963,7 +13348,7 @@ def build_router(
             summary = "当前状态、当前建议、执行状态、调参与治理、问答入口。"
         elif "/system/feishu/ask" in preview_url:
             title = "飞书问答入口"
-            summary = "可按状态、讨论、执行、参数、得分五类口径追问系统。"
+            summary = "支持自然语言直接追问状态、机会、持仓、执行、风控与调参，不再退回帮助页。"
 
         return {
             "inline": {
@@ -10163,14 +13548,14 @@ def build_router(
     async def controlled_apply_readiness(
         trade_date: str | None = None,
         account_id: str | None = None,
-        max_apply_intents: int = 1,
+        max_apply_intents: int | None = None,
         intent_ids: str | None = None,
         allowed_symbols: str | None = None,
-        require_live: bool = True,
-        require_trading_session: bool = True,
-        max_equity_position_limit: float | None = 0.2,
-        max_single_amount: float | None = 50000.0,
-        min_reverse_repo_reserved_amount: float | None = 70000.0,
+        require_live: bool | None = None,
+        require_trading_session: bool | None = None,
+        max_equity_position_limit: float | None = None,
+        max_single_amount: float | None = None,
+        min_reverse_repo_reserved_amount: float | None = None,
         max_stock_test_budget_amount: float | None = None,
         max_apply_submissions_per_day: int | None = None,
         blocked_time_windows: str | None = None,
@@ -10205,6 +13590,70 @@ def build_router(
             ),
         )
         return {"ok": payload["status"] != "blocked", **payload}
+
+    @router.get("/deployment/parameter-consistency")
+    async def deployment_parameter_consistency():
+        payload = await run_in_threadpool(_build_parameter_consistency_payload)
+        return {"ok": True, **payload}
+
+    @router.get("/governance/dashboard")
+    async def governance_dashboard(trade_date: str | None = None):
+        score_date = trade_date or datetime.now().date().isoformat()
+        agent_profiles = agent_score_service.export_profiles(score_date) if agent_score_service else {}
+        factor_effectiveness = runtime_state_store.get("factor_effectiveness:latest", {}) if runtime_state_store else {}
+        factor_items = list((factor_effectiveness or {}).get("items") or [])
+        factor_health = {}
+        recent_actions: list[dict[str, Any]] = []
+        for item in factor_items:
+            factor_id = str(item.get("factor_id") or "").strip()
+            if not factor_id:
+                continue
+            status = str(item.get("status") or "unknown")
+            consecutive_invalid_days = int(item.get("consecutive_invalid_days", 0) or 0)
+            if status == "ineffective" and consecutive_invalid_days >= 5:
+                factor_health[factor_id] = "auto_disabled"
+                recent_actions.append(
+                    {
+                        "action": "factor_auto_disabled",
+                        "target": factor_id,
+                        "reason": f"连续{consecutive_invalid_days}日 ineffective",
+                        "at": str(factor_effectiveness.get("generated_at") or ""),
+                    }
+                )
+            elif status == "ineffective":
+                factor_health[factor_id] = "degraded"
+            else:
+                factor_health[factor_id] = "active" if status == "effective" else status
+        latest_report = trade_attribution_service.latest_report()
+        playbook_pnl_map = {
+            item.key: {
+                "recent_pnl": float(item.avg_next_day_close_pct or 0.0),
+                "trade_count": int(item.trade_count or 0),
+            }
+            for item in list(latest_report.by_playbook or [])
+        }
+        playbook_health = {
+            item.id: {
+                "priority": float(item.priority_score or 0.0),
+                "recent_pnl": float((playbook_pnl_map.get(item.id) or {}).get("recent_pnl", 0.0) or 0.0),
+                "trade_count": int((playbook_pnl_map.get(item.id) or {}).get("trade_count", 0) or 0),
+                "status": "probation" if bool(item.probation) else "active",
+            }
+            for item in playbook_registry.list_all()
+        }
+        payload = {
+            "generated_at": datetime.now().isoformat(),
+            "score_date": score_date,
+            "agent_scores": agent_profiles,
+            "factor_health": factor_health,
+            "playbook_health": playbook_health,
+            "recent_governance_actions": recent_actions[-20:],
+            "summary_lines": [
+                f"agent_profiles={len(agent_profiles)} factor_items={len(factor_health)} playbooks={len(playbook_health)}",
+                f"recent_governance_actions={len(recent_actions[-20:])}",
+            ],
+        }
+        return {"ok": True, **payload}
 
     @router.get("/deployment/service-recovery-readiness")
     async def service_recovery_readiness(
@@ -10269,17 +13718,20 @@ def build_router(
             )
             return {"ok": response.get("status") in {"ok", "queued_for_gateway"}, **response}
 
-        return {
-            "ok": False,
-            "account_id": resolved_account_id,
-            "status": "cache_unavailable",
-            "cache_mode": "miss",
-            "refresh_required": True,
-            "summary_lines": [
-                "账户状态缓存尚未建立。",
-                "如需拉取最新账户状态，请调用 /system/account-state?refresh=true。",
-            ],
-        }
+        payload = await run_in_threadpool(
+            lambda: account_state_service.snapshot(
+                resolved_account_id,
+                persist=True,
+                include_trades=False,
+                timeout_sec=4.0,
+            )
+        )
+        payload["cache_mode"] = "auto_refresh_on_miss"
+        payload["fresh"] = payload.get("status") == "ok"
+        payload["refresh_required"] = payload.get("status") != "ok"
+        if payload.get("summary_lines"):
+            payload["summary_lines"] = list(payload.get("summary_lines") or []) + ["本次为缓存缺失后的自动轻量刷新。"]
+        return {"ok": payload.get("status") in {"ok", "queued_for_gateway"}, **payload}
 
     @router.post("/reverse-repo/check")
     async def reverse_repo_check(account_id: str | None = None, auto_submit: bool = False):
@@ -10370,6 +13822,44 @@ def build_router(
     async def get_robot_console_layout(trade_date: str | None = None):
         return {"ok": True, **_build_robot_console_layout(trade_date)}
 
+    @router.get("/dashboard/mission-control")
+    async def get_dashboard_mission_control(trade_date: str | None = None):
+        return {"ok": True, **_build_dashboard_mission_control_payload(trade_date)}
+
+    @router.get("/dashboard/opportunity-flow")
+    async def get_dashboard_opportunity_flow(trade_date: str | None = None):
+        return {"ok": True, **_build_opportunity_flow_payload(trade_date)}
+
+    @router.get("/dashboard/execution-mainline")
+    async def get_dashboard_execution_mainline(
+        trade_date: str | None = None,
+        symbol: str | None = None,
+        trace_id: str | None = None,
+    ):
+        return {
+            "ok": True,
+            **_build_execution_mainline_trace_payload(
+                trade_date,
+                symbol=symbol,
+                trace_id=trace_id,
+            ),
+        }
+
+    @router.get("/execution/mainline-trace")
+    async def get_execution_mainline_trace(
+        trade_date: str | None = None,
+        symbol: str | None = None,
+        trace_id: str | None = None,
+    ):
+        return {
+            "ok": True,
+            **_build_execution_mainline_trace_payload(
+                trade_date,
+                symbol=symbol,
+                trace_id=trace_id,
+            ),
+        }
+
     @router.get("/workflow/mainline")
     async def get_mainline_workflow(trade_date: str | None = None):
         return {"ok": True, **_build_mainline_workflow_payload(trade_date)}
@@ -10391,6 +13881,10 @@ def build_router(
     @router.get("/feishu/briefing")
     async def get_feishu_briefing(trade_date: str | None = None):
         return {"ok": True, **_build_feishu_briefing_payload(trade_date)}
+
+    @router.get("/feishu/bots")
+    async def get_feishu_bots():
+        return {"ok": True, **_build_feishu_bot_registry_payload()}
 
     @router.get("/feishu/rights-briefing")
     async def get_feishu_rights_briefing(trade_date: str | None = None):
@@ -10422,7 +13916,19 @@ def build_router(
 
     @router.post("/feishu/ask")
     async def feishu_ask(payload: FeishuAskInput):
-        answer = _answer_feishu_question(payload.question, trade_date=payload.trade_date)
+        resolved_bot_role = _normalize_feishu_bot_role(payload.bot_role)
+        answer = _answer_feishu_question(
+            payload.question,
+            trade_date=payload.trade_date,
+            bot_role=resolved_bot_role,
+        )
+        question_reply = _build_feishu_question_reply(
+            payload.question,
+            trade_date=payload.trade_date,
+            bot_role=resolved_bot_role,
+            bot_name=payload.bot_id,
+            answer=answer,
+        )
         notification = {"dispatched": False, "reason": "disabled"}
         if payload.notify and message_dispatcher:
             content = feishu_answer_template(
@@ -10431,9 +13937,19 @@ def build_router(
                 answer.get("data_refs", []),
                 trade_advice=answer.get("trade_advice"),
             )
+            channel = {
+                "main": "report",
+                "supervision": "supervision",
+                "execution": "execution",
+            }.get(resolved_bot_role, "report")
+            title = {
+                "main": "Hermes主控问答回复",
+                "supervision": "Hermes督办回复",
+                "execution": "Hermes回执回复",
+            }.get(resolved_bot_role, "飞书问答回复")
             dispatched = message_dispatcher.dispatch(
-                "report",
-                "飞书问答回复",
+                channel,
+                title,
                 content,
                 level="info",
                 force=payload.force,
@@ -10443,6 +13959,9 @@ def build_router(
             "ok": True,
             "question": payload.question,
             **answer,
+            "reply_mode": question_reply.get("reply_mode"),
+            "reply_lines": question_reply.get("reply_lines", answer.get("answer_lines", [])),
+            "reply_card": question_reply.get("reply_card"),
             "notification": notification,
         }
 
@@ -10598,6 +14117,10 @@ def build_router(
         text = _extract_feishu_message_text(payload)
         actor = _extract_feishu_actor(payload)
         chat_id = _extract_feishu_chat_id(payload)
+        receiver_bot_role = _normalize_feishu_bot_role(payload.get("__receiver_bot_role"))
+        receiver_bot_name = str(payload.get("__receiver_bot_name") or "").strip()
+        receiver_bot_id = str(payload.get("__receiver_bot_id") or "").strip()
+        receiver_bot_app_id = str(payload.get("__receiver_bot_app_id") or "").strip()
 
         if event_type and event_type not in {"im.message.receive_v1", "message"}:
             return {
@@ -10607,7 +14130,46 @@ def build_router(
                 "event_type": event_type,
             }
 
-        parsed = _parse_feishu_supervision_ack(text)
+        addressed, addressing_reason = _is_feishu_message_addressed(
+            payload,
+            text=text,
+            bot_role=receiver_bot_role,
+            bot_name=receiver_bot_name,
+            bot_id=receiver_bot_id,
+            bot_app_id=receiver_bot_app_id,
+        )
+        if not addressed:
+            raw_mentions = ((payload.get("event") or {}).get("message") or {}).get("mentions")
+            logger.info(
+                "飞书消息忽略: reason=%s receiver_role=%s receiver_name=%s receiver_app_id=%s current_app_id=%s mentions_type=%s mentions_count=%s text=%s",
+                addressing_reason,
+                receiver_bot_role,
+                receiver_bot_name,
+                receiver_bot_app_id,
+                str((payload.get("header") or {}).get("app_id") or "").strip(),
+                type(raw_mentions).__name__,
+                len(raw_mentions) if isinstance(raw_mentions, list) else 0,
+                text,
+            )
+            return {
+                "ok": True,
+                "processed": False,
+                "reason": "message_ignored",
+                "addressing_reason": addressing_reason,
+                "event_type": event_type or "message",
+                "chat_id": chat_id,
+                "text": text,
+                "receiver_bot_role": receiver_bot_role,
+                "receiver_bot_name": receiver_bot_name,
+                "receiver_bot_id": receiver_bot_id,
+                "receiver_bot_app_id": receiver_bot_app_id,
+            }
+
+        parsed = (
+            _parse_feishu_supervision_ack(text)
+            if receiver_bot_role == "supervision"
+            else {"matched": False, "unmatched_reason": "not_supervision_bot"}
+        )
         if not parsed.get("matched"):
             control_plane_link_reply = _build_control_plane_link_reply(text)
             if control_plane_link_reply.get("matched"):
@@ -10619,45 +14181,55 @@ def build_router(
                     "chat_id": chat_id,
                     "reply_to_chat_id": chat_id,
                     "text": text,
+                    "receiver_bot_role": receiver_bot_role,
+                    "receiver_bot_name": receiver_bot_name,
+                    "receiver_bot_id": receiver_bot_id,
                     **control_plane_link_reply,
                 }
-            if _is_feishu_message_addressed(payload, text=text):
-                question = _normalize_feishu_question_text(payload, text)
-                if _is_feishu_adjustment_request(question):
-                    adjustment_reply = _build_feishu_adjustment_reply(question)
-                    if adjustment_reply.get("matched"):
-                        return {
-                            "ok": True,
-                            "processed": True,
-                            "reason": "natural_language_adjustment_applied",
-                            "event_type": event_type or "message",
-                            "chat_id": chat_id,
-                            "reply_to_chat_id": chat_id,
-                            "text": text,
-                            "question": question,
-                            **adjustment_reply,
-                        }
-                question_reply = _build_feishu_question_reply(
+            question = _normalize_feishu_question_text(payload, text)
+            if _is_feishu_adjustment_request(question):
+                adjustment_reply = _build_feishu_adjustment_reply(question)
+                if adjustment_reply.get("matched"):
+                    return {
+                        "ok": True,
+                        "processed": True,
+                        "reason": "natural_language_adjustment_applied",
+                        "event_type": event_type or "message",
+                        "chat_id": chat_id,
+                        "reply_to_chat_id": chat_id,
+                        "text": text,
+                        "question": question,
+                        "receiver_bot_role": receiver_bot_role,
+                        "receiver_bot_name": receiver_bot_name,
+                        "receiver_bot_id": receiver_bot_id,
+                        **adjustment_reply,
+                    }
+            question_reply = _build_feishu_question_reply(
+                question,
+                bot_role=receiver_bot_role,
+                bot_name=receiver_bot_name,
+                control_plane_base_url=_resolve_control_plane_base_url(request),
+                answer=_answer_feishu_question(
                     question,
-                    control_plane_base_url=_resolve_control_plane_base_url(request),
-                )
-                return {
-                    "ok": True,
-                    "processed": True,
-                    "reason": "natural_language_question_answered",
-                    "event_type": event_type or "message",
-                    "chat_id": chat_id,
-                    "reply_to_chat_id": chat_id,
-                    "text": text,
-                    **question_reply,
-                }
+                    bot_role=receiver_bot_role,
+                ),
+            )
             return {
                 "ok": True,
-                "processed": False,
-                "reason": parsed.get("unmatched_reason") or "message_ignored",
+                "processed": True,
+                "reason": (
+                    "natural_language_action_executed"
+                    if str(question_reply.get("topic") or "").strip() == "action"
+                    else "natural_language_question_answered"
+                ),
                 "event_type": event_type or "message",
                 "chat_id": chat_id,
+                "reply_to_chat_id": chat_id,
+                "receiver_bot_role": receiver_bot_role,
+                "receiver_bot_name": receiver_bot_name,
+                "receiver_bot_id": receiver_bot_id,
                 "text": text,
+                **question_reply,
             }
 
         ack_result = _apply_agent_supervision_ack(
@@ -10697,6 +14269,10 @@ def build_router(
             "ok": True,
             **_build_nightly_sandbox_payload(trade_date),
         }
+
+    @router.get("/symbols/{symbol}/desk-brief")
+    async def get_symbol_desk_brief(symbol: str, trade_date: str | None = None):
+        return {"ok": True, **_build_symbol_desk_brief_payload(symbol, trade_date=trade_date)}
 
     @router.post("/feishu/adjustments/natural-language")
     async def feishu_adjust_from_natural_language(payload: NaturalLanguageAdjustmentInput):
@@ -11080,6 +14656,25 @@ def build_router(
                     else discussion_cycle_service.bootstrap_cycle(trade_date)
                 )
                 cycle_payload = cycle.model_dump()
+            ingress_payload = {
+                "trade_date": trade_date,
+                "generated_at": datetime.now().isoformat(),
+                "count": len(updated),
+                "case_ids": [item.case_id for item in updated],
+                "symbols": [item.symbol for item in updated],
+                "source_counts": {
+                    source: sum(1 for item in updated if str(item.runtime_snapshot.source or "") == source)
+                    for source in sorted(
+                        {
+                            str(item.runtime_snapshot.source or "")
+                            for item in updated
+                            if str(item.runtime_snapshot.source or "").strip()
+                        }
+                    )
+                },
+            }
+            if meeting_state_store:
+                meeting_state_store.set("latest_opportunity_ticket_ingress", ingress_payload)
             if audit_store:
                 audit_store.append(
                     category="discussion",
@@ -11099,12 +14694,10 @@ def build_router(
                 "ingress_summary": {
                     "entered_discussion_count": len(updated),
                     "case_ids": [item.case_id for item in updated],
-                    "source_counts": {
-                        source: sum(1 for item in updated if str(item.runtime_snapshot.source or "") == source)
-                        for source in sorted({str(item.runtime_snapshot.source or "") for item in updated if str(item.runtime_snapshot.source or "").strip()})
-                    },
+                    "source_counts": ingress_payload["source_counts"],
                     "non_default_entry": True,
                     "cycle_bootstrapped": bool(cycle_payload),
+                    "supervision_visible": bool(meeting_state_store),
                 },
                 "cycle": cycle_payload,
             }
@@ -11200,8 +14793,18 @@ def build_router(
                     },
                 )
             if response.get("ok"):
+                dependent_refresh = _refresh_strategy_dependent_writebacks(
+                    trade_date,
+                    expected_round=response.get("round"),
+                )
+                response["dependent_refresh"] = dependent_refresh
                 written_items = list(response.get("items") or [])
                 case_ids = [str(item.get("case_id") or "").strip() for item in written_items if str(item.get("case_id") or "").strip()]
+                case_ids.extend(
+                    str(item).strip()
+                    for item in list((dependent_refresh or {}).get("refreshed_case_ids") or [])
+                    if str(item).strip()
+                )
                 updated_cases = [
                     candidate_case_service.get_case(case_id)
                     for case_id in dict.fromkeys(case_ids)
@@ -11608,7 +15211,9 @@ def build_router(
         watchlist_limit: int = 5,
         rejected_limit: int = 5,
     ):
-        resolved_date = _resolve_trade_date(trade_date)
+        trade_context = _resolve_user_facing_trade_context(trade_date)
+        resolved_date = str(trade_context.get("source_trade_date") or "").strip() or _resolve_trade_date(trade_date)
+        display_trade_date = str(trade_context.get("effective_trade_date") or "").strip() or resolved_date
         if not candidate_case_service:
             return {"ok": False, "error": "candidate case service not initialized"}
         payload = _build_client_brief(
@@ -11616,6 +15221,7 @@ def build_router(
             selection_limit=selection_limit,
             watchlist_limit=watchlist_limit,
             rejected_limit=rejected_limit,
+            display_trade_date=display_trade_date,
         )
         return {"ok": True, **payload}
 
@@ -11623,18 +15229,14 @@ def build_router(
     async def get_discussion_meeting_context(trade_date: str | None = None):
         if not candidate_case_service:
             return {"ok": False, "error": "candidate case service not initialized"}
-        if trade_date and meeting_state_store:
-            stored = _sanitize_json_compatible(meeting_state_store.get(f"discussion_context:{trade_date}"))
-            if stored:
-                return {"ok": True, **stored}
-        if not trade_date and meeting_state_store:
-            stored = _sanitize_json_compatible(meeting_state_store.get("latest_discussion_context"))
+        if trade_date:
+            stored = _get_discussion_context_from_store(trade_date)
             if stored:
                 return {"ok": True, **stored}
         if not trade_date:
-            latest = _sanitize_json_compatible(serving_store.get_latest_discussion_context())
-            if latest:
-                return {"ok": True, **latest}
+            stored = _get_latest_discussion_context_payload()
+            if stored:
+                return {"ok": True, **stored}
             return {"ok": True, "available": False, "resource": "discussion_context"}
         payload = _build_discussion_context_payload(trade_date)
         _persist_discussion_context(payload)
@@ -11681,50 +15283,19 @@ def build_router(
     async def dispatch_discussion_execution_intents(payload: ExecutionIntentDispatchInput):
         if not candidate_case_service:
             return {"ok": False, "error": "candidate case service not initialized"}
-        result = _build_execution_dispatch_receipts(
+        dispatch_packet = _dispatch_execution_intents(
             trade_date=payload.trade_date,
             account_id=payload.account_id,
             intent_ids=payload.intent_ids,
             apply=payload.apply,
+            trigger="api",
         )
-        _persist_execution_dispatch(result)
-        summary_dispatch_result = _dispatch_execution_dispatch_summary(result)
-        alert_result = (
-            live_execution_alert_notifier.dispatch_dispatch(result)
-            if settings.run_mode == "live" and live_execution_alert_notifier
-            else None
-        )
-        if audit_store:
-            audit_store.append(
-                category="execution",
-                message=f"执行意图已派发: {payload.trade_date}",
-                payload={
-                    "trade_date": payload.trade_date,
-                    "apply": payload.apply,
-                    "submitted_count": result.get("submitted_count", 0),
-                    "preview_count": result.get("preview_count", 0),
-                    "blocked_count": result.get("blocked_count", 0),
-                    "status": result.get("status"),
-                    "summary_dispatched": summary_dispatch_result.get("dispatched", False),
-                    "summary_reason": summary_dispatch_result.get("reason"),
-                    "alert_dispatched": (alert_result.dispatched if alert_result else False),
-                    "alert_reason": (alert_result.reason if alert_result else "disabled"),
-                },
-            )
+        result = dispatch_packet["result"]
         return {
             "ok": True,
             **result,
-            "summary_notification": summary_dispatch_result,
-            "notification": (
-                {
-                    "dispatched": alert_result.dispatched,
-                    "reason": alert_result.reason,
-                    "level": alert_result.payload.get("level"),
-                    "title": alert_result.payload.get("title"),
-                }
-                if alert_result
-                else {"dispatched": False, "reason": "disabled"}
-            ),
+            "summary_notification": dispatch_packet["summary_notification"],
+            "notification": dispatch_packet["alert_notification"],
         }
 
     @router.get("/discussions/execution-dispatch/latest")
@@ -11809,13 +15380,12 @@ def build_router(
 
     @router.post("/execution/gateway/receipts")
     async def record_execution_gateway_receipt(payload: ExecutionGatewayReceiptInput):
-        try:
-            latest_receipt = _store_execution_gateway_receipt(payload)
-        except ValueError as exc:
-            return {"ok": False, "stored": False, "error": str(exc)}
+        ok, stored, latest_receipt, error = _store_execution_gateway_receipt(payload)
+        if not ok:
+            return {"ok": False, "stored": False, "error": error}
         return {
-            "ok": True,
-            "stored": True,
+            "ok": ok,
+            "stored": stored,
             "latest_receipt": latest_receipt,
             "summary_lines": ["execution gateway receipt 已写入并更新 latest。"],
         }
@@ -11989,6 +15559,8 @@ def build_router(
         payload = await run_in_threadpool(
             lambda: execution_reconciliation_service.reconcile(resolved_account_id, persist=True)
         )
+        trade_date = str(payload.get("reconciled_at") or datetime.now().isoformat())[:10]
+        payload["execution_quality_report"] = quality_tracker.summarize_day(trade_date, persist=True)
         attribution_payload = _sync_reconciliation_attribution(payload)
         if attribution_payload:
             payload["attribution"] = attribution_payload
@@ -12041,7 +15613,11 @@ def build_router(
             execution_adapter=execution_adapter,
             meeting_state_store=meeting_state_store,
             runtime_state_store=runtime_state_store,
+            execution_gateway_state_store=execution_gateway_state_store,
+            position_watch_state_store=position_watch_state_store,
+            monitor_state_service=monitor_state_service,
             candidate_case_service=candidate_case_service,
+            discussion_cycle_service=discussion_cycle_service,
             dispatcher=message_dispatcher,
             runtime_context=(
                 serving_store.get_latest_runtime_context()
@@ -12050,7 +15626,7 @@ def build_router(
             ),
             discussion_context=(
                 serving_store.get_latest_discussion_context()
-                or meeting_state_store.get("latest_discussion_context", {})
+                or _get_latest_discussion_context_payload()
                 or {}
             ),
             execution_plane=str(getattr(settings, "execution_plane", "local_xtquant") or "local_xtquant"),
@@ -12073,23 +15649,32 @@ def build_router(
         return {"ok": payload.get("status") in {"ok", "queued_for_gateway"}, **payload}
 
     @router.get("/tail-market/latest")
-    async def get_latest_tail_market_scan():
+    async def get_latest_tail_market_scan(include_control_plane: bool = False):
         if not meeting_state_store:
             return {"ok": False, "error": "meeting state store not initialized"}
-        payload = meeting_state_store.get("latest_tail_market_scan")
-        intraday_rank_result = meeting_state_store.get("latest_intraday_rank_result") or {}
+        payload = _get_latest_position_watch_payload()
+        fast_opportunity_payload = _get_latest_fast_opportunity_payload()
+        intraday_rank_result = (
+            (runtime_state_store.get("latest_intraday_rank_result") if runtime_state_store else None)
+            or meeting_state_store.get("latest_intraday_rank_result")
+            or {}
+        )
         if not payload:
             if intraday_rank_result:
-                attached = _attach_control_plane_gateway_summary(
-                    {
-                        "available": True,
-                        "status": "intraday_only",
-                        "trade_date": intraday_rank_result.get("trade_date"),
-                        "summary_lines": list(intraday_rank_result.get("summary_lines") or []),
-                        "intraday_rank_result": intraday_rank_result,
-                    },
-                    trade_date=str(intraday_rank_result.get("trade_date") or "") or None,
-                )
+                attached = {
+                    "available": True,
+                    "status": "intraday_only",
+                    "trade_date": intraday_rank_result.get("trade_date"),
+                    "summary_lines": list(intraday_rank_result.get("summary_lines") or []),
+                    "intraday_rank_result": intraday_rank_result,
+                }
+                if include_control_plane:
+                    attached = _attach_control_plane_gateway_summary(
+                        attached,
+                        trade_date=str(intraday_rank_result.get("trade_date") or "") or None,
+                    )
+                if fast_opportunity_payload:
+                    attached["fast_opportunity_scan"] = fast_opportunity_payload
                 return {"ok": True, **attached}
             not_found_payload = {
                 "ok": True,
@@ -12097,14 +15682,32 @@ def build_router(
                 "status": "not_found",
                 "summary_lines": ["当前尚无尾盘卖出扫描记录。"],
             }
-            attached = _attach_control_plane_gateway_summary(not_found_payload)
+            attached = (
+                _attach_control_plane_gateway_summary(not_found_payload)
+                if include_control_plane
+                else not_found_payload
+            )
+            if fast_opportunity_payload:
+                attached["fast_opportunity_scan"] = fast_opportunity_payload
             return {"ok": True, **attached}
-        attached = _attach_control_plane_gateway_summary(
-            payload,
-            trade_date=str(payload.get("trade_date") or "") or None,
-            latest_tail_market_payload=payload,
+        attached = (
+            _attach_control_plane_gateway_summary(
+                payload,
+                trade_date=str(payload.get("trade_date") or "") or None,
+                latest_tail_market_payload=payload,
+            )
+            if include_control_plane
+            else dict(payload)
         )
         attached["intraday_rank_result"] = intraday_rank_result
+        if fast_opportunity_payload:
+            attached["fast_opportunity_scan"] = fast_opportunity_payload
+            attached["summary_lines"] = list(attached.get("summary_lines") or [])
+            attached["summary_lines"].extend(
+                str(item).strip()
+                for item in list(fast_opportunity_payload.get("summary_lines") or [])[:1]
+                if str(item).strip()
+            )
         if intraday_rank_result and not attached.get("summary_lines"):
             attached["summary_lines"] = list(intraday_rank_result.get("summary_lines") or [])
         return {"ok": payload.get("status") in {"ok", "queued_for_gateway"}, **attached}
@@ -12261,7 +15864,7 @@ def build_router(
         if normalized_source not in {"latest", "history"}:
             normalized_source = "latest"
         if normalized_source == "latest":
-            latest = meeting_state_store.get("latest_tail_market_scan") if meeting_state_store else None
+            latest = _get_latest_position_watch_payload()
             payloads = [latest] if latest else []
         else:
             history = meeting_state_store.get("tail_market_history", []) if meeting_state_store else []
@@ -12312,8 +15915,7 @@ def build_router(
         if resolved_trade_date:
             context = _build_discussion_context_payload(resolved_trade_date)
         else:
-            if meeting_state_store:
-                context = _sanitize_json_compatible(meeting_state_store.get("latest_discussion_context"))
+            context = _get_latest_discussion_context_payload()
             if not context:
                 context = _sanitize_json_compatible(serving_store.get_latest_discussion_context())
             resolved_trade_date = str((context or {}).get("trade_date") or "") or None
@@ -13179,7 +16781,7 @@ def build_router(
         if normalized_source not in {"latest", "history"}:
             return {"ok": False, "error": f"unsupported source: {source}"}
         if normalized_source == "latest":
-            latest = meeting_state_store.get("latest_tail_market_scan")
+            latest = _get_latest_position_watch_payload()
             payloads = [latest] if latest else []
         else:
             history = meeting_state_store.get("tail_market_history", [])
@@ -13301,11 +16903,18 @@ def build_router(
             cycle = discussion_cycle_service.refresh_cycle(trade_date)
             _save_monitor_pool_snapshot(trade_date, cycle, source="discussion_refresh")
             _persist_discussion_context(_build_discussion_context_payload(trade_date, cycle_payload=cycle.model_dump()))
+            execution_chain_progress = _prepare_execution_chain_for_cycle(
+                trade_date=trade_date,
+                cycle=cycle,
+                trigger="discussion_refresh_auto_dispatch",
+                allow_dispatch=True,
+            )
             return {
                 "ok": True,
                 "cycle": _serialize_cycle_compact(cycle),
                 "refresh_skipped": False,
                 "cadence_gate": cadence_gate,
+                "execution_chain_progress": execution_chain_progress,
             }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -13342,16 +16951,10 @@ def build_router(
                 else {"triggered": True, "layer": "execution", "trigger": "discussion_finalize"}
             )
             if execution_gate_required and not cadence_gate.get("triggered"):
-                return {
-                    "ok": True,
-                    "cycle": (
-                        _serialize_cycle_compact(cycle_for_finalize)
-                        if cycle_for_finalize
-                        else {"available": False, "trade_date": trade_date}
-                    ),
-                    "notification": {"dispatched": False, "reason": "execution_poll_skip"},
-                    "finalize_skipped": True,
-                    "cadence_gate": cadence_gate,
+                cadence_gate = {
+                    **cadence_gate,
+                    "bypassed": True,
+                    "reason": "manual_finalize_override",
                 }
             cycle = discussion_cycle_service.finalize_cycle(trade_date)
             _save_monitor_pool_snapshot(trade_date, cycle, source="discussion_finalize")
@@ -13370,6 +16973,12 @@ def build_router(
                 account_id=execution_precheck["account_id"],
             )
             _persist_execution_intents(execution_intents)
+            auto_execution_dispatch = _maybe_auto_dispatch_execution_intents(
+                trade_date=trade_date,
+                account_id=execution_precheck["account_id"],
+                execution_intents=execution_intents,
+                trigger="discussion_finalize_auto_dispatch",
+            )
             client_brief = _build_client_brief(trade_date)
             _persist_discussion_context(
                 _build_discussion_context_payload(
@@ -13395,6 +17004,9 @@ def build_router(
                         "notify_reason": (dispatch_result.reason if dispatch_result else "not_configured"),
                         "execution_alert_dispatched": (execution_alert_result.dispatched if execution_alert_result else False),
                         "execution_alert_reason": (execution_alert_result.reason if execution_alert_result else "disabled"),
+                        "auto_dispatch_triggered": auto_execution_dispatch.get("dispatched", False),
+                        "auto_dispatch_reason": auto_execution_dispatch.get("reason"),
+                        "auto_dispatch_status": auto_execution_dispatch.get("status"),
                     },
                 )
             return _sanitize_json_compatible({
@@ -13404,11 +17016,11 @@ def build_router(
                 "cadence_gate": cadence_gate,
                 "execution_precheck": execution_precheck,
                 "execution_intents": execution_intents,
+                "auto_execution_dispatch": auto_execution_dispatch,
+                "execution_dispatch": auto_execution_dispatch.get("execution_dispatch"),
                 "client_brief": client_brief,
                 "finalize_packet": (
-                    (_sanitize_json_compatible(meeting_state_store.get(f"discussion_context:{trade_date}")) or {}).get("finalize_packet")
-                    if meeting_state_store
-                    else None
+                    (_get_discussion_context_from_store(trade_date) or {}).get("finalize_packet")
                 ),
                 "execution_alert_notification": (
                     {
@@ -13470,11 +17082,19 @@ def build_router(
         results = settlement_service.settle(cases, outcome_map)
         persisted = []
         for item in results:
+            if (
+                float(item.result_score_delta or 0.0) == 0.0
+                and float(item.governance_score_delta or 0.0) == 0.0
+                and bool(getattr(item, "insufficient_sample", False))
+            ):
+                continue
             state = agent_score_service.record_settlement(
                 agent_id=item.agent_id,
                 score_date=payload.score_date,
                 result_score_delta=item.result_score_delta,
                 cases_evaluated=item.cases_evaluated,
+                settlement_key=f"manual:{payload.trade_date}:{payload.score_date}:{item.agent_id}",
+                confidence_tier=item.confidence_tier,
             )
             persisted.append(state.model_dump())
         attribution_items = []
@@ -13514,6 +17134,10 @@ def build_router(
             score_date=payload.score_date,
             items=attribution_items,
         )
+        attribution_payloads = [item.model_dump() for item in attribution_items]
+        market_memory_service.update_from_attribution(attribution_payloads)
+        failure_journal_service.record_failures(attribution_payloads)
+        strategy_lifecycle_service.refresh_from_attribution(_derive_trade_records())
         if audit_store:
             audit_store.append(
                 category="learning",
@@ -13590,6 +17214,62 @@ def build_router(
             "by_regime": report.by_regime,
             "by_exit_reason": report.by_exit_reason,
         }
+
+    @router.get("/learning/market-memory")
+    async def learning_market_memory(
+        regime_label: str | None = None,
+        playbook: str | None = None,
+        sector: str | None = None,
+        limit: int = 50,
+    ):
+        payload = market_memory_service.list_entries(
+            regime_label=regime_label,
+            playbook=playbook,
+            sector=sector,
+            limit=limit,
+        )
+        return {
+            "available": bool(payload.get("available")),
+            "count": int(payload.get("count", 0) or 0),
+            "items": list(payload.get("items") or []),
+            "summary": dict(payload.get("summary") or {}),
+        }
+
+    @router.get("/learning/failure-journal")
+    async def learning_failure_journal(
+        playbook: str | None = None,
+        regime_label: str | None = None,
+        sector: str | None = None,
+        month: str | None = None,
+        limit: int = 50,
+    ):
+        payload = failure_journal_service.list_entries(
+            playbook=playbook,
+            regime_label=regime_label,
+            sector=sector,
+            month=month,
+            limit=limit,
+        )
+        return {
+            "available": bool(payload.get("available")),
+            "count": int(payload.get("count", 0) or 0),
+            "items": list(payload.get("items") or []),
+            "latest_monthly_summary": dict(payload.get("latest_monthly_summary") or {}),
+        }
+
+    @router.get("/learning/failure-journal/pattern-warning")
+    async def learning_failure_pattern_warning(
+        playbooks: str,
+        regime_label: str,
+        sectors: str | None = None,
+        review_tags: str | None = None,
+    ):
+        return failure_journal_service.build_pattern_warning(
+            playbooks=[item.strip() for item in str(playbooks or "").split(",") if item.strip()],
+            regime_label=regime_label,
+            sectors=[item.strip() for item in str(sectors or "").split(",") if item.strip()],
+            review_tags=[item.strip() for item in str(review_tags or "").split(",") if item.strip()],
+        )
 
     @router.get("/reports/offline-backtest-attribution")
     async def offline_backtest_attribution_report():
@@ -14032,6 +17712,7 @@ def build_router(
     async def apply_parameter_hint_rollbacks(payload: ParameterRollbackApplyInput):
         if not parameter_service:
             return {"ok": False, "error": "parameter service not initialized"}
+        snapshot = _create_governance_snapshot()
         selected_ids = set(payload.event_ids)
         events = [item.model_dump() for item in parameter_service.list_proposals(status=payload.status)]
         filtered_events = [
@@ -14171,6 +17852,7 @@ def build_router(
         return {
             "ok": True,
             "applied": applied,
+            "snapshot_id": snapshot.get("snapshot_id"),
             "count": len(execution_items),
             "items": execution_items,
             "rollback_events": rollback_events,
@@ -14313,57 +17995,157 @@ def build_router(
 
     @router.get("/status/services")
     async def get_services_status():
-        """获取各组件服务状态 (systemctl)"""
-        services = {
-            "control-plane": "ashare-system-v2.service",
-            "scheduler": "ashare-system-v2-scheduler.service",
-            "feishu": "ashare-feishu-longconn.service",
-            "go-platform": "ashare-go-data-platform.service",
-            "openclaw": "openclaw-gateway.service",
+        """获取各组件服务状态，优先匹配当前实际运行的 user unit。"""
+
+        service_candidates = {
+            "control-plane": [("user", "ashare-system-v2.service"), ("system", "ashare-system-v2.service")],
+            "scheduler": [("user", "ashare-scheduler.service"), ("system", "ashare-system-v2-scheduler.service")],
+            "feishu": [("user", "ashare-feishu-longconn.service")],
+            "go-platform": [("user", "ashare-go-data-platform.service"), ("system", "ashare-go-data-platform.service")],
+            "openclaw": [("user", "openclaw-gateway.service"), ("system", "openclaw-gateway.service")],
         }
 
-        results = {}
-        for name, unit in services.items():
+        def _systemctl_cmd(scope: str, *args: str) -> list[str]:
+            return ["systemctl", "--user", *args] if scope == "user" else ["systemctl", *args]
+
+        def _load_state(scope: str, unit: str) -> str:
             try:
-                cmd = ["systemctl", "is-active", unit]
-                if name == "feishu":
-                    cmd = ["systemctl", "--user", "is-active", unit]
-                process = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                result = subprocess.run(
+                    _systemctl_cmd(scope, "show", unit, "--property=LoadState", "--value"),
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
                 )
-                stdout, _ = await process.communicate()
-                results[name] = stdout.decode().strip()
+                return (result.stdout or "").strip() or "unknown"
             except Exception:
-                results[name] = "unknown"
-        return {"ok": True, "services": results}
+                return "unknown"
+
+        def _active_state(scope: str, unit: str) -> str:
+            try:
+                result = subprocess.run(
+                    _systemctl_cmd(scope, "is-active", unit),
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                state = (result.stdout or result.stderr or "").strip() or "unknown"
+                if state == "inactive" and _load_state(scope, unit) == "not-found":
+                    return "not-found"
+                return state
+            except Exception:
+                return "unknown"
+
+        def _resolve_service(service_key: str) -> dict[str, str]:
+            candidates = service_candidates.get(service_key, [])
+            resolved: list[dict[str, str]] = []
+            for scope, unit in candidates:
+                load_state = _load_state(scope, unit)
+                if load_state == "not-found":
+                    continue
+                resolved.append(
+                    {
+                        "scope": scope,
+                        "unit": unit,
+                        "load_state": load_state,
+                        "status": _active_state(scope, unit),
+                    }
+                )
+            if not resolved:
+                fallback_scope, fallback_unit = candidates[0]
+                return {
+                    "scope": fallback_scope,
+                    "unit": fallback_unit,
+                    "load_state": "not-found",
+                    "status": "not-found",
+                }
+            resolved.sort(key=lambda item: 0 if item["status"] in {"active", "activating", "reloading"} else 1)
+            return resolved[0]
+
+        details = {name: _resolve_service(name) for name in service_candidates}
+        return {
+            "ok": True,
+            "services": {name: item["status"] for name, item in details.items()},
+            "details": details,
+        }
 
     @router.post("/operations/service/restart")
     async def restart_service(service: str):
-        """重启指定服务"""
-        services = {
-            "control-plane": "ashare-system-v2.service",
-            "scheduler": "ashare-system-v2-scheduler.service",
-            "feishu": "ashare-feishu-longconn.service",
-            "go-platform": "ashare-go-data-platform.service",
-            "openclaw": "openclaw-gateway.service",
+        """重启指定服务，优先作用于当前实际运行的 user unit。"""
+
+        service_candidates = {
+            "control-plane": [("user", "ashare-system-v2.service"), ("system", "ashare-system-v2.service")],
+            "scheduler": [("user", "ashare-scheduler.service"), ("system", "ashare-system-v2-scheduler.service")],
+            "feishu": [("user", "ashare-feishu-longconn.service")],
+            "go-platform": [("user", "ashare-go-data-platform.service"), ("system", "ashare-go-data-platform.service")],
+            "openclaw": [("user", "openclaw-gateway.service"), ("system", "openclaw-gateway.service")],
         }
-        unit = services.get(service)
-        if not unit:
+        if service not in service_candidates:
             raise HTTPException(status_code=400, detail=f"Unknown service: {service}")
 
+        def _systemctl_cmd(scope: str, *args: str) -> list[str]:
+            return ["systemctl", "--user", *args] if scope == "user" else ["systemctl", *args]
+
+        def _load_state(scope: str, unit: str) -> str:
+            try:
+                result = subprocess.run(
+                    _systemctl_cmd(scope, "show", unit, "--property=LoadState", "--value"),
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                return (result.stdout or "").strip() or "unknown"
+            except Exception:
+                return "unknown"
+
+        def _active_state(scope: str, unit: str) -> str:
+            try:
+                result = subprocess.run(
+                    _systemctl_cmd(scope, "is-active", unit),
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                state = (result.stdout or result.stderr or "").strip() or "unknown"
+                if state == "inactive" and _load_state(scope, unit) == "not-found":
+                    return "not-found"
+                return state
+            except Exception:
+                return "unknown"
+
+        resolved: list[tuple[str, str, str]] = []
+        for scope, unit in service_candidates[service]:
+            load_state = _load_state(scope, unit)
+            if load_state == "not-found":
+                continue
+            resolved.append((scope, unit, _active_state(scope, unit)))
+        if not resolved:
+            raise HTTPException(status_code=404, detail=f"Service unit not found for {service}")
+
+        resolved.sort(key=lambda item: 0 if item[2] in {"active", "activating", "reloading"} else 1)
+        scope, unit, previous_status = resolved[0]
+
         try:
-            cmd = ["sudo", "systemctl", "restart", unit]
-            if service == "feishu":
-                cmd = ["systemctl", "--user", "restart", unit]
-
-            # 使用 Popen 防止阻塞或因 Control Plane 重启自身导致请求中断处理
-            subprocess.Popen(cmd)
-
+            subprocess.Popen(
+                _systemctl_cmd(scope, "restart", unit),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             if audit_store:
-                audit_store.append(category="dashboard", message=f"仪表盘触发服务重启: {service}")
-            return {"ok": True, "message": f"Restart command sent to {service}"}
+                audit_store.append(
+                    category="dashboard",
+                    message=f"仪表盘触发服务重启: {service}",
+                    payload={"service": service, "scope": scope, "unit": unit, "previous_status": previous_status},
+                )
+            return {
+                "ok": True,
+                "service": service,
+                "scope": scope,
+                "unit": unit,
+                "previous_status": previous_status,
+                "message": f"已发送重启指令: {scope}:{unit}",
+            }
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": str(e), "service": service, "scope": scope, "unit": unit}
 
     @router.get("/audits/by-decision")
     async def audits_by_decision(decision_id: str):
@@ -14441,6 +18223,94 @@ def build_router(
     async def latest_meeting():
         return _latest_meeting()
 
+    @router.get("/portfolio/efficiency")
+    async def get_portfolio_efficiency(account_id: str | None = None):
+        resolved_account_id = _resolve_account_id(account_id)
+        snapshot = account_state_service.latest_for(resolved_account_id) if account_state_service else {}
+        if not snapshot and account_state_service:
+            snapshot = account_state_service.snapshot(resolved_account_id, persist=False, include_trades=False)
+        if not snapshot or snapshot.get("status") != "ok":
+            return {"ok": False, "error": "account_state_unavailable", "snapshot": snapshot}
+        runtime_context = dict((runtime_state_store.get("latest_runtime_context", {}) if runtime_state_store else {}) or {})
+        latest_runtime_report = _latest_runtime()
+        regime_label = (
+            str((((runtime_context.get("market_profile") or {}).get("regime")) or "")).strip()
+            or str((((latest_runtime_report.get("market_regime_detector") or {}).get("regime_label")) or "")).strip()
+            or "unknown"
+        )
+        positions_payload = list(snapshot.get("equity_positions") or snapshot.get("positions") or [])
+        playbook_contexts = {
+            str(item.get("symbol") or ""): item
+            for item in list((runtime_context.get("playbook_contexts") or []) if isinstance(runtime_context, dict) else [])
+            if str(item.get("symbol") or "").strip()
+        }
+        dossier_map = {
+            str(item.get("symbol") or ""): item
+            for item in list((latest_runtime_report.get("items") or []) if isinstance(latest_runtime_report, dict) else [])
+            if str(item.get("symbol") or "").strip()
+        }
+        position_contexts = _build_portfolio_position_contexts(
+            positions_payload,
+            dossier_map=dossier_map,
+            playbook_map=playbook_contexts,
+        )
+        metrics = dict(snapshot.get("metrics") or {})
+        payload = portfolio_risk_checker.build_efficiency_snapshot(
+            total_equity=float(metrics.get("total_asset", 0.0) or 0.0),
+            cash_available=float(metrics.get("cash", 0.0) or 0.0),
+            existing_positions=position_contexts,
+            regime_label=regime_label,
+            daily_new_exposure=_resolve_daily_new_exposure(str(snapshot.get("trade_date") or datetime.now().date().isoformat())),
+            reverse_repo_value=float(metrics.get("reverse_repo_value", 0.0) or 0.0),
+        )
+        payload["ok"] = True
+        payload["trade_date"] = snapshot.get("trade_date")
+        payload["account_id"] = resolved_account_id
+        payload["summary_lines"] = [
+            f"组合效率: cash_ratio={payload['cash_ratio']:.1%} risk_budget_used={payload['risk_budget_used']:.1%} beta={payload['portfolio_beta']:.2f}。",
+        ]
+        return payload
+
+    @router.get("/trace/{trace_id}")
+    async def get_trade_trace(trace_id: str):
+        trace_payload = trace_service.get_trace(trace_id)
+        compose_payload = _compose_evaluation_by_trace_id(trace_id)
+        return {
+            "ok": True,
+            "available": bool(trace_payload or compose_payload),
+            "trace": trace_payload,
+            "compose_evaluation": compose_payload,
+            "summary_lines": (
+                [f"trace {trace_id} 暂无事件。"]
+                if not trace_payload and not compose_payload
+                else [f"trace {trace_id} 事件 {int(trace_payload.get('event_count', 0) or 0)} 条。"]
+            ),
+        }
+
+    @router.get("/governance/snapshots")
+    async def list_governance_snapshots(limit: int = 20):
+        items = parameter_snapshot_service.list_snapshots(limit=limit)
+        return {"ok": True, "count": len(items), "items": items}
+
+    @router.post("/governance/rollback")
+    async def rollback_governance_snapshot(snapshot_id: str):
+        try:
+            snapshot = _apply_governance_snapshot(snapshot_id)
+        except KeyError as exc:
+            return {"ok": False, "error": str(exc)}
+        if audit_store:
+            audit_store.append(
+                category="governance",
+                message="治理快照已回滚",
+                payload={"snapshot_id": snapshot_id},
+            )
+        return {
+            "ok": True,
+            "snapshot_id": snapshot_id,
+            "snapshot": snapshot,
+            "summary_lines": [f"已回滚到治理快照 {snapshot_id}。"],
+        }
+
     @router.get("/config")
     async def get_runtime_config():
         if not config_mgr:
@@ -14452,8 +18322,9 @@ def build_router(
         if not config_mgr:
             return {"error": "config manager not initialized"}
         try:
+            snapshot = _create_governance_snapshot()
             new_config = config_mgr.update(**updates)
-            return {"ok": True, "config": new_config.model_dump()}
+            return {"ok": True, "config": new_config.model_dump(), "snapshot_id": snapshot.get("snapshot_id")}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 

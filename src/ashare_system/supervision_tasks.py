@@ -26,11 +26,24 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def _align_datetimes(left: datetime | None, right: datetime | None) -> tuple[datetime | None, datetime | None]:
+    if left is None or right is None:
+        return left, right
+    if left.tzinfo is None and right.tzinfo is not None:
+        left = left.replace(tzinfo=right.tzinfo)
+    elif left.tzinfo is not None and right.tzinfo is None:
+        right = right.replace(tzinfo=left.tzinfo)
+    return left, right
+
+
 def _seconds_since(value: str | None, *, now: datetime) -> int | None:
     parsed = _parse_iso_datetime(value)
     if parsed is None:
         return None
     current = now.astimezone(parsed.tzinfo) if parsed.tzinfo and now.tzinfo else now
+    current, parsed = _align_datetimes(current, parsed)
+    if current is None or parsed is None:
+        return None
     return max(int((current - parsed).total_seconds()), 0)
 
 
@@ -103,7 +116,7 @@ def _activity_matches_completion_tags(item: dict[str, Any], completion_tags: lis
     for tag in completion_tags:
         if tag == "research_output" and any(keyword in text for keyword in ["研究", "事件", "催化", "热点", "dossier", "research_summary"]):
             return True
-        if tag == "strategy_output" and any(keyword in text for keyword in ["策略", "调参", "提案", "param_proposals", "proposal", "override"]):
+        if tag == "strategy_output" and any(keyword in text for keyword in ["策略", "调参", "提案", "param_proposals", "proposal", "override", "compose", "replan", "重编排"]):
             return True
         if tag == "nightly_sandbox" and "夜间沙盘" in text and not any(hint in text for hint in negative_hints):
             return True
@@ -224,10 +237,12 @@ def sync_agent_task_completion_from_activity(
             continue
         sent_dt = _parse_iso_datetime(sent_at)
         active_dt = _parse_iso_datetime(last_active_at)
+        sent_dt, active_dt = _align_datetimes(sent_dt, active_dt)
         if sent_dt is None or active_dt is None or active_dt < sent_dt:
             continue
         completed_at = str(existing.get("completed_at") or "").strip() or None
         completed_dt = _parse_iso_datetime(completed_at)
+        completed_dt, active_dt = _align_datetimes(completed_dt, active_dt)
         if completed_dt is not None and completed_dt >= active_dt:
             updated[agent_id] = existing
             continue
@@ -618,7 +633,7 @@ def _detect_market_response_outputs(item: dict[str, Any]) -> list[str]:
             outputs.append(label)
 
     _add("新提案", ("提案", "机会票", "opportunity", "新增方向", "新票", "候选"))
-    _add("新compose", ("compose", "runtime/jobs/compose", "compose-from-brief", "策略草案", "编排草案"))
+    _add("新compose", ("compose", "runtime/jobs/compose", "compose-from-brief", "策略草案", "编排草案", "重编排", "replan"))
     _add("持仓动作判断", ("做t", "换仓", "减仓", "加仓", "持仓", "替换", "仓位"))
     _add("热点催化判断", ("研究", "热点", "催化", "事件", "news", "dossier"))
     _add("风险边界", ("风控", "风险", "放行", "阻断", "precheck"))
@@ -804,6 +819,27 @@ def _task_prompt_for_agent(
             " 写清市场假设、playbooks、factors、weights、约束、采用理由、放弃项，再决定是否调用 /runtime/jobs/compose-from-brief。"
         )
         outputs = ["市场假设", "工具选择理由与放弃项", "playbooks/factors/weights/约束", "是否调用 compose-from-brief 及理由", "调用后的下一步动作"]
+    if agent_id == "ashare-research":
+        agent_proposed_count = int(((item.get("autonomy_metrics") or {}).get("agent_proposed_count") or 0))
+        if agent_proposed_count > 0:
+            prompt += (
+                f" 当前已有 {agent_proposed_count} 只 agent_proposed 自提票进入讨论主线。"
+                " 你不能只报热点摘要，还要补齐这些非默认机会票的市场逻辑、证据和风险点。"
+            )
+            outputs = list(dict.fromkeys([*outputs, "自提机会票补证"]))
+    if agent_id == "ashare-strategy":
+        autonomy_metrics = dict(item.get("autonomy_metrics") or {})
+        if bool(autonomy_metrics.get("retry_required")):
+            prompt += (
+                " 上一轮 compose 已被系统判定为失败后待重编排。"
+                " 现在必须直接进入第二轮 compose：先说明原市场假设为何失效，再重写假设、切换 playbooks/factors/constraints，"
+                " 并基于 auto_replan 给出的方向继续组织下一轮 compose。"
+            )
+            outputs = list(
+                dict.fromkeys(
+                    [*outputs, "第二轮 compose 草案", "假设修正说明", "重编排原因", "下一轮 compose 请求"]
+                )
+            )
     if status == "overdue":
         prompt += " 你当前已经超时，必须优先回应该阶段最紧急的任务。"
     elif status == "needs_work":
@@ -930,7 +966,7 @@ def _build_follow_up_overrides(
         prompt = (
             f"当前阶段是{phase['label']}，讨论态={cycle_state or 'idle'}。"
             " 现在不要只做口头策略判断。请先产出一份可执行 compose 草案，"
-            " 至少包含市场假设、playbooks、factors、weights、约束、工具选择理由、放弃项，"
+            " 至少包含市场假设、playbooks、factors、weights、约束、工具选择理由、放弃项，必要时自己组织参数，"
             " 并明确是否调用 /runtime/jobs/compose-from-brief 进行验证。"
         )
         follow_up["ashare-strategy"] = {
@@ -1548,6 +1584,36 @@ def build_agent_task_plan(
         if market_response_state == "lagging" and "市场响应迟滞" not in str(task.get("task_reason") or ""):
             task["task_reason"] = str(task.get("task_reason") or "").rstrip("；") + "；市场响应迟滞"
             task["dispatch_recommended"] = True
+
+        dispatch_key = str(task.get("dispatch_key") or "").strip()
+        last_event = dict(last_agents.get(agent_id) or {})
+        last_key = str(last_event.get("dispatch_key") or "")
+        last_sent_at = str(last_event.get("sent_at") or "").strip() or None
+        last_age = _seconds_since(last_sent_at, now=current)
+        completed_at = str(last_event.get("completed_at") or "").strip() or None
+        completed_age = _seconds_since(completed_at, now=current)
+        latest_activity_at = str((item_map.get(agent_id) or {}).get("last_active_at") or "").strip() or None
+        latest_activity_age = _seconds_since(latest_activity_at, now=current)
+        latest_activity_after_dispatch = (
+            bool(latest_activity_at and last_sent_at)
+            and latest_activity_age is not None
+            and last_age is not None
+            and latest_activity_age < last_age
+        )
+        is_attention = str(task.get("status") or "") in {"needs_work", "overdue"} or market_response_state == "lagging"
+        dispatch_recommended = (
+            is_attention
+            or last_key != dispatch_key
+            or last_age is None
+            or last_age >= interval_seconds
+            or (completed_at is None and latest_activity_after_dispatch)
+        )
+        if completed_at and not is_attention and last_key == dispatch_key and completed_age is not None and completed_age < interval_seconds:
+            dispatch_recommended = False
+        task["dispatch_recommended"] = dispatch_recommended
+        task["last_dispatched_at"] = last_sent_at
+        task["last_completed_at"] = completed_at
+        task["dispatch_interval_seconds"] = interval_seconds
 
     tasks.sort(key=_task_priority_key)
     recommended_tasks = [task for task in tasks if task.get("dispatch_recommended")]

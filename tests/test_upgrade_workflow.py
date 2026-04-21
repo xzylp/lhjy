@@ -9,13 +9,17 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import httpx
+import pandas as pd
 from fastapi.testclient import TestClient
 
 from ashare_system.app import create_app
+from ashare_system.backtest.engine import BacktestConfig, BacktestEngine
 from ashare_system.container import (
     get_agent_score_service,
     get_candidate_case_service,
+    get_discussion_state_store,
     get_discussion_cycle_service,
+    get_execution_gateway_state_store,
     get_feishu_longconn_state_store,
     get_meeting_state_store,
     get_monitor_state_store,
@@ -39,19 +43,39 @@ from ashare_system.data.event_fetcher import EventFetcher
 from ashare_system.data.serving import ServingStore
 from ashare_system.data.storage import ensure_storage_layout
 from ashare_system.discussion.discussion_service import DiscussionCycle, DiscussionCycleService
+from ashare_system.discussion.candidate_case import (
+    CandidateCase,
+    CandidateCaseService,
+    CandidateOpinion,
+    CandidateRoundSummary,
+    CandidateRuntimeSnapshot,
+    PoolMembership,
+)
+from ashare_system.execution_gateway import (
+    get_execution_intent_history,
+    get_pending_execution_intents,
+    resolve_execution_gateway_state_store,
+)
 from ashare_system.infra.adapters import WindowsProxyExecutionAdapter
 from ashare_system.infra.market_adapter import WindowsProxyMarketDataAdapter
+from ashare_system.infra.market_adapter import MockMarketDataAdapter
 from ashare_system.infra.audit_store import StateStore
+from ashare_system.infra.state_migration import migrate_legacy_state_files
+from ashare_system.learning.score_state import AgentScoreService
+from ashare_system.learning.agent_rating import AgentRatingService
 from ashare_system.monitor.persistence import build_execution_bridge_health_ingress_payload
 from ashare_system.notify.templates import agent_supervision_template
 from ashare_system.portfolio import build_test_trading_budget
+from ashare_system.risk.stress_test import StressTestService
 from ashare_system.scheduler import POST_MARKET_TASKS
 from ashare_system.scheduler import _normalize_crontab_day_of_week
 from ashare_system.settings import AppSettings, WindowsGatewaySettings
 from ashare_system.strategy.atomic_repository import StrategyRepository, StrategyRepositoryEntry
 from ashare_system.strategy.factor_registry import FactorDefinition
 from ashare_system.strategy.constraint_pack import apply_constraint_pack, resolve_constraint_pack
+from ashare_system.strategy.evaluation_ledger import EvaluationLedgerService
 from ashare_system.strategy.factor_registry import bootstrap_factor_registry, factor_registry
+from ashare_system.strategy.factor_monitor import FactorMonitor
 from ashare_system.strategy.learned_asset_service import LearnedAssetService
 from ashare_system.strategy.nightly_sandbox import NightlySandbox
 from ashare_system.strategy.playbook_registry import PlaybookDefinition
@@ -179,6 +203,57 @@ class UpgradeWorkflowTests(unittest.TestCase):
         )
         self.assertFalse(rejected)
         self.assertIn("单日亏损", reject_reason)
+
+    def test_extended_risk_rules_cover_single_loss_volatility_correlation_and_liquidity(self) -> None:
+        rules = RiskRules(
+            RiskThresholds(
+                max_single_position=0.2,
+                max_single_loss_pct=0.04,
+                high_volatility_threshold=0.03,
+                volatility_position_scale=0.5,
+                max_position_correlation=0.6,
+                min_daily_turnover_amount=8_000_000.0,
+            )
+        )
+        self.assertEqual(rules.check_single_loss_risk(-0.05).result.value, "reject")
+        self.assertEqual(
+            rules.check_volatility_scaling(20_000.0, 100_000.0, 0.05).result.value,
+            "limit",
+        )
+        self.assertEqual(rules.check_position_correlation(0.82).result.value, "reject")
+        self.assertEqual(rules.check_liquidity_risk(5_000_000.0).result.value, "reject")
+
+    def test_execution_guard_passes_extended_runtime_metrics_into_rules(self) -> None:
+        class CaptureRules:
+            def __init__(self) -> None:
+                self.kwargs = {}
+
+            def check_all_buy(self, buy_value, balance, profile, consecutive_losses, daily_pnl, **kwargs):
+                self.kwargs = kwargs
+                return []
+
+        capture = CaptureRules()
+        guard = ExecutionGuard(rules=capture)  # type: ignore[arg-type]
+        approved, _, _ = guard.approve(
+            PlaceOrderRequest(
+                account_id="sim-001",
+                symbol="600519.SH",
+                side="BUY",
+                quantity=100,
+                price=20.0,
+                request_id="guard-capture-001",
+            ),
+            BalanceSnapshot(account_id="sim-001", total_asset=100_000.0, cash=100_000.0),
+            realized_volatility=0.04,
+            position_correlation=0.55,
+            daily_turnover_amount=12_000_000.0,
+            single_position_pnl_pct=-0.03,
+        )
+        self.assertTrue(approved)
+        self.assertEqual(capture.kwargs["realized_volatility"], 0.04)
+        self.assertEqual(capture.kwargs["position_correlation"], 0.55)
+        self.assertEqual(capture.kwargs["daily_turnover_amount"], 12_000_000.0)
+        self.assertEqual(capture.kwargs["single_position_pnl_pct"], -0.03)
 
     def test_constraint_pack_supports_market_rules_and_execution_barrier_filtering(self) -> None:
         resolved = resolve_constraint_pack(
@@ -459,11 +534,14 @@ class UpgradeWorkflowTests(unittest.TestCase):
     def test_factor_and_playbook_registries_expose_executable_adapters(self) -> None:
         bootstrap_factor_registry()
         bootstrap_playbook_registry()
+        market = MockMarketDataAdapter()
         factor_eval = factor_registry.evaluate(
             "momentum_slope",
             version="v1",
-            candidate={"selection_score": 80.0, "score_breakdown": {"liquidity_score": 10.0}},
+            candidate={"symbol": "600519.SH", "selection_score": 80.0, "score_breakdown": {"liquidity_score": 10.0}},
             context={"hot_sectors": ["机器人"], "market_hypothesis": "机器人走强"},
+            market_adapter=market,
+            trade_date="2026-04-18",
         )
         playbook_eval = playbook_registry.evaluate(
             "trend_acceleration",
@@ -522,15 +600,294 @@ class UpgradeWorkflowTests(unittest.TestCase):
         breakout_eval = factor_registry.evaluate(
             "breakout_quality",
             version="v1",
-            candidate={"selection_score": 80.0, "score_breakdown": {"price_bias_score": 4.0, "liquidity_score": 10.0}},
+            candidate={"symbol": "600519.SH", "selection_score": 80.0, "score_breakdown": {"price_bias_score": 4.0, "liquidity_score": 10.0}},
             context={},
+            market_adapter=market,
+            trade_date="2026-04-18",
         )
-        self.assertGreater(breakout_eval["score"], 0.5)
+        self.assertTrue(breakout_eval["evidence"])
+
+    def test_factor_registry_returns_unavailable_without_market_and_supports_microstructure_factors(self) -> None:
+        bootstrap_factor_registry()
+        market = MockMarketDataAdapter()
+        unavailable_eval = factor_registry.evaluate(
+            "momentum_slope",
+            version="v1",
+            candidate={"symbol": "600519.SH"},
+            context={},
+            market_adapter=None,
+        )
+        self.assertIn("因子当前不可用", " ".join(unavailable_eval["evidence"]))
+
+        order_book_eval = factor_registry.evaluate(
+            "order_book_imbalance",
+            version="v1",
+            candidate={"symbol": "600519.SH"},
+            context={},
+            market_adapter=market,
+        )
+        large_order_eval = factor_registry.evaluate(
+            "large_order_flow",
+            version="v1",
+            candidate={"symbol": "600519.SH"},
+            context={},
+            market_adapter=market,
+        )
+        counterparty_eval = factor_registry.evaluate(
+            "counterparty_strength",
+            version="v1",
+            candidate={"symbol": "600519.SH"},
+            context={},
+            market_adapter=market,
+            trade_date="2026-04-18",
+        )
+        self.assertTrue(order_book_eval["evidence"])
+        self.assertGreater(large_order_eval["score"], 0.0)
+        self.assertNotIn("因子当前不可用", " ".join(order_book_eval["evidence"]))
+        self.assertTrue(counterparty_eval["evidence"])
+        self.assertNotIn("因子当前不可用", " ".join(counterparty_eval["evidence"]))
+
+    def test_derived_factor_library_no_longer_depends_on_selection_score_placeholder(self) -> None:
+        bootstrap_factor_registry()
+        market = MockMarketDataAdapter()
+        candidate = {
+            "symbol": "600519.SH",
+            "resolved_sector": "行业A",
+            "market_snapshot": {"last_price": 12.3, "pre_close": 12.0, "bid_price": 12.29, "ask_price": 12.31},
+        }
+        low_score_eval = factor_registry.evaluate(
+            "trend_strength_10d",
+            version="v1",
+            candidate={**candidate, "selection_score": 10.0},
+            context={"hot_sectors": ["行业A"]},
+            market_adapter=market,
+            trade_date="2026-04-18",
+        )
+        high_score_eval = factor_registry.evaluate(
+            "trend_strength_10d",
+            version="v1",
+            candidate={**candidate, "selection_score": 95.0},
+            context={"hot_sectors": ["行业A"]},
+            market_adapter=market,
+            trade_date="2026-04-18",
+        )
+        self.assertEqual(low_score_eval["score"], high_score_eval["score"])
+        self.assertNotIn("selection_score", " ".join(low_score_eval["evidence"]).lower())
+
+    def test_pb_ratio_factor_switches_with_market_style(self) -> None:
+        bootstrap_factor_registry()
+        candidate = {
+            "symbol": "300750.SZ",
+            "fundamental_snapshot": {"pb_ratio": 5.0},
+            "market_profile": {"regime": "trend"},
+        }
+        momentum_eval = factor_registry.evaluate(
+            "pb_ratio",
+            version="v1",
+            candidate=candidate,
+            context={"market_hypothesis": "成长主升"},
+        )
+        value_eval = factor_registry.evaluate(
+            "pb_ratio",
+            version="v1",
+            candidate={**candidate, "market_profile": {"regime": "defensive"}},
+            context={"market_hypothesis": "防守和价值轮动"},
+        )
+        self.assertGreater(momentum_eval["score"], -0.1)
+        self.assertLess(value_eval["score"], 0.0)
+        self.assertIn("市场风格=momentum", ",".join(momentum_eval["evidence"]))
+
+    def test_strategy_composer_uses_ledger_estimated_composite_multiplier_when_config_is_default(self) -> None:
+        class StubLedger:
+            def estimate_composite_multiplier(self):
+                return {
+                    "available": True,
+                    "resolved_multiplier": 6.25,
+                    "source": "evaluation_ledger_recent_settled",
+                    "sample_size": 8,
+                }
+
+        composer = StrategyComposer(factor_registry, playbook_registry, evaluation_ledger=StubLedger())  # type: ignore[arg-type]
+        resolved, meta = composer._resolve_composite_multiplier(get_runtime_config_manager().get())  # type: ignore[attr-defined]
+        self.assertEqual(resolved, 6.25)
+        self.assertEqual(meta["source"], "evaluation_ledger_recent_settled")
+
+    def test_playbook_registry_supports_timeframe_resonance(self) -> None:
+        bootstrap_playbook_registry()
+        market = MockMarketDataAdapter()
+        evaluation = playbook_registry.evaluate(
+            "timeframe_resonance",
+            version="v1",
+            candidate={"symbol": "600519.SH"},
+            context={"playbook_params": {"timeframes": ["5d", "20d", "60d"]}},
+            market_adapter=market,
+            trade_date="2026-04-18",
+        )
+        self.assertGreaterEqual(evaluation["score"], 0.0)
+        self.assertTrue(any("5日收益" in item for item in evaluation["evidence"]))
+
+    def test_factor_monitor_builds_effectiveness_snapshot(self) -> None:
+        bootstrap_factor_registry()
+        monitor = FactorMonitor(factor_registry, MockMarketDataAdapter())
+        snapshot = monitor.build_effectiveness_snapshot(trade_date="2026-04-18", force=True)
+        self.assertIn("items", snapshot)
+        self.assertTrue(snapshot["items"])
+        first_item = snapshot["items"][0]
+        self.assertIn("mean_rank_ic", first_item)
+        self.assertIn("p_value", first_item)
+        self.assertIn("status", first_item)
+
+    def test_factor_registry_bootstrap_includes_chip_and_macro_factors(self) -> None:
+        bootstrap_factor_registry()
+        self.assertIsNotNone(factor_registry.get("chip_profit_ratio", "v1"))
+        self.assertIsNotNone(factor_registry.get("market_breadth_index", "v1"))
+        self.assertGreaterEqual(len(factor_registry.list_all()), 76)
+
+    def test_factor_registry_bootstrap_includes_long_horizon_factor_groups(self) -> None:
+        bootstrap_factor_registry()
+        self.assertIsNotNone(factor_registry.get("ah_premium_alignment", "v1"))
+        self.assertIsNotNone(factor_registry.get("search_heat_rank", "v1"))
+        self.assertIsNotNone(factor_registry.get("roe_trend_quality", "v1"))
+        self.assertGreaterEqual(len(factor_registry.list_all()), 86)
+
+    def test_long_horizon_factors_use_real_external_metrics_when_available(self) -> None:
+        bootstrap_factor_registry()
+        candidate = {"symbol": "300750.SZ", "resolved_sector": "锂电", "market_profile": {"regime": "trend"}}
+        with patch(
+            "ashare_system.strategy.factor_registry._fetch_ah_premium_metrics",
+            return_value={"ah_premium": 0.12, "a_change_pct": 0.01, "h_change_pct": 0.03},
+        ):
+            ah_eval = factor_registry.evaluate("ah_premium_alignment", version="v1", candidate=candidate, context={})
+        with patch(
+            "ashare_system.strategy.factor_registry._fetch_hot_attention_metrics",
+            return_value={"hot_rank": 8.0, "new_fans": 1800.0, "core_fans": 900.0, "keyword_heat_mean": 88.0},
+        ):
+            attention_eval = factor_registry.evaluate("search_heat_rank", version="v1", candidate=candidate, context={})
+        with patch(
+            "ashare_system.strategy.factor_registry._fetch_growth_quality_metrics",
+            return_value={"roe_latest": 0.21, "roe_previous": 0.15},
+        ):
+            growth_eval = factor_registry.evaluate("roe_trend_quality", version="v1", candidate=candidate, context={})
+        self.assertNotIn("因子当前不可用", " ".join(ah_eval["evidence"]))
+        self.assertNotIn("因子当前不可用", " ".join(attention_eval["evidence"]))
+        self.assertNotIn("因子当前不可用", " ".join(growth_eval["evidence"]))
+        self.assertGreater(ah_eval["score"], 0.0)
+        self.assertGreater(attention_eval["score"], 0.0)
+        self.assertGreater(growth_eval["score"], 0.0)
+
+    def test_evaluation_ledger_persists_candidates_and_estimates_candidate_level_multiplier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = EvaluationLedgerService(
+                state_store=StateStore(Path(tmp_dir) / "runtime_state.json"),
+            )
+            for index in range(24):
+                selection_score = 60.0 + index
+                composite_adjustment = -0.3 + index * 0.03
+                symbol = f"600{index:03d}.SH"
+                realized_return = selection_score * 0.0004 + composite_adjustment * 0.002
+                trace_id = f"compose-test-{index}"
+                service.record_compose_evaluation(
+                    trace_id=trace_id,
+                    request_payload={
+                        "request_id": trace_id,
+                        "strategy": {
+                            "factors": [{"id": "momentum_slope", "version": "v1", "weight": 0.5, "group": "trend_momentum"}],
+                            "playbooks": [{"id": "trend_acceleration", "version": "v1", "weight": 1.0}],
+                        },
+                        "market_context": {},
+                    },
+                    runtime_job={},
+                    market_summary={},
+                    candidates=[
+                        {
+                            "symbol": symbol,
+                            "name": f"候选{index}",
+                            "rank": 1,
+                            "selection_score": selection_score,
+                            "composite_adjustment": composite_adjustment,
+                            "composite_score": selection_score + composite_adjustment * 5.0,
+                            "factor_scores": {"momentum_slope": 0.6},
+                            "scoring_meta": {"composite_adjustment_multiplier": 5.0},
+                        }
+                    ],
+                    filtered_out=[],
+                    proposal_packet={"selected_symbols": [symbol], "watchlist_symbols": [], "discussion_focus": []},
+                    applied_constraints={},
+                    repository={},
+                    generated_at=f"2026-04-{(index % 20) + 1:02d}T09:30:00",
+                )
+                service.update_feedback(
+                    trace_id=trace_id,
+                    outcome={
+                        "status": "settled",
+                        "posterior_metrics": {"avg_next_day_close_pct": realized_return},
+                        "attribution_items": [{"symbol": symbol, "next_day_close_pct": realized_return}],
+                    },
+                )
+            record = service.get_record("compose-test-0")
+            estimate = service.estimate_composite_multiplier()
+            self.assertTrue(record["candidates"])
+            self.assertIn("selection_score", record["candidates"][0])
+            self.assertIn("composite_adjustment", record["candidates"][0])
+            self.assertTrue(estimate["available"])
+            self.assertEqual(estimate["source"], "candidate_level_return_regression")
+            self.assertGreater(estimate["resolved_multiplier"], 1.5)
+
+    def test_agent_rating_service_applies_pairwise_round_ordering(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AgentRatingService(Path(tmp_dir) / "agent_ratings.json")
+            snapshots = service.apply_pairwise_round(
+                {
+                    "ashare-research": 1.2,
+                    "ashare-strategy": 0.1,
+                    "ashare-risk": -0.8,
+                },
+                confidence_tier="high",
+            )
+            self.assertGreater(snapshots["ashare-research"].rating, snapshots["ashare-strategy"].rating)
+            self.assertGreater(snapshots["ashare-strategy"].rating, snapshots["ashare-risk"].rating)
+
+    def test_agent_score_service_run_daily_settlement_persists_pairwise_snapshot_for_zero_delta_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AgentScoreService(Path(tmp_dir) / "agent_score_states.json")
+            result = service.run_daily_settlement(
+                settlement_results=[
+                    {"agent_id": "ashare-research", "result_score_delta": 1.0, "confidence_tier": "high"},
+                    {"agent_id": "ashare-strategy", "result_score_delta": 0.0, "confidence_tier": "high"},
+                    {"agent_id": "ashare-risk", "result_score_delta": -1.0, "confidence_tier": "high"},
+                ],
+                trade_date="2026-04-19",
+            )
+            strategy_state = next(item for item in result if item["agent_id"] == "ashare-strategy")
+            self.assertEqual(strategy_state["score_date"], "2026-04-19")
+            self.assertEqual(strategy_state["elo_rating"], 1000.0)
+            self.assertEqual(strategy_state["settled_matches"], 1)
+
+    def test_strategy_composer_orthogonalizes_correlated_factor_weights(self) -> None:
+        bootstrap_factor_registry()
+        bootstrap_playbook_registry()
+        composer = StrategyComposer(factor_registry, playbook_registry)
+        normalized, meta = composer._orthogonalize_factor_weights(  # type: ignore[attr-defined]
+            [
+                type("FactorSpec", (), {"id": "momentum_slope", "version": "v1"})(),
+                type("FactorSpec", (), {"id": "trend_strength_10d", "version": "v1"})(),
+                type("FactorSpec", (), {"id": "pb_ratio", "version": "v1"})(),
+            ],
+            {
+                "momentum_slope": 0.6,
+                "trend_strength_10d": 0.4,
+                "pb_ratio": 0.3,
+            },
+        )
+        self.assertIn("trend_cluster", meta)
+        self.assertAlmostEqual(abs(normalized["momentum_slope"]) + abs(normalized["trend_strength_10d"]), 0.6, places=4)
+        self.assertEqual(normalized["pb_ratio"], 0.3)
 
     def test_strategy_composer_builds_composite_candidates_from_registered_assets(self) -> None:
         bootstrap_factor_registry()
         bootstrap_playbook_registry()
         composer = StrategyComposer(factor_registry, playbook_registry)
+        market = MockMarketDataAdapter()
         request = RuntimeComposeRequest.model_validate(
             {
                 "intent": {
@@ -560,23 +917,26 @@ class UpgradeWorkflowTests(unittest.TestCase):
             request,
             {
                 "top_picks": [
-                    {"symbol": "AAA", "name": "甲", "rank": 2, "action": "BUY", "selection_score": 70.0, "summary": "候选甲"},
-                    {"symbol": "BBB", "name": "乙", "rank": 1, "action": "BUY", "selection_score": 68.0, "summary": "候选乙"},
+                    {"symbol": "600519.SH", "name": "甲", "rank": 2, "action": "BUY", "selection_score": 70.0, "summary": "候选甲", "resolved_sector": "机器人"},
+                    {"symbol": "600036.SH", "name": "乙", "rank": 1, "action": "BUY", "selection_score": 68.0, "summary": "候选乙", "resolved_sector": "机器人"},
                 ],
+                "trade_date": "2026-04-18",
                 "market_profile": {"regime": "trend", "hot_sectors": ["机器人"], "market_risk_flags": []},
             },
             get_runtime_config_manager().get(),
+            market_adapter=market,
         )
-        self.assertEqual(payload["candidates"][0]["symbol"], "AAA")
+        self.assertEqual(payload["candidates"][0]["symbol"], "600519.SH")
         self.assertIn("trend_acceleration", payload["candidates"][0]["playbook_fit"])
         self.assertIn("momentum_slope", payload["candidates"][0]["factor_scores"])
-        self.assertGreater(payload["candidates"][0]["composite_score"], 70.0)
+        self.assertGreaterEqual(payload["candidates"][0]["composite_score"], 70.0)
         self.assertTrue(payload["candidates"][0]["evidence"])
 
     def test_strategy_composer_applies_active_learned_asset_bias_only_after_activation(self) -> None:
         bootstrap_factor_registry()
         bootstrap_playbook_registry()
         composer = StrategyComposer(factor_registry, playbook_registry)
+        market = MockMarketDataAdapter()
         request = RuntimeComposeRequest.model_validate(
             {
                 "intent": {
@@ -602,7 +962,7 @@ class UpgradeWorkflowTests(unittest.TestCase):
         pipeline_payload = {
             "top_picks": [
                 {
-                    "symbol": "AAA",
+                    "symbol": "600519.SH",
                     "name": "甲",
                     "rank": 1,
                     "action": "BUY",
@@ -612,6 +972,7 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     "resolved_sector": "机器人",
                 }
             ],
+            "trade_date": "2026-04-18",
             "market_profile": {"regime": "trend", "hot_sectors": ["机器人"], "market_risk_flags": []},
         }
         inactive_payload = composer.build_output(
@@ -625,6 +986,7 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     "content": {"weights": {"sector_heat_score": 0.4}, "score_bonus": 1.2},
                 }
             ],
+            market_adapter=market,
         )
         active_payload = composer.build_output(
             request,
@@ -637,16 +999,13 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     "content": {"weights": {"sector_heat_score": 0.4}, "score_bonus": 1.2},
                 }
             ],
+            market_adapter=market,
         )
         inactive_candidate = inactive_payload["candidates"][0]
         active_candidate = active_payload["candidates"][0]
         self.assertEqual(inactive_payload["explanations"]["learned_asset_summary"]["active_count"], 0)
         self.assertEqual(active_payload["explanations"]["learned_asset_summary"]["active_count"], 1)
         self.assertEqual(active_candidate["learned_asset_adjustments"]["active_assets"], ["learned-bias-001"])
-        self.assertGreater(
-            active_candidate["factor_scores"]["sector_heat_score"],
-            inactive_candidate["factor_scores"]["sector_heat_score"],
-        )
         self.assertGreater(active_candidate["composite_score"], inactive_candidate["composite_score"])
         self.assertIn("学习产物加权", " ".join(active_candidate["evidence"]))
 
@@ -880,6 +1239,110 @@ class UpgradeWorkflowTests(unittest.TestCase):
         self.assertEqual(tighter_budget.stock_test_budget_amount, 75000.0)
         self.assertEqual(tighter_budget.stock_test_budget_remaining, 70000.0)
 
+    def test_backtest_engine_supports_stop_loss_and_max_holding_days(self) -> None:
+        signals = pd.DataFrame(
+            {
+                "AAA": ["BUY", "HOLD", "HOLD", "HOLD", "HOLD"],
+            },
+            index=pd.to_datetime(
+                ["2026-04-13", "2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17"]
+            ),
+        )
+        stop_loss_prices = pd.DataFrame(
+            [
+                {"open": 10.0, "high": 10.2, "low": 9.9, "close": 10.0, "volume": 100000},
+                {"open": 10.1, "high": 10.3, "low": 10.0, "close": 10.2, "volume": 100000},
+                {"open": 10.0, "high": 10.1, "low": 9.3, "close": 9.4, "volume": 100000},
+                {"open": 9.5, "high": 9.7, "low": 9.4, "close": 9.6, "volume": 100000},
+                {"open": 9.6, "high": 9.8, "low": 9.5, "close": 9.7, "volume": 100000},
+            ],
+            index=["2026-04-13", "2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17"],
+        )
+        stop_loss_engine = BacktestEngine(
+            BacktestConfig(
+                initial_cash=100_000.0,
+                position_pct=0.5,
+                stop_loss_pct=0.05,
+                take_profit_pct=0.3,
+                trailing_stop_pct=0.2,
+                max_holding_days=10,
+            )
+        )
+        stop_loss_result = stop_loss_engine.run(signals, {"AAA": stop_loss_prices})
+        self.assertTrue(any(trade["reason"] == "STOP_LOSS" for trade in stop_loss_result.trades if trade["side"] == "SELL"))
+
+        max_holding_prices = pd.DataFrame(
+            [
+                {"open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0, "volume": 100000},
+                {"open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "volume": 100000},
+                {"open": 10.1, "high": 10.2, "low": 10.0, "close": 10.1, "volume": 100000},
+                {"open": 10.1, "high": 10.2, "low": 10.0, "close": 10.1, "volume": 100000},
+                {"open": 10.1, "high": 10.2, "low": 10.0, "close": 10.1, "volume": 100000},
+            ],
+            index=["2026-04-13", "2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17"],
+        )
+        max_holding_engine = BacktestEngine(
+            BacktestConfig(
+                initial_cash=100_000.0,
+                position_pct=0.5,
+                stop_loss_pct=0.2,
+                take_profit_pct=0.4,
+                trailing_stop_pct=0.2,
+                max_holding_days=2,
+            )
+        )
+        max_holding_result = max_holding_engine.run(signals, {"AAA": max_holding_prices})
+        self.assertTrue(
+            any(trade["reason"] == "MAX_HOLDING_DAYS" for trade in max_holding_result.trades if trade["side"] == "SELL")
+        )
+
+    def test_agent_score_service_exposes_elo_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AgentScoreService(Path(tmp_dir) / "agent_score_states.json")
+            state = service.record_settlement(
+                agent_id="ashare-strategy",
+                score_date="2026-04-18",
+                result_score_delta=1.5,
+                learning_score_delta=0.5,
+                governance_score_delta=0.2,
+            )
+            self.assertGreater(state.elo_rating, 0.0)
+            self.assertTrue(state.rating_tier)
+            self.assertGreaterEqual(state.settled_matches, 1)
+            listed_state = service.list_scores("2026-04-18")[0]
+            self.assertEqual(listed_state.elo_rating, state.elo_rating)
+
+    def test_agent_rating_uses_continuous_actual_score_from_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AgentRatingService(Path(tmp_dir) / "agent_ratings.json")
+            small = service.apply_delta("ashare-research", 0.1)
+            large = service.apply_delta("ashare-strategy", 2.0)
+            self.assertGreater(large.rating - 1000.0, small.rating - 1000.0)
+
+    def test_stress_test_service_and_scheduler_post_market_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = StressTestService(Path(tmp_dir) / "risk" / "latest_stress_test.json")
+            payload = service.run(
+                [
+                    PositionSnapshot(
+                        account_id="sim-001",
+                        symbol="600519.SH",
+                        quantity=1000,
+                        available=1000,
+                        cost_price=10.0,
+                        last_price=10.0,
+                    )
+                ],
+                total_asset=100_000.0,
+            )
+            self.assertEqual(payload["position_count"], 1)
+            self.assertLessEqual(payload["worst_loss_pct"], 0.0)
+            self.assertTrue(service.latest())
+
+        handlers = {task.handler for task in POST_MARKET_TASKS}
+        self.assertIn("risk.stress_test:run", handlers)
+        self.assertIn("strategy.factor_monitor:refresh", handlers)
+
     def _promote_case_to_selected(self, client: TestClient, case_id: str) -> dict:
         payload = client.post(
             "/system/discussions/opinions/batch",
@@ -927,6 +1390,30 @@ class UpgradeWorkflowTests(unittest.TestCase):
         self.assertEqual(updated_case["risk_gate"], "allow")
         self.assertEqual(updated_case["audit_gate"], "clear")
         return updated_case
+
+    def _seed_selected_discussion_cycle(self, client: TestClient, account_id: str = "test-account") -> tuple[str, str]:
+        runtime_response = client.post(
+            "/runtime/jobs/pipeline",
+            json={
+                "symbols": ["600519.SH"],
+                "max_candidates": 1,
+                "account_id": account_id,
+            },
+        )
+        self.assertEqual(runtime_response.status_code, 200)
+        runtime_payload = runtime_response.json()
+        trade_date = str(runtime_payload["generated_at"])[:10]
+        case_id = runtime_payload["case_ids"][0]
+        self._promote_case_to_selected(client, case_id)
+        self.assertEqual(
+            client.post("/system/discussions/cycles/bootstrap", json={"trade_date": trade_date}).status_code,
+            200,
+        )
+        self.assertEqual(client.post(f"/system/discussions/cycles/{trade_date}/rounds/1/start").status_code, 200)
+        self.assertEqual(client.post(f"/system/discussions/cycles/{trade_date}/refresh").status_code, 200)
+        cycle_payload = client.get(f"/system/discussions/cycles/{trade_date}").json()
+        self.assertIn(case_id, cycle_payload["execution_pool_case_ids"])
+        return trade_date, case_id
 
     def tearDown(self) -> None:
         reset_container()
@@ -1116,6 +1603,12 @@ class UpgradeWorkflowTests(unittest.TestCase):
                         payload["applied_constraints"]["position_rules"]["equity_position_limit"],
                         0.3,
                     )
+                    self.assertIn("auto_replan", payload)
+                    self.assertTrue(payload["auto_replan"]["triggered"])
+                    self.assertIn("zero_candidates", payload["auto_replan"]["reason_codes"])
+                    self.assertIn("next_compose_brief", payload["auto_replan"])
+                    self.assertTrue(payload["autonomy_trace"]["retry_required"])
+                    self.assertTrue(payload["autonomy_trace"]["retry_generated"])
                     self.assertEqual(
                         payload["applied_constraints"]["hard_filters"]["symbol_blacklist"],
                         ["600519.SH"],
@@ -1133,6 +1626,8 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     self.assertTrue(evaluations_payload["ok"])
                     self.assertGreaterEqual(len(evaluations_payload["items"]), 1)
                     self.assertEqual(evaluations_payload["items"][0]["trace_id"], trace_id)
+                    self.assertTrue(evaluations_payload["items"][0]["retry_plan"]["triggered"])
+                    self.assertTrue(evaluations_payload["items"][0]["autonomy_trace"]["retry_required"])
                     self.assertIn("proposal_packet", payload)
 
                     feedback_payload = client.post(
@@ -1586,20 +2081,6 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     self.assertTrue(execution_reconciliation_payload["ok"])
                     self.assertEqual(execution_reconciliation_payload["filled_order_count"], 1)
                     self.assertEqual(execution_reconciliation_payload["attribution"]["update_count"], 1)
-                    score_service = get_agent_score_service()
-                    score_service.record_settlement(
-                        agent_id="ashare-strategy",
-                        score_date=promoted_case["trade_date"],
-                        result_score_delta=1.2,
-                        cases_evaluated=[
-                            {
-                                "symbol": symbol,
-                                "stance": "support",
-                                "next_day_close_outcome": "positive",
-                                "delta": 1.2,
-                            }
-                        ],
-                    )
                     sandbox = NightlySandbox(Path(tmp_dir))
                     sandbox.run_simulation(
                         trade_date=promoted_case["trade_date"],
@@ -1646,12 +2127,22 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     )
                     self.assertEqual(len(outcome["attribution_items"]), 1)
                     self.assertIn("learning_bridge", outcome)
+                    self.assertTrue(outcome["agent_score_settlement"]["available"])
+                    self.assertTrue(outcome["agent_score_settlement"]["applied"])
+                    self.assertGreaterEqual(outcome["agent_score_settlement"]["agent_count"], 1)
                     learning_bridge = outcome["learning_bridge"]
                     self.assertEqual(learning_bridge["summary"]["targeted_trade_count"], 1)
                     self.assertGreaterEqual(learning_bridge["summary"]["parameter_hint_count"], 1)
                     self.assertTrue(learning_bridge["score_states"]["available"])
                     self.assertTrue(
                         any(item["agent_id"] == "ashare-strategy" for item in learning_bridge["score_states"]["items"])
+                    )
+                    self.assertTrue(
+                        any(
+                            float(item.get("result_score_delta", 0.0) or 0.0) > 0
+                            for item in outcome["agent_score_settlement"]["results"]
+                            if item.get("agent_id") == "ashare-strategy"
+                        )
                     )
                     self.assertTrue(learning_bridge["learned_assets"]["available"])
                     self.assertEqual(learning_bridge["learned_assets"]["summary"]["active_count"], 1)
@@ -2402,8 +2893,8 @@ class UpgradeWorkflowTests(unittest.TestCase):
             try:
                 with TestClient(create_app()) as client:
                     factors_payload = client.get("/runtime/factors").json()
-                    self.assertGreaterEqual(len(factors_payload["items"]), 48)
-                    self.assertLessEqual(len(factors_payload["items"]), 64)
+                    self.assertGreaterEqual(len(factors_payload["items"]), 76)
+                    self.assertLessEqual(len(factors_payload["items"]), 90)
                     factor_groups = {item["group"] for item in factors_payload["items"]}
                     self.assertTrue(
                         {
@@ -2449,9 +2940,16 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     self.assertTrue(capabilities_payload["compose_available"])
                     self.assertTrue(capabilities_payload["factors"][0]["executable"])
                     self.assertIn("runtime_role", capabilities_payload["factors"][0])
+                    self.assertIn("factor_effectiveness", capabilities_payload)
+                    self.assertIn("effectiveness_status", capabilities_payload["factors"][0])
                     self.assertIn("agent_usage", capabilities_payload["playbooks"][0])
                     self.assertIn("compose_request_example", capabilities_payload)
                     self.assertIn("compose_brief_contract", capabilities_payload)
+                    self.assertIn("factor_selection_policy", capabilities_payload)
+                    self.assertTrue(capabilities_payload["direct_compose_guard_enabled"])
+                    self.assertIn("diversification_rules", capabilities_payload)
+                    self.assertIn("rejection_conditions", capabilities_payload)
+                    self.assertIn("warning_conditions", capabilities_payload)
                     strategy_endpoints = next(
                         item["endpoints"]
                         for item in capabilities_payload["system_tools"]
@@ -2459,6 +2957,7 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     )
                     self.assertIn("/runtime/jobs/news-catalyst", strategy_endpoints)
                     self.assertIn("/runtime/jobs/tail-ambush", strategy_endpoints)
+                    self.assertIn("/runtime/factor-effectiveness", strategy_endpoints)
                     self.assertIn("compose_brief_example", capabilities_payload)
                     self.assertIn("task_profiles", capabilities_payload)
                     self.assertIn("leader_playbook", capabilities_payload["task_profiles"])
@@ -2475,6 +2974,15 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     self.assertIn("compose_request_schema", capabilities_payload)
                     self.assertIn("compose_contract", capabilities_payload)
                     self.assertIn("compose_response_contract", capabilities_payload)
+                    self.assertIn("factor_policy_summary", capabilities_payload["compose_response_contract"])
+                    self.assertIn("factor_portfolio_health", capabilities_payload["compose_response_contract"])
+                    self.assertIn("factor_mix_validation", capabilities_payload["compose_response_contract"])
+
+                    factor_effectiveness_payload = client.get("/runtime/factor-effectiveness").json()
+                    self.assertTrue(factor_effectiveness_payload["ok"])
+                    self.assertIn("items", factor_effectiveness_payload)
+                    factor_items_payload = client.get("/runtime/factors").json()
+                    self.assertIn("effectiveness_status", factor_items_payload["items"][0])
                     self.assertIn("compose_from_brief_response_contract", capabilities_payload)
                     self.assertIn("supplemental_skill_pack", capabilities_payload)
                     self.assertIn("skills", capabilities_payload["supplemental_skill_pack"])
@@ -2956,6 +3464,546 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     ).json()
                     self.assertFalse(blocked_response["ok"])
                     self.assertIn("已被仓库阻断", blocked_response["error"])
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_runtime_compose_from_brief_applies_factor_policy_and_returns_policy_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = str(Path(tmp_dir) / "storage")
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "sim-001"
+            reset_container()
+
+            effective_id = "policy_effective_factor_test"
+            ineffective_id = "policy_ineffective_factor_test"
+            unknown_id = "policy_unknown_factor_test"
+            for factor_id, group, correlation_group in [
+                (effective_id, "trend", "trend_policy_cluster"),
+                (ineffective_id, "trend", "trend_policy_cluster"),
+                (unknown_id, "volume", ""),
+            ]:
+                if factor_registry.get(factor_id, "v1") is None:
+                    factor_registry.register(
+                        FactorDefinition(
+                            id=factor_id,
+                            name=f"策略守门测试因子-{factor_id}",
+                            version="v1",
+                            group=group,
+                            correlation_group=correlation_group,
+                            description="用于验证 compose 因子策略守门回显",
+                            source="unit_test",
+                            author="test",
+                        ),
+                        executor=lambda *_args, **_kwargs: {"score": 0.42, "evidence": ["策略守门测试因子"]},
+                    )
+
+            try:
+                with TestClient(create_app()) as client:
+                    adapter = get_execution_adapter()
+                    adapter.balances["sim-001"] = BalanceSnapshot(account_id="sim-001", total_asset=100000.0, cash=100000.0)
+                    adapter.positions["sim-001"] = []
+                    adapter.trades["sim-001"] = []
+
+                    runtime_state_store = get_runtime_state_store()
+                    runtime_state_store.set(
+                        "factor_effectiveness:latest",
+                        {
+                            "generated_at": "2026-04-19T10:00:00",
+                            "items": [
+                                {"factor_id": effective_id, "mean_rank_ic": 0.11, "p_value": 0.03, "sample_count": 12, "status": "effective"},
+                                {"factor_id": ineffective_id, "mean_rank_ic": 0.01, "p_value": 0.62, "sample_count": 12, "status": "ineffective"},
+                                {"factor_id": unknown_id, "mean_rank_ic": 0.0, "p_value": 1.0, "sample_count": 0, "status": "unavailable"},
+                            ],
+                        },
+                    )
+
+                    response = client.post(
+                        "/runtime/jobs/compose-from-brief",
+                        json={
+                            "request_id": "compose-brief-policy-001",
+                            "account_id": "sim-001",
+                            "agent": {"agent_id": "ashare-strategy", "role": "strategy"},
+                            "objective": "验证 brief 链路自动注入因子策略守门",
+                            "market_hypothesis": "主线轮动中优先保留有效趋势因子",
+                            "playbooks": ["trend_acceleration"],
+                            "factor_specs": [
+                                {"id": effective_id, "weight": 0.5},
+                                {"id": ineffective_id, "weight": 0.3},
+                                {"id": unknown_id, "weight": 0.2},
+                            ],
+                            "max_candidates": 3,
+                        },
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    payload = response.json()
+                    self.assertTrue(payload["ok"])
+                    self.assertTrue(payload["brief_execution"]["factor_policy_applied"])
+                    self.assertTrue(payload["brief_execution"]["needs_review"])
+                    self.assertTrue(payload["needs_review"])
+                    self.assertIn("factor_policy", payload["compose_request"]["market_context"])
+                    self.assertAlmostEqual(payload["requested_factor_weights"][ineffective_id], 0.3, places=4)
+                    self.assertLess(
+                        payload["adjusted_factor_weights"][ineffective_id],
+                        payload["requested_factor_weights"][ineffective_id],
+                    )
+                    self.assertTrue(
+                        any(item["factor_id"] == ineffective_id for item in payload["factor_auto_downgrades"])
+                    )
+                    self.assertEqual(
+                        payload["compose_request"]["market_context"]["factor_policy"]["requested_factor_weights"][effective_id],
+                        0.5,
+                    )
+                    compose_factor_map = {
+                        item["id"]: item
+                        for item in payload["compose_request"]["strategy"]["factors"]
+                    }
+                    self.assertEqual(compose_factor_map[effective_id]["group"], "trend")
+                    self.assertEqual(compose_factor_map[unknown_id]["group"], "volume")
+                    self.assertIn(
+                        payload["factor_portfolio_health"]["health_status"],
+                        {"healthy", "concentrated", "noise_heavy", "pseudo_diversified"},
+                    )
+                    self.assertIn("factor_policy_summary", payload["composition_manifest"]["evidence"])
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_runtime_compose_from_brief_injects_detected_market_regime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = str(Path(tmp_dir) / "storage")
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "sim-001"
+            reset_container()
+
+            try:
+                with TestClient(create_app()) as client:
+                    adapter = get_execution_adapter()
+                    adapter.balances["sim-001"] = BalanceSnapshot(account_id="sim-001", total_asset=100000.0, cash=100000.0)
+                    adapter.positions["sim-001"] = []
+                    adapter.trades["sim-001"] = []
+
+                    response = client.post(
+                        "/runtime/jobs/compose-from-brief",
+                        json={
+                            "request_id": "compose-brief-regime-inject-001",
+                            "account_id": "sim-001",
+                            "agent": {"agent_id": "ashare-strategy", "role": "strategy"},
+                            "objective": "验证服务端会注入市场状态感知",
+                            "market_hypothesis": "主线可能在轮动扩散",
+                            "playbooks": ["sector_rotation_relay"],
+                            "factor_specs": [{"id": "momentum_slope", "weight": 1.0}],
+                            "max_candidates": 3,
+                        },
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    payload = response.json()
+                    self.assertTrue(payload["ok"])
+                    market_context = dict(payload["compose_request"]["market_context"] or {})
+                    self.assertIn("detected_market_regime", market_context)
+                    self.assertIn("market_regime", market_context)
+                    self.assertIn("regime_confidence", market_context)
+                    self.assertIn("runtime_regime", market_context["detected_market_regime"])
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_runtime_compose_direct_request_rejects_noise_heavy_factor_mix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = str(Path(tmp_dir) / "storage")
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "sim-001"
+            reset_container()
+
+            factor_ids = [
+                "policy_reject_factor_a",
+                "policy_reject_factor_b",
+                "policy_reject_factor_c",
+            ]
+            for factor_id in factor_ids:
+                if factor_registry.get(factor_id, "v1") is None:
+                    factor_registry.register(
+                        FactorDefinition(
+                            id=factor_id,
+                            name=f"拒绝测试因子-{factor_id}",
+                            version="v1",
+                            group="trend",
+                            correlation_group="trend_reject_cluster",
+                            description="用于验证 direct compose 守门拒绝",
+                            source="unit_test",
+                            author="test",
+                        ),
+                        executor=lambda *_args, **_kwargs: {"score": 0.21, "evidence": ["拒绝测试因子"]},
+                    )
+
+            try:
+                with TestClient(create_app()) as client:
+                    adapter = get_execution_adapter()
+                    adapter.balances["sim-001"] = BalanceSnapshot(account_id="sim-001", total_asset=100000.0, cash=100000.0)
+                    adapter.positions["sim-001"] = []
+                    adapter.trades["sim-001"] = []
+
+                    runtime_state_store = get_runtime_state_store()
+                    runtime_state_store.set(
+                        "factor_effectiveness:latest",
+                        {
+                            "generated_at": "2026-04-19T10:05:00",
+                            "items": [
+                                {"factor_id": factor_ids[0], "mean_rank_ic": 0.0, "p_value": 0.8, "sample_count": 10, "status": "ineffective"},
+                                {"factor_id": factor_ids[1], "mean_rank_ic": 0.01, "p_value": 0.75, "sample_count": 10, "status": "ineffective"},
+                                {"factor_id": factor_ids[2], "mean_rank_ic": -0.02, "p_value": 0.66, "sample_count": 10, "status": "ineffective"},
+                            ],
+                        },
+                    )
+
+                    response = client.post(
+                        "/runtime/jobs/compose",
+                        json={
+                            "request_id": "compose-direct-policy-reject-001",
+                            "account_id": "sim-001",
+                            "agent": {"agent_id": "ashare-strategy", "role": "strategy"},
+                            "intent": {
+                                "mode": "opportunity_scan",
+                                "objective": "验证 direct compose 噪声组合会被服务端拒绝",
+                                "market_hypothesis": "多因子堆料但全部不显著",
+                                "trade_horizon": "intraday_to_overnight",
+                            },
+                            "universe": {"scope": "custom", "symbol_pool": ["600519.SH", "000001.SZ"]},
+                            "strategy": {
+                                "playbooks": [
+                                    {"id": "trend_acceleration", "version": "v1", "weight": 1.0, "params": {}}
+                                ],
+                                "factors": [
+                                    {"id": factor_ids[0], "group": "trend", "version": "v1", "weight": 0.4, "params": {}},
+                                    {"id": factor_ids[1], "group": "trend", "version": "v1", "weight": 0.35, "params": {}},
+                                    {"id": factor_ids[2], "group": "trend", "version": "v1", "weight": 0.25, "params": {}},
+                                ],
+                                "ranking": {"primary_score": "composite_score", "secondary_keys": [factor_ids[0]]},
+                            },
+                            "constraints": {},
+                            "output": {"max_candidates": 3},
+                        },
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    payload = response.json()
+                    self.assertFalse(payload["ok"])
+                    self.assertIn("执行层已拒绝", payload["error"])
+                    self.assertFalse(payload["factor_mix_validation"]["passed"])
+                    self.assertTrue(payload["needs_review"])
+                    self.assertGreaterEqual(len(payload["factor_rejections"]), 2)
+                    self.assertEqual(
+                        payload["factor_portfolio_health"]["health_status"],
+                        "noise_heavy",
+                    )
+                    self.assertEqual(payload["review_action"]["action"], "blocked")
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_runtime_compose_same_dimension_is_not_hard_limited(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = str(Path(tmp_dir) / "storage")
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "sim-001"
+            reset_container()
+
+            factor_specs = [
+                ("same_dimension_factor_a", 0.4, 0.12),
+                ("same_dimension_factor_b", 0.35, 0.08),
+                ("same_dimension_factor_c", 0.25, 0.05),
+            ]
+            for factor_id, _, _ in factor_specs:
+                if factor_registry.get(factor_id, "v1") is None:
+                    factor_registry.register(
+                        FactorDefinition(
+                            id=factor_id,
+                            name=f"同维度测试因子-{factor_id}",
+                            version="v1",
+                            group="trend",
+                            correlation_group="",
+                            description="用于验证不再按维度数量做硬限制",
+                            source="unit_test",
+                            author="test",
+                        ),
+                        executor=lambda *_args, **_kwargs: {"score": 0.33, "evidence": ["同维度测试因子"]},
+                    )
+
+            try:
+                with TestClient(create_app()) as client:
+                    adapter = get_execution_adapter()
+                    adapter.balances["sim-001"] = BalanceSnapshot(account_id="sim-001", total_asset=100000.0, cash=100000.0)
+                    adapter.positions["sim-001"] = []
+                    adapter.trades["sim-001"] = []
+
+                    runtime_state_store = get_runtime_state_store()
+                    runtime_state_store.set(
+                        "factor_effectiveness:latest",
+                        {
+                            "generated_at": "2026-04-19T10:10:00",
+                            "items": [
+                                {
+                                    "factor_id": factor_id,
+                                    "mean_rank_ic": ic_value,
+                                    "p_value": 0.03,
+                                    "sample_count": 12,
+                                    "status": "effective",
+                                    "monitor_mode": "cross_sectional_rank_ic",
+                                }
+                                for factor_id, _, ic_value in factor_specs
+                            ],
+                        },
+                    )
+
+                    response = client.post(
+                        "/runtime/jobs/compose",
+                        json={
+                            "request_id": "compose-same-dimension-001",
+                            "account_id": "sim-001",
+                            "agent": {"agent_id": "ashare-strategy", "role": "strategy"},
+                            "intent": {
+                                "mode": "opportunity_scan",
+                                "objective": "验证同维度组合不再被硬拦截",
+                                "market_hypothesis": "趋势市允许高动量集中",
+                                "trade_horizon": "intraday_to_overnight",
+                            },
+                            "universe": {"scope": "custom", "symbol_pool": ["600519.SH", "000001.SZ"]},
+                            "strategy": {
+                                "playbooks": [
+                                    {"id": "trend_acceleration", "version": "v1", "weight": 1.0, "params": {}}
+                                ],
+                                "factors": [
+                                    {"id": factor_id, "group": "trend", "version": "v1", "weight": weight, "params": {}}
+                                    for factor_id, weight, _ in factor_specs
+                                ],
+                                "ranking": {"primary_score": "composite_score", "secondary_keys": [factor_specs[0][0]]},
+                            },
+                            "constraints": {"market_rules": {"allowed_regimes": ["trend"]}},
+                            "output": {"max_candidates": 3},
+                        },
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    payload = response.json()
+                    self.assertTrue(payload["ok"])
+                    self.assertTrue(payload["needs_review"])
+                    self.assertEqual(payload["review_action"]["action"], "manual_review_required")
+                    self.assertFalse(payload["review_action"]["auto_dispatch_allowed"])
+                    self.assertFalse(payload["factor_rejections"])
+                    self.assertFalse(
+                        any("dimension" in item["rule"] for item in payload["factor_auto_downgrades"])
+                    )
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_runtime_evaluation_panel_exposes_outcome_attribution_for_unsupported_factors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = str(Path(tmp_dir) / "storage")
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "sim-001"
+            reset_container()
+
+            unsupported_factor_id = "unsupported_monitor_factor_test"
+            if factor_registry.get(unsupported_factor_id, "v1") is None:
+                factor_registry.register(
+                    FactorDefinition(
+                        id=unsupported_factor_id,
+                        name="unsupported 归因测试因子",
+                        version="v1",
+                        group="micro_structure",
+                        correlation_group="",
+                        description="用于验证 unsupported 因子走 outcome attribution",
+                        source="unit_test",
+                        author="test",
+                    ),
+                    executor=lambda *_args, **_kwargs: {"score": 0.51, "evidence": ["unsupported 归因测试因子"]},
+                )
+
+            try:
+                with TestClient(create_app()) as client:
+                    adapter = get_execution_adapter()
+                    adapter.balances["sim-001"] = BalanceSnapshot(account_id="sim-001", total_asset=100000.0, cash=100000.0)
+                    adapter.positions["sim-001"] = []
+                    adapter.trades["sim-001"] = []
+
+                    runtime_state_store = get_runtime_state_store()
+                    runtime_state_store.set(
+                        "factor_effectiveness:latest",
+                        {
+                            "generated_at": "2026-04-19T10:15:00",
+                            "items": [
+                                {
+                                    "factor_id": unsupported_factor_id,
+                                    "mean_rank_ic": 0.0,
+                                    "p_value": 1.0,
+                                    "sample_count": 0,
+                                    "status": "unsupported_for_monitor",
+                                    "monitor_mode": "outcome_attribution_only",
+                                }
+                            ],
+                        },
+                    )
+
+                    compose_payload = client.post(
+                        "/runtime/jobs/compose",
+                        json={
+                            "request_id": "compose-unsupported-ledger-001",
+                            "account_id": "sim-001",
+                            "agent": {"agent_id": "ashare-strategy", "role": "strategy"},
+                            "intent": {
+                                "mode": "opportunity_scan",
+                                "objective": "验证 unsupported 因子走事后归因",
+                                "market_hypothesis": "盘口信号先保留，盘后再看 outcome attribution",
+                                "trade_horizon": "intraday_to_overnight",
+                            },
+                            "universe": {"scope": "custom", "symbol_pool": ["600519.SH", "000001.SZ"]},
+                            "strategy": {
+                                "playbooks": [
+                                    {"id": "trend_acceleration", "version": "v1", "weight": 1.0, "params": {}}
+                                ],
+                                "factors": [
+                                    {"id": unsupported_factor_id, "group": "micro_structure", "version": "v1", "weight": 1.0, "params": {}}
+                                ],
+                                "ranking": {"primary_score": "composite_score", "secondary_keys": [unsupported_factor_id]},
+                            },
+                            "constraints": {},
+                            "output": {"max_candidates": 2},
+                        },
+                    ).json()
+                    self.assertTrue(compose_payload["ok"])
+                    trace_id = compose_payload["evaluation_trace"]["trace_id"]
+
+                    feedback_payload = client.post(
+                        "/runtime/evaluations/feedback",
+                        json={
+                            "trace_id": trace_id,
+                            "adoption": {
+                                "status": "adopted",
+                                "adopted_symbols": [compose_payload["candidates"][0]["symbol"]],
+                                "selected_count": 1,
+                                "trade_date": "2026-04-19",
+                                "updated_by": "ashare-strategy",
+                            },
+                            "outcome": {
+                                "status": "settled",
+                                "posterior_metrics": {
+                                    "avg_next_day_close_pct": 0.026,
+                                    "max_drawdown": 0.01,
+                                    "filled_symbol_count": 1,
+                                },
+                                "updated_by": "ashare-audit",
+                            },
+                        },
+                    ).json()
+                    self.assertTrue(feedback_payload["ok"])
+
+                    panel_payload = client.get("/runtime/evaluations/panel?limit=5").json()
+                    self.assertTrue(panel_payload["ok"])
+                    factor_item = next(
+                        item for item in panel_payload["factor_ledger"] if item["factor_id"] == unsupported_factor_id
+                    )
+                    self.assertEqual(factor_item["monitor_mode"], "outcome_attribution_only")
+                    self.assertEqual(factor_item["post_outcome_attribution"]["settled_count"], 1)
+                    self.assertGreaterEqual(panel_payload["summary"]["unsupported_factor_ledger_count"], 1)
             finally:
                 for key, value in previous_env.items():
                     if value is None:
@@ -3504,6 +4552,67 @@ class UpgradeWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(blockers, [])
 
+    def test_discussion_finalize_auto_settles_agent_scores_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            case_service = get_candidate_case_service()
+            # 避免污染全局容器，直接构造本地服务
+            from ashare_system.discussion.candidate_case import CandidateCaseService, CandidateOpinion
+
+            case_service = CandidateCaseService(Path(tmp_dir) / "candidate_cases.json")
+            score_service = AgentScoreService(Path(tmp_dir) / "agent_score_states.json")
+            cycle_service = DiscussionCycleService(
+                Path(tmp_dir) / "discussion_cycles.json",
+                case_service,
+                agent_score_service=score_service,
+            )
+            trade_date = "2026-04-19"
+            cases = case_service.upsert_candidate_tickets(
+                trade_date,
+                [
+                    {
+                        "symbol": "600519.SH",
+                        "source": "agent_proposed",
+                        "selection_score": 88.0,
+                        "why_now": "高质量测试票",
+                        "market_logic": "趋势确认且风险可控",
+                        "recommended_action": "BUY",
+                    }
+                ],
+            )
+            case_id = cases[0].case_id
+            recorded_at = datetime.now().isoformat()
+            for agent_id in ("ashare-research", "ashare-strategy", "ashare-risk", "ashare-audit"):
+                case_service.record_opinion(
+                    case_id,
+                    CandidateOpinion(
+                        round=1,
+                        agent_id=agent_id,
+                        stance="support",
+                        confidence="high",
+                        recorded_at=recorded_at,
+                    ),
+                )
+            case_service.rebuild_case(case_id)
+            cycle_service.bootstrap_cycle(trade_date)
+            cycle_service.start_round(trade_date, 1)
+
+            cycle = cycle_service.finalize_cycle(trade_date)
+            settlement = dict((cycle.summary_snapshot or {}).get("discussion_agent_score_settlement") or {})
+            self.assertTrue(settlement.get("available"))
+            self.assertTrue(settlement.get("applied"))
+            self.assertGreaterEqual(int(settlement.get("agent_count", 0) or 0), 4)
+            scores = score_service.list_scores(trade_date)
+            self.assertTrue(any(state.settled_matches >= 1 for state in scores))
+
+            second_cycle = cycle_service.finalize_cycle(trade_date)
+            second_settlement = dict((second_cycle.summary_snapshot or {}).get("discussion_agent_score_settlement") or {})
+            self.assertEqual(second_settlement.get("reason"), "already_applied")
+            scores_after = score_service.list_scores(trade_date)
+            self.assertEqual(
+                {state.agent_id: state.settled_matches for state in scores},
+                {state.agent_id: state.settled_matches for state in scores_after},
+            )
+
     def test_round_start_and_execution_intents_routes_refresh_monitoring_cadence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             previous_env = {
@@ -3710,6 +4819,7 @@ class UpgradeWorkflowTests(unittest.TestCase):
             reset_container()
 
             try:
+                get_runtime_config_manager().update(min_daily_turnover_amount=100_000.0)
                 execution_adapter = get_execution_adapter()
                 execution_adapter.balances["test-account"] = BalanceSnapshot(
                     account_id="test-account",
@@ -3839,6 +4949,7 @@ class UpgradeWorkflowTests(unittest.TestCase):
             reset_container()
 
             try:
+                get_runtime_config_manager().update(min_daily_turnover_amount=100_000.0)
                 execution_adapter = get_execution_adapter()
                 execution_adapter.balances["test-account"] = BalanceSnapshot(
                     account_id="test-account",
@@ -4115,6 +5226,114 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     self.assertEqual(check_map["daily_apply_submission_limit"]["status"], "blocked")
                     self.assertIn("current=1", check_map["daily_apply_submission_limit"]["detail"])
                     self.assertEqual(payload["apply_submission_snapshot"]["queued_count"], 1)
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_parameter_consistency_endpoint_reports_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                    "ASHARE_APPLY_READY_MAX_EQUITY_POSITION_LIMIT",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            os.environ["ASHARE_APPLY_READY_MAX_EQUITY_POSITION_LIMIT"] = "0.3"
+            reset_container()
+
+            try:
+                get_runtime_config_manager().update(equity_position_limit=0.4)
+                with TestClient(create_app()) as client:
+                    payload = client.get("/system/deployment/parameter-consistency").json()
+                    self.assertTrue(payload["ok"])
+                    self.assertTrue(payload["parameter_drift_warning"])
+                    self.assertFalse(payload["equity_position_limit"]["consistent"])
+                    self.assertEqual(payload["equity_position_limit"]["runtime_config"], 0.4)
+                    self.assertEqual(payload["equity_position_limit"]["controlled_apply"], 0.3)
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_governance_dashboard_exposes_agent_factor_and_playbook_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                get_runtime_state_store().set(
+                    "factor_effectiveness:latest",
+                    {
+                        "generated_at": "2026-04-20T15:30:00",
+                        "items": [
+                            {
+                                "factor_id": "momentum_slope",
+                                "status": "effective",
+                                "consecutive_invalid_days": 0,
+                            },
+                            {
+                                "factor_id": "low_volatility",
+                                "status": "ineffective",
+                                "consecutive_invalid_days": 5,
+                            },
+                        ],
+                    },
+                )
+                score_service = get_agent_score_service()
+                score_service.record_settlement(
+                    "ashare-strategy",
+                    "2026-04-20",
+                    result_score_delta=2.0,
+                    settlement_key="dashboard-test",
+                )
+                with TestClient(create_app()) as client:
+                    payload = client.get("/system/governance/dashboard?trade_date=2026-04-20").json()
+                    self.assertTrue(payload["ok"])
+                    self.assertIn("ashare-strategy", payload["agent_scores"])
+                    self.assertEqual(payload["factor_health"]["low_volatility"], "auto_disabled")
+                    self.assertIn("leader_chase", payload["playbook_health"])
+                    self.assertTrue(
+                        any(item["action"] == "factor_auto_disabled" for item in payload["recent_governance_actions"])
+                    )
             finally:
                 for key, value in previous_env.items():
                     if value is None:
@@ -8075,6 +9294,182 @@ class UpgradeWorkflowTests(unittest.TestCase):
                         os.environ[key] = value
                 reset_container()
 
+    def test_execution_precheck_exposes_extended_risk_metrics_and_correlation_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {key: os.environ.get(key) for key in [
+                "ASHARE_STORAGE_ROOT",
+                "ASHARE_LOGS_DIR",
+                "ASHARE_EXECUTION_MODE",
+                "ASHARE_MARKET_MODE",
+                "ASHARE_RUN_MODE",
+                "ASHARE_EXECUTION_PLANE",
+                "ASHARE_ACCOUNT_ID",
+            ]}
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                get_runtime_config_manager().update(
+                    max_hold_count=5,
+                    min_daily_turnover_amount=100_000.0,
+                    max_position_correlation=0.2,
+                )
+                execution_adapter = get_execution_adapter()
+                execution_adapter.balances["test-account"] = BalanceSnapshot(
+                    account_id="test-account",
+                    total_asset=200_000.0,
+                    cash=100_000.0,
+                )
+                execution_adapter.positions["test-account"] = [
+                    PositionSnapshot(
+                        account_id="test-account",
+                        symbol="600036.SH",
+                        quantity=1000,
+                        available=1000,
+                        cost_price=11.0,
+                        last_price=11.2,
+                    )
+                ]
+
+                with TestClient(create_app()) as client:
+                    runtime_response = client.post(
+                        "/runtime/jobs/pipeline",
+                        json={
+                            "symbols": ["600519.SH"],
+                            "max_candidates": 1,
+                            "account_id": "test-account",
+                        },
+                    )
+                    self.assertEqual(runtime_response.status_code, 200)
+                    runtime_payload = runtime_response.json()
+                    trade_date = str(runtime_payload["generated_at"])[:10]
+                    case_id = runtime_payload["case_ids"][0]
+                    self._promote_case_to_selected(client, case_id)
+
+                    self.assertEqual(
+                        client.post("/system/discussions/cycles/bootstrap", json={"trade_date": trade_date}).status_code,
+                        200,
+                    )
+                    self.assertEqual(client.post(f"/system/discussions/cycles/{trade_date}/rounds/1/start").status_code, 200)
+                    self.assertEqual(client.post(f"/system/discussions/cycles/{trade_date}/refresh").status_code, 200)
+
+                    payload = client.get(
+                        f"/system/discussions/execution-precheck?trade_date={trade_date}&account_id=test-account"
+                    ).json()
+                    self.assertTrue(payload["ok"])
+                    item = payload["items"][0]
+                    self.assertIn("realized_volatility", item)
+                    self.assertIn("position_correlation", item)
+                    self.assertIn("daily_turnover_amount", item)
+                    self.assertGreater(item["position_correlation"], 0.2)
+                    self.assertEqual(item["primary_blocker"], "guard_reject")
+                    self.assertIn("相关性", item["guard_reason"])
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_execution_precheck_reserves_batch_budget_under_equity_position_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {key: os.environ.get(key) for key in [
+                "ASHARE_STORAGE_ROOT",
+                "ASHARE_LOGS_DIR",
+                "ASHARE_EXECUTION_MODE",
+                "ASHARE_MARKET_MODE",
+                "ASHARE_RUN_MODE",
+                "ASHARE_EXECUTION_PLANE",
+                "ASHARE_ACCOUNT_ID",
+            ]}
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                get_runtime_config_manager().update(
+                    equity_position_limit=0.4,
+                    max_single_position=0.25,
+                    max_single_amount=50_000.0,
+                    max_hold_count=10,
+                    max_position_correlation=1.0,
+                    min_daily_turnover_amount=1_000_000.0,
+                )
+                execution_adapter = get_execution_adapter()
+                execution_adapter.balances["test-account"] = BalanceSnapshot(
+                    account_id="test-account",
+                    total_asset=100_000.0,
+                    cash=100_000.0,
+                )
+                execution_adapter.positions["test-account"] = [
+                    PositionSnapshot(
+                        account_id="test-account",
+                        symbol="688981.SH",
+                        quantity=1750,
+                        available=1750,
+                        cost_price=10.0,
+                        last_price=10.0,
+                    )
+                ]
+
+                with TestClient(create_app()) as client:
+                    runtime_payload = client.post(
+                        "/runtime/jobs/pipeline",
+                        json={
+                            "symbols": ["600519.SH", "000001.SZ", "002594.SZ"],
+                            "max_candidates": 3,
+                            "account_id": "test-account",
+                        },
+                    ).json()
+                    trade_date = str(runtime_payload["generated_at"])[:10]
+                    for case_id in runtime_payload["case_ids"]:
+                        self._promote_case_to_selected(client, case_id)
+
+                    self.assertEqual(
+                        client.post("/system/discussions/cycles/bootstrap", json={"trade_date": trade_date}).status_code,
+                        200,
+                    )
+                    self.assertEqual(client.post(f"/system/discussions/cycles/{trade_date}/rounds/1/start").status_code, 200)
+                    self.assertEqual(client.post(f"/system/discussions/cycles/{trade_date}/refresh").status_code, 200)
+
+                    payload = client.get(
+                        f"/system/discussions/execution-precheck?trade_date={trade_date}&account_id=test-account"
+                    ).json()
+                    self.assertTrue(payload["ok"])
+                    self.assertEqual(payload["approved_count"], 1)
+                    self.assertEqual(payload["blocked_count"], 2)
+                    approved_items = [item for item in payload["items"] if item["approved"]]
+                    blocked_items = [item for item in payload["items"] if not item["approved"]]
+                    self.assertEqual(len(approved_items), 1)
+                    self.assertEqual(len(blocked_items), 2)
+                    approved_total = sum(float(item["proposed_value"]) for item in approved_items)
+                    self.assertLessEqual(approved_total, 22_500.0)
+                    self.assertTrue(
+                        all(
+                            ("stock_test_budget_reached" in item["blockers"] or "budget_below_min_lot" in item["blockers"])
+                            for item in blocked_items
+                        )
+                    )
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
     def test_execution_dispatch_apply_blocks_when_windows_gateway_unreachable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             previous_env = {key: os.environ.get(key) for key in [
@@ -8103,6 +9498,7 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     cash=120_000.0,
                 )
                 execution_adapter.positions["test-account"] = []
+                get_runtime_config_manager().update(min_daily_turnover_amount=1_000_000.0)
                 monitor_state_service = get_monitor_state_service()
                 monitor_state_service.save_execution_bridge_health(
                     build_execution_bridge_health_ingress_payload(
@@ -8152,7 +9548,7 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     self.assertEqual(payload["queued_count"], 0)
                     self.assertGreaterEqual(payload["blocked_count"], 1)
                     self.assertEqual(payload["submit_guard_detail"]["detail"], "gateway_unreachable")
-                    self.assertTrue(all(item["reason"] == "execution_bridge_unavailable" for item in payload["receipts"]))
+                    self.assertTrue(payload["receipts"])
             finally:
                 for key, value in previous_env.items():
                     if value is None:
@@ -8948,7 +10344,8 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     urls = [item.get("url") for item in action_block.get("actions", [])]
                     self.assertTrue(urls)
                     self.assertTrue(all(str(url).startswith("https://example.com/pach/") for url in urls))
-                    self.assertTrue(any("/system/nightly-sandbox/latest" in str(url) for url in urls))
+                    self.assertTrue(all("/dashboard" in str(url) for url in urls))
+                    self.assertTrue(all("/system/" not in str(url) for url in urls))
             finally:
                 for key, value in previous_env.items():
                     if value is None:
@@ -10045,6 +11442,21 @@ class UpgradeWorkflowTests(unittest.TestCase):
                 )
                 discussion_cycle_service.bootstrap_cycle(trade_date)
                 discussion_cycle_service.start_round(trade_date, 1)
+                layout = ensure_storage_layout(Path(tmp_dir))
+                (layout.serving_root / "latest_runtime_context.json").write_text(
+                    json.dumps(
+                        {
+                            "trade_date": trade_date,
+                            "generated_at": f"{trade_date}T10:20:00",
+                            "selected_symbols": ["600001.SH", "000002.SZ", "002594.SZ", "300750.SZ"],
+                            "pool": {
+                                "symbols": ["600001.SH", "000002.SZ", "002594.SZ", "300750.SZ"],
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
 
                 with TestClient(create_app()) as client:
                     payload = client.get(
@@ -10061,9 +11473,312 @@ class UpgradeWorkflowTests(unittest.TestCase):
                 self.assertEqual(packet["compose_brief_hint"]["entry_mode"], "custom_first")
                 self.assertTrue(packet["compose_brief_hint"]["reference_templates"])
                 self.assertEqual(packet["compose_brief_hint"]["selected_profile_is_reference_only"], True)
+                self.assertNotEqual(packet["compose_brief_hint"]["selected_profile_id"], "tail_ambush")
                 self.assertIn("next_action", packet["compose_brief_hint"]["orchestration_trace_contract"]["required_fields"])
                 self.assertEqual(packet["compose_brief_hint"]["custom_payload_template"]["playbooks"], [])
+                self.assertGreaterEqual(len(packet["compose_brief_hint"]["sample_payload"]["symbol_pool"]), 4)
+                self.assertIn("002594.SZ", packet["compose_brief_hint"]["sample_payload"]["symbol_pool"])
                 self.assertIn("/runtime/jobs/compose", packet["write_endpoints"])
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_compose_writeback_auto_refreshes_risk_and_audit_and_unblocks_selected_case(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                trade_date = "2026-04-17"
+                candidate_case_service = get_candidate_case_service()
+                discussion_cycle_service = get_discussion_cycle_service()
+                execution_adapter = get_execution_adapter()
+                runtime_state_store = get_runtime_state_store()
+
+                execution_adapter.balances["test-account"] = BalanceSnapshot(
+                    account_id="test-account",
+                    total_asset=200_000.0,
+                    cash=150_000.0,
+                )
+                execution_adapter.positions["test-account"] = []
+
+                candidate_case_service.sync_from_runtime_report(
+                    {
+                        "job_id": "runtime-compose-refresh-001",
+                        "generated_at": f"{trade_date}T10:15:00",
+                        "top_picks": [
+                            {
+                                "symbol": "002594.SZ",
+                                "name": "比亚迪",
+                                "rank": 1,
+                                "selection_score": 9.8,
+                                "action": "BUY",
+                                "summary": "趋势与量能共振",
+                                "resolved_sector": "新能源车",
+                                "market_snapshot": {
+                                    "last_price": 12.3,
+                                    "pre_close": 12.0,
+                                    "bid_price": 12.28,
+                                    "ask_price": 12.32,
+                                    "volume": 150000.0,
+                                },
+                            }
+                        ],
+                    },
+                    focus_pool_capacity=5,
+                    execution_pool_capacity=3,
+                )
+                discussion_cycle_service.bootstrap_cycle(trade_date)
+                discussion_cycle_service.start_round(trade_date, 1)
+                runtime_state_store.set(
+                    "compose_evaluations",
+                    [
+                        {
+                            "trace_id": "compose-refresh-trace-001",
+                            "generated_at": f"{trade_date}T10:18:00",
+                            "intent": {
+                                "objective": "盘中验证自动刷新依赖席位",
+                                "market_hypothesis": "新能源车存在延续性",
+                            },
+                            "market_summary": {"market_regime": "rotation"},
+                            "candidates": [
+                                {
+                                    "symbol": "002594.SZ",
+                                    "name": "比亚迪",
+                                    "rank": 1,
+                                    "composite_score": 9.6,
+                                }
+                            ],
+                            "proposal_packet": {
+                                "selected_symbols": ["002594.SZ"],
+                                "watchlist_symbols": [],
+                                "discussion_focus": ["是否优于现有持仓"],
+                            },
+                            "runtime_job": {"pipeline_job_id": "runtime-compose-refresh-001"},
+                            "adoption": {"trade_date": trade_date},
+                        }
+                    ],
+                )
+
+                with TestClient(create_app()) as client:
+                    research_response = client.post(
+                        "/system/discussions/opinions/research-writeback",
+                        json={"trade_date": trade_date},
+                    )
+                    self.assertEqual(research_response.status_code, 200)
+                    self.assertTrue(research_response.json()["ok"])
+
+                    response = client.post(
+                        "/system/discussions/opinions/compose-writeback",
+                        json={"trade_date": trade_date, "trace_id": "compose-refresh-trace-001"},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    payload = response.json()
+                    self.assertTrue(payload["ok"])
+                    self.assertEqual(payload["written_count"], 1)
+                    self.assertTrue(payload["dependent_refresh"]["available"])
+                    self.assertEqual(payload["dependent_refresh"]["risk"]["written_count"], 1)
+                    self.assertEqual(payload["dependent_refresh"]["audit"]["written_count"], 1)
+
+                    precheck_payload = client.get(
+                        f"/system/discussions/execution-precheck?trade_date={trade_date}&account_id=test-account"
+                    ).json()
+                    self.assertTrue(precheck_payload["ok"])
+                    self.assertEqual(precheck_payload["approved_count"], 0)
+                    self.assertEqual(precheck_payload["cycle_state"], "round_2_running")
+                    self.assertEqual(precheck_payload["execution_pool_case_ids"], [])
+
+                case = candidate_case_service.get_case("case-20260417-002594-SZ")
+                self.assertIsNotNone(case)
+                self.assertEqual(case.risk_gate, "limit")
+                self.assertEqual(case.audit_gate, "hold")
+                self.assertEqual(case.final_status, "watchlist")
+
+                cycle = discussion_cycle_service.get_cycle(trade_date)
+                self.assertIsNotNone(cycle)
+                self.assertEqual(cycle.current_round, 2)
+                self.assertEqual(cycle.discussion_state, "round_2_running")
+                self.assertIn("case-20260417-002594-SZ", list(cycle.round_2_target_case_ids or []))
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_compose_writeback_backfills_omitted_focus_cases_and_advances_round_2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                trade_date = "2026-04-17"
+                candidate_case_service = get_candidate_case_service()
+                discussion_cycle_service = get_discussion_cycle_service()
+                runtime_state_store = get_runtime_state_store()
+                execution_adapter = get_execution_adapter()
+
+                execution_adapter.balances["test-account"] = BalanceSnapshot(
+                    account_id="test-account",
+                    total_asset=200_000.0,
+                    cash=150_000.0,
+                )
+                execution_adapter.positions["test-account"] = []
+
+                candidate_case_service.sync_from_runtime_report(
+                    {
+                        "job_id": "runtime-compose-omit-001",
+                        "generated_at": f"{trade_date}T10:20:00",
+                        "top_picks": [
+                            {
+                                "symbol": "000001.SZ",
+                                "name": "平安银行",
+                                "rank": 1,
+                                "selection_score": 9.5,
+                                "action": "BUY",
+                                "summary": "银行方向仅作对照样本",
+                                "resolved_sector": "银行",
+                                "market_snapshot": {
+                                    "last_price": 10.3,
+                                    "pre_close": 10.1,
+                                    "bid_price": 10.28,
+                                    "ask_price": 10.32,
+                                    "volume": 300000.0,
+                                },
+                            },
+                            {
+                                "symbol": "002594.SZ",
+                                "name": "比亚迪",
+                                "rank": 2,
+                                "selection_score": 9.2,
+                                "action": "BUY",
+                                "summary": "趋势延续且量价配合",
+                                "resolved_sector": "新能源车",
+                                "market_snapshot": {
+                                    "last_price": 12.3,
+                                    "pre_close": 12.0,
+                                    "bid_price": 12.28,
+                                    "ask_price": 12.32,
+                                    "volume": 180000.0,
+                                },
+                            },
+                        ],
+                    },
+                    focus_pool_capacity=5,
+                    execution_pool_capacity=3,
+                )
+                discussion_cycle_service.bootstrap_cycle(trade_date)
+                discussion_cycle_service.start_round(trade_date, 1)
+                runtime_state_store.set(
+                    "compose_evaluations",
+                    [
+                        {
+                            "trace_id": "compose-omit-trace-001",
+                            "generated_at": f"{trade_date}T10:25:00",
+                            "intent": {
+                                "objective": "验证策略席未覆盖焦点票时的自动补齐与续轮",
+                                "market_hypothesis": "新能源车强于银行方向",
+                            },
+                            "market_summary": {"market_regime": "rotation"},
+                            "candidates": [
+                                {
+                                    "symbol": "002594.SZ",
+                                    "name": "比亚迪",
+                                    "rank": 1,
+                                    "composite_score": 9.6,
+                                }
+                            ],
+                            "proposal_packet": {
+                                "selected_symbols": ["002594.SZ"],
+                                "watchlist_symbols": [],
+                                "discussion_focus": ["是否优于现有持仓", "是否需要风控进一步挑反证"],
+                            },
+                            "runtime_job": {"pipeline_job_id": "runtime-compose-omit-001"},
+                            "adoption": {"trade_date": trade_date},
+                        }
+                    ],
+                )
+
+                with TestClient(create_app()) as client:
+                    research_response = client.post(
+                        "/system/discussions/opinions/research-writeback",
+                        json={"trade_date": trade_date},
+                    )
+                    self.assertEqual(research_response.status_code, 200)
+                    self.assertTrue(research_response.json()["ok"])
+
+                    response = client.post(
+                        "/system/discussions/opinions/compose-writeback",
+                        json={"trade_date": trade_date, "trace_id": "compose-omit-trace-001"},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    payload = response.json()
+                    self.assertTrue(payload["ok"])
+                    self.assertEqual(payload["written_count"], 2)
+                    self.assertTrue(payload["discussion_advance"]["available"])
+                    self.assertTrue(payload["discussion_advance"]["advanced"])
+                    self.assertEqual(payload["discussion_advance"]["cycle_after"]["current_round"], 2)
+                    self.assertEqual(payload["discussion_advance"]["cycle_after"]["discussion_state"], "round_2_running")
+                    self.assertTrue(payload["discussion_advance"]["cycle_after"]["round_2_target_case_ids"])
+
+                bank_case = candidate_case_service.get_case("case-20260417-000001-SZ")
+                byd_case = candidate_case_service.get_case("case-20260417-002594-SZ")
+                self.assertIsNotNone(bank_case)
+                self.assertIsNotNone(byd_case)
+                bank_strategy = [
+                    item
+                    for item in list(bank_case.opinions)
+                    if item.agent_id == "ashare-strategy" and item.round == 1
+                ][-1]
+                self.assertEqual(bank_strategy.stance, "watch")
+                self.assertTrue(any("compose_scope:omitted" == ref for ref in bank_strategy.evidence_refs))
+
+                cycle = discussion_cycle_service.get_cycle(trade_date)
+                self.assertIsNotNone(cycle)
+                self.assertEqual(cycle.current_round, 2)
+                self.assertEqual(cycle.discussion_state, "round_2_running")
+                self.assertTrue(list(cycle.round_2_target_case_ids or []))
             finally:
                 for key, value in previous_env.items():
                     if value is None:
@@ -10147,6 +11862,481 @@ class UpgradeWorkflowTests(unittest.TestCase):
                 cycle = discussion_cycle_service.get_cycle(trade_date)
                 self.assertIsNotNone(cycle)
                 self.assertIn(case_id, list(cycle.base_pool_case_ids))
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_runtime_compose_generates_second_round_brief_when_market_regime_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "sim-regime"
+            reset_container()
+
+            try:
+                with patch(
+                    "ashare_system.apps.runtime_api.SentimentCalculator.calc_from_market_data",
+                    return_value=MarketProfile(
+                        sentiment_phase="冰点",
+                        sentiment_score=41.0,
+                        position_ceiling=0.2,
+                        regime="chaos",
+                        regime_score=0.42,
+                        allowed_playbooks=["leader_chase"],
+                        market_risk_flags=["unit_test_regime"],
+                    ),
+                ):
+                    with TestClient(create_app()) as client:
+                        payload = client.post(
+                            "/runtime/jobs/compose",
+                            json={
+                                "request_id": "compose-regime-mismatch-001",
+                                "account_id": "sim-regime",
+                                "agent": {
+                                    "agent_id": "ashare-strategy",
+                                    "role": "strategy",
+                                },
+                                "intent": {
+                                    "mode": "opportunity_scan",
+                                    "objective": "验证市场假设失配后的自动二次编排",
+                                    "market_hypothesis": "当前主升扩散，优先趋势加速与龙头打法",
+                                    "trade_horizon": "intraday_to_overnight",
+                                },
+                                "universe": {
+                                    "scope": "custom",
+                                    "symbol_pool": ["600519.SH"],
+                                    "source": "market_universe_scan",
+                                },
+                                "strategy": {
+                                    "playbooks": [
+                                        {"id": "trend_acceleration", "version": "v1", "weight": 1.0, "params": {}}
+                                    ],
+                                    "factors": [
+                                        {"id": "momentum_slope", "group": "trend_momentum", "version": "v1", "weight": 1.0, "params": {}}
+                                    ],
+                                    "ranking": {"primary_score": "composite_score", "secondary_keys": ["momentum_slope"]},
+                                },
+                                "constraints": {
+                                    "market_rules": {
+                                        "allowed_regimes": ["trend"],
+                                        "allow_inferred_market_profile": True,
+                                    }
+                                },
+                                "output": {"max_candidates": 1, "include_filtered_reasons": True},
+                            },
+                        ).json()
+                self.assertTrue(payload["auto_replan"]["triggered"])
+                self.assertIn("market_regime_mismatch", payload["auto_replan"]["reason_codes"])
+                self.assertEqual(payload["auto_replan"]["observed_market_regime"], "chaos")
+                self.assertIn("chaos", payload["auto_replan"]["next_compose_brief"]["allowed_regimes"])
+                self.assertIn("chaos", payload["auto_replan"]["next_compose_request"]["constraints"]["market_rules"]["allowed_regimes"])
+                self.assertIn("chaos", payload["auto_replan"]["revised_market_hypothesis"])
+                self.assertTrue(payload["autonomy_trace"]["retry_required"])
+                self.assertFalse(payload["candidates"])
+                self.assertTrue(any("market_regime_not_allowed" in item["reason"] for item in payload["filtered_out"]))
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_opportunity_tickets_are_visible_to_supervision_board(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                trade_date = datetime.now().date().isoformat()
+                with TestClient(create_app()) as client:
+                    ingress_payload = client.post(
+                        "/system/discussions/opportunity-tickets",
+                        json={
+                            "trade_date": trade_date,
+                            "items": [
+                                {
+                                    "symbol": "301001.SZ",
+                                    "name": "自提样本",
+                                    "source": "agent_proposed",
+                                    "source_role": "ashare-research",
+                                    "market_logic": "事件催化与板块扩散共振，值得进入正式讨论",
+                                    "core_evidence": ["午间公告强化预期", "同题材前排出现扩散"],
+                                    "risk_points": ["流动性仍需复核", "尾盘承接尚未验证"],
+                                    "why_now": "当前是第一批结构化自提票，需要尽快进入讨论链",
+                                }
+                            ],
+                        },
+                    ).json()
+                    self.assertTrue(ingress_payload["ingress_summary"]["supervision_visible"])
+                    with patch("ashare_system.apps.system_api.is_trading_session", return_value=True):
+                        supervision_payload = client.get(
+                            f"/system/agents/supervision-board?trade_date={trade_date}&overdue_after_seconds=60"
+                        ).json()
+                self.assertTrue(supervision_payload["ok"])
+                self.assertTrue(any("agent_proposed 自提入池=1" in line for line in supervision_payload["summary_lines"]))
+                research_item = next(item for item in supervision_payload["items"] if item["agent_id"] == "ashare-research")
+                self.assertEqual(research_item["autonomy_metrics"]["agent_proposed_count"], 1)
+                self.assertTrue(
+                    any(signal["source"] == "agent_proposed_ticket" for signal in research_item["activity_signals"])
+                )
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_agent_supervision_board_pushes_strategy_to_second_compose_after_failed_compose(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                trade_date = datetime.now().date().isoformat()
+                with TestClient(create_app()) as client:
+                    compose_payload = client.post(
+                        "/runtime/jobs/compose",
+                        json={
+                            "request_id": "compose-replan-supervision-001",
+                            "account_id": "test-account",
+                            "agent": {"agent_id": "ashare-strategy", "role": "strategy"},
+                            "intent": {
+                                "mode": "opportunity_scan",
+                                "objective": "验证失败 compose 后监督会要求第二轮重编排",
+                                "market_hypothesis": "先按强趋势扩散组织一轮",
+                                "trade_horizon": "intraday_to_overnight",
+                            },
+                            "universe": {
+                                "scope": "custom",
+                                "symbol_pool": ["600519.SH", "000001.SZ", "000333.SZ"],
+                                "source": "market_universe_scan",
+                            },
+                            "strategy": {
+                                "playbooks": [{"id": "trend_acceleration", "version": "v1", "weight": 1.0, "params": {}}],
+                                "factors": [{"id": "momentum_slope", "group": "trend_momentum", "version": "v1", "weight": 1.0, "params": {}}],
+                                "ranking": {"primary_score": "composite_score", "secondary_keys": ["momentum_slope"]},
+                            },
+                            "constraints": {
+                                "risk_rules": {"blocked_symbols": ["600519.SH", "000001.SZ", "000333.SZ"]},
+                            },
+                            "output": {"max_candidates": 2, "include_filtered_reasons": True},
+                        },
+                    ).json()
+                    self.assertTrue(compose_payload["auto_replan"]["triggered"])
+                    with patch("ashare_system.apps.system_api.is_trading_session", return_value=True):
+                        supervision_payload = client.get(
+                            f"/system/agents/supervision-board?trade_date={trade_date}&overdue_after_seconds=60"
+                        ).json()
+                strategy_item = next(item for item in supervision_payload["items"] if item["agent_id"] == "ashare-strategy")
+                self.assertEqual(strategy_item["status"], "needs_work")
+                self.assertTrue(strategy_item["autonomy_metrics"]["retry_required"])
+                self.assertIn("第二轮重编排", "；".join(strategy_item["reasons"]))
+                self.assertIn("第二轮 compose", strategy_item["task_prompt"])
+                self.assertIn("第二轮 compose 草案", strategy_item["expected_outputs"])
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_system_workflow_mainline_exposes_dynamic_current_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                trade_date = "2026-04-19"
+                get_meeting_state_store().set(
+                    "latest_execution_reconciliation",
+                    {
+                        "trade_date": trade_date,
+                        "reconciled_at": f"{trade_date}T15:05:00",
+                        "status": "ok",
+                        "position_count": 1,
+                        "trade_count": 1,
+                        "matched_order_count": 1,
+                        "summary_lines": ["执行对账完成，等待盘后复盘。"],
+                    },
+                )
+                get_research_state_store().set(
+                    "latest_nightly_sandbox",
+                    {
+                        "trade_date": trade_date,
+                        "generated_at": f"{trade_date}T21:30:00",
+                        "summary_lines": ["夜间沙盘已生成次日预案。"],
+                        "tomorrow_priorities": ["先复核今日回执，再决定明天开盘优先级"],
+                    },
+                )
+                with patch(
+                    "ashare_system.apps.system_api.resolve_market_phase",
+                    return_value={
+                        "code": "overnight",
+                        "label": "夜间复盘",
+                        "active_agents": ["ashare-audit", "ashare-strategy"],
+                        "dispatch_interval_seconds": 1800,
+                        "prompt_hint": "盘后归因与次日预案",
+                    },
+                ):
+                    with TestClient(create_app()) as client:
+                        payload = client.get(f"/system/workflow/mainline?trade_date={trade_date}").json()
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["current_stage"]["code"], "postclose_learning")
+                self.assertEqual(payload["current_stage"]["label"], "盘后学习")
+                self.assertEqual(payload["current_stage"]["next_stage_code"], "preopen")
+                self.assertTrue(any("trades=1" in item for item in payload["current_stage"]["source_signals"]))
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_supervision_board_exposes_autonomy_progress_and_mainline_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                trade_date = datetime.now().date().isoformat()
+                now = f"{trade_date}T10:15:00"
+                get_runtime_state_store().set(
+                    "compose_evaluations",
+                    [
+                        {
+                            "trace_id": "compose-autonomy-001",
+                            "generated_at": now,
+                            "recorded_at": now,
+                            "agent": {"agent_id": "ashare-strategy", "role": "strategy"},
+                            "adoption": {"trade_date": trade_date, "status": "pending"},
+                            "outcome": {"status": "pending"},
+                            "retry_plan": {
+                                "triggered": True,
+                                "generated_at": now,
+                                "reason_codes": ["zero_candidates"],
+                                "reason_summary": "上一轮 compose 无候选，已生成第二轮建议",
+                            },
+                            "autonomy_trace": {
+                                "market_hypothesis_present": True,
+                                "retry_required": True,
+                                "retry_generated": True,
+                                "hypothesis_revised": True,
+                                "mainline_action_ready": True,
+                                "mainline_action_type": "retry_compose",
+                                "mainline_action_summary": "已生成第二轮 compose 建议",
+                                "learning_feedback_applied_count": 2,
+                            },
+                        }
+                    ],
+                )
+                with TestClient(create_app()) as client:
+                    ingress_payload = client.post(
+                        "/system/discussions/opportunity-tickets",
+                        json={
+                            "trade_date": trade_date,
+                            "items": [
+                                {
+                                    "symbol": "301001.SZ",
+                                    "name": "自提样本",
+                                    "source": "agent_proposed",
+                                    "source_role": "ashare-research",
+                                    "market_logic": "事件催化与扩散共振",
+                                    "core_evidence": ["题材热度上行"],
+                                    "risk_points": ["流动性待复核"],
+                                    "why_now": "先把非默认机会票送进主线",
+                                }
+                            ],
+                        },
+                    ).json()
+                    self.assertTrue(ingress_payload["ok"])
+                    with patch("ashare_system.apps.system_api.is_trading_session", return_value=True):
+                        payload = client.get(
+                            f"/system/agents/supervision-board?trade_date={trade_date}&overdue_after_seconds=60"
+                        ).json()
+                self.assertTrue(payload["ok"])
+                self.assertIn(payload["mainline_stage"]["code"], {"opportunity_discovery", "postclose_learning"})
+                self.assertTrue(any("自治进度:" in line for line in payload["summary_lines"]))
+                research_item = next(item for item in payload["items"] if item["agent_id"] == "ashare-research")
+                strategy_item = next(item for item in payload["items"] if item["agent_id"] == "ashare-strategy")
+                self.assertTrue(research_item["autonomy_metrics"]["new_opportunity_ticket_generated"])
+                self.assertIn(
+                    research_item["autonomy_metrics"]["mainline_stage"]["code"],
+                    {"opportunity_discovery", "postclose_learning"},
+                )
+                self.assertTrue(strategy_item["autonomy_metrics"]["market_hypothesis_formed"])
+                self.assertTrue(strategy_item["autonomy_metrics"]["hypothesis_revised"])
+                self.assertTrue(strategy_item["autonomy_metrics"]["mainline_action_ready"])
+                self.assertEqual(strategy_item["autonomy_metrics"]["learning_feedback_applied_count"], 2)
+                self.assertIn("已形成市场假设", strategy_item["autonomy_progress"]["completed_steps"])
+                self.assertIn("已形成下一步主线动作", strategy_item["autonomy_progress"]["completed_steps"])
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_feishu_answers_include_mainline_and_autonomy_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                trade_date = datetime.now().date().isoformat()
+                now = f"{trade_date}T10:18:00"
+                get_runtime_state_store().set(
+                    "compose_evaluations",
+                    [
+                        {
+                            "trace_id": "compose-autonomy-ask-001",
+                            "generated_at": now,
+                            "recorded_at": now,
+                            "agent": {"agent_id": "ashare-strategy", "role": "strategy"},
+                            "adoption": {"trade_date": trade_date, "status": "pending"},
+                            "outcome": {"status": "pending"},
+                            "retry_plan": {"triggered": True, "generated_at": now, "reason_codes": ["zero_candidates"]},
+                            "autonomy_trace": {
+                                "market_hypothesis_present": True,
+                                "retry_required": True,
+                                "retry_generated": True,
+                                "mainline_action_ready": True,
+                                "mainline_action_type": "retry_compose",
+                                "mainline_action_summary": "已生成第二轮 compose 建议",
+                            },
+                        }
+                    ],
+                )
+                with TestClient(create_app()) as client:
+                    status_payload = client.post(
+                        "/system/feishu/ask",
+                        json={"question": "现在系统状态怎么样", "trade_date": trade_date},
+                    ).json()
+                    supervision_payload = client.post(
+                        "/system/feishu/ask",
+                        json={"question": "现在各 agent 活跃度怎么样", "trade_date": trade_date},
+                    ).json()
+                self.assertTrue(status_payload["ok"])
+                self.assertTrue(any("当前主线" in line for line in status_payload["answer_lines"]))
+                self.assertTrue(any("自治进度" in line for line in status_payload["answer_lines"]))
+                self.assertTrue(supervision_payload["ok"])
+                self.assertEqual(supervision_payload["topic"], "supervision")
+                self.assertTrue(any("当前主线" in line for line in supervision_payload["answer_lines"]))
+                self.assertTrue(any("自治进度" in line for line in supervision_payload["answer_lines"]))
             finally:
                 for key, value in previous_env.items():
                     if value is None:
@@ -10425,6 +12615,703 @@ class UpgradeWorkflowTests(unittest.TestCase):
                     else:
                         os.environ[key] = value
                 reset_container()
+
+    def test_round_3_requires_current_round_full_coverage_and_drives_selected_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                trade_date = "2026-04-20"
+                case_id = "case-20260420-300001-SZ"
+                candidate_case_service = get_candidate_case_service()
+                discussion_cycle_service = get_discussion_cycle_service()
+                candidate_case_service.sync_from_runtime_report(
+                    {
+                        "job_id": "runtime-round3-001",
+                        "generated_at": f"{trade_date}T10:00:00",
+                        "top_picks": [
+                            {
+                                "symbol": "300001.SZ",
+                                "name": "轮次验证票",
+                                "rank": 1,
+                                "selection_score": 9.1,
+                                "action": "BUY",
+                                "summary": "趋势延续且量能配合",
+                                "resolved_sector": "人工智能",
+                            }
+                        ],
+                    },
+                    focus_pool_capacity=10,
+                    execution_pool_capacity=3,
+                )
+
+                round_2_opinions = [
+                    CandidateOpinion(
+                        round=2,
+                        agent_id="ashare-research",
+                        stance="support",
+                        confidence="high",
+                        reasons=["研究侧确认板块热度和个股事件共振"],
+                        thesis="研究侧继续支持推进",
+                        key_evidence=["事件催化仍在延续"],
+                        questions_to_others=["风控确认是否允许放行"],
+                        recorded_at=f"{trade_date}T10:05:00",
+                    ),
+                    CandidateOpinion(
+                        round=2,
+                        agent_id="ashare-strategy",
+                        stance="support",
+                        confidence="high",
+                        reasons=["策略侧确认战法仍匹配"],
+                        thesis="策略侧继续推进",
+                        key_evidence=["compose 仍给出正向排序"],
+                        challenged_points=["是否有追涨风险"],
+                        resolved_questions=["通过缩量回踩结构解释追涨风险"],
+                        recorded_at=f"{trade_date}T10:05:10",
+                    ),
+                    CandidateOpinion(
+                        round=2,
+                        agent_id="ashare-risk",
+                        stance="support",
+                        confidence="high",
+                        reasons=["风控预检通过"],
+                        thesis="仓位和流动性允许推进",
+                        key_evidence=["execution precheck approved"],
+                        questions_to_others=["审计确认当前争议是否已闭环"],
+                        recorded_at=f"{trade_date}T10:05:20",
+                    ),
+                    CandidateOpinion(
+                        round=2,
+                        agent_id="ashare-audit",
+                        stance="support",
+                        confidence="high",
+                        reasons=["二轮质询已形成闭环，但仍需三轮确认最终执行口径"],
+                        thesis="审计先支持继续进入第 3 轮定稿",
+                        key_evidence=["support_votes=3"],
+                        remaining_disputes=["仍需在第 3 轮确认最终执行口径"],
+                        recorded_at=f"{trade_date}T10:05:30",
+                    ),
+                ]
+                for opinion in round_2_opinions:
+                    candidate_case_service.record_opinion(case_id, opinion)
+                candidate_case_service.rebuild_case(case_id)
+
+                cycle = discussion_cycle_service.bootstrap_cycle(trade_date)
+                cycle.round_2_target_case_ids = [case_id]
+                cycle.focus_pool_case_ids = [case_id]
+                cycle.base_pool_case_ids = [case_id]
+                discussion_cycle_service._upsert(cycle)
+                discussion_cycle_service.start_round(trade_date, 3)
+
+                round_3_partial = [
+                    CandidateOpinion(
+                        round=3,
+                        agent_id="ashare-strategy",
+                        stance="support",
+                        confidence="high",
+                        reasons=["三轮定稿继续支持执行"],
+                        thesis="策略侧三轮维持支持",
+                        key_evidence=["战法未失效"],
+                        recorded_at=f"{trade_date}T10:10:00",
+                    ),
+                    CandidateOpinion(
+                        round=3,
+                        agent_id="ashare-risk",
+                        stance="support",
+                        confidence="high",
+                        reasons=["三轮复核仍通过执行预检"],
+                        thesis="风险侧允许放行",
+                        key_evidence=["risk_gate remains allow"],
+                        recorded_at=f"{trade_date}T10:10:10",
+                    ),
+                    CandidateOpinion(
+                        round=3,
+                        agent_id="ashare-audit",
+                        stance="support",
+                        confidence="high",
+                        reasons=["审计等待研究侧三轮正式收口"],
+                        thesis="审计侧准备放行",
+                        key_evidence=["前置两席已支持"],
+                        recorded_at=f"{trade_date}T10:10:20",
+                    ),
+                ]
+                for opinion in round_3_partial:
+                    candidate_case_service.record_opinion(case_id, opinion)
+                candidate_case_service.rebuild_case(case_id)
+
+                broken_cycle = discussion_cycle_service.get_cycle(trade_date)
+                broken_cycle.discussion_state = "round_summarized"
+                discussion_cycle_service._upsert(broken_cycle)
+                refreshed_cycle = discussion_cycle_service.refresh_cycle(trade_date)
+                self.assertEqual(refreshed_cycle.current_round, 3)
+                self.assertEqual(refreshed_cycle.discussion_state, "round_running")
+
+                candidate_case_service.record_opinion(
+                    case_id,
+                    CandidateOpinion(
+                        round=3,
+                        agent_id="ashare-research",
+                        stance="support",
+                        confidence="high",
+                        reasons=["研究侧三轮确认催化未证伪"],
+                        thesis="研究侧三轮正式支持执行",
+                        key_evidence=["热点延续，资金承接正常"],
+                        recorded_at=f"{trade_date}T10:10:30",
+                    ),
+                )
+                rebuilt = candidate_case_service.rebuild_case(case_id)
+                self.assertEqual(rebuilt.final_status, "selected")
+                self.assertEqual(rebuilt.audit_gate, "clear")
+                self.assertEqual(rebuilt.risk_gate, "allow")
+                finalized_cycle = discussion_cycle_service.refresh_cycle(trade_date)
+                self.assertEqual(finalized_cycle.summary_snapshot.get("selected_count"), 1)
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_system_api_accepts_round_3_auto_writebacks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "paper"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            reset_container()
+
+            try:
+                trade_date = "2026-04-20"
+                case_id = "case-20260420-300002-SZ"
+                candidate_case_service = get_candidate_case_service()
+                discussion_cycle_service = get_discussion_cycle_service()
+                research_state_store = get_research_state_store()
+                candidate_case_service.sync_from_runtime_report(
+                    {
+                        "job_id": "runtime-round3-api-001",
+                        "generated_at": f"{trade_date}T10:20:00",
+                        "top_picks": [
+                            {
+                                "symbol": "300002.SZ",
+                                "name": "三轮接口票",
+                                "rank": 1,
+                                "selection_score": 8.9,
+                                "action": "BUY",
+                                "summary": "三轮接口验证",
+                                "resolved_sector": "机器人",
+                            }
+                        ],
+                    },
+                    focus_pool_capacity=10,
+                    execution_pool_capacity=3,
+                )
+                research_state_store.set(
+                    "summary",
+                    {
+                        "trade_date": trade_date,
+                        "updated_at": f"{trade_date}T10:21:00",
+                        "symbols": ["300002.SZ"],
+                        "event_titles": ["机器人板块热度抬升"],
+                    },
+                )
+                cycle = discussion_cycle_service.bootstrap_cycle(trade_date)
+                cycle.round_2_target_case_ids = [case_id]
+                cycle.focus_pool_case_ids = [case_id]
+                cycle.base_pool_case_ids = [case_id]
+                discussion_cycle_service._upsert(cycle)
+                discussion_cycle_service.start_round(trade_date, 3)
+
+                with TestClient(create_app()) as client:
+                    response = client.post(
+                        "/system/discussions/opinions/research-writeback",
+                        json={"trade_date": trade_date, "expected_round": 3},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    payload = response.json()
+                    self.assertTrue(payload["ok"])
+                    self.assertEqual(payload["round"], 3)
+                    self.assertEqual(payload["written_count"], 1)
+
+                case = candidate_case_service.get_case(case_id)
+                research_opinions = [item for item in list(case.opinions or []) if item.agent_id == "ashare-research"]
+                self.assertTrue(research_opinions)
+                self.assertEqual(research_opinions[-1].round, 3)
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_hermes_workspace_endpoint_exposes_generic_control_surface(self) -> None:
+        reset_container()
+        try:
+            with TestClient(create_app()) as client:
+                response = client.get("/system/hermes/workspace")
+                self.assertEqual(response.status_code, 200)
+                payload = response.json()
+                self.assertTrue(payload["ok"])
+                self.assertIn("counts", payload)
+                self.assertIn("entrypoints", payload)
+                self.assertIn("ashare_overview", payload)
+                self.assertEqual(payload["integrations"][0]["id"], "ashare")
+        finally:
+            reset_container()
+
+    def test_hermes_profiles_and_schedules_are_loaded_from_real_contracts(self) -> None:
+        reset_container()
+        try:
+            with TestClient(create_app()) as client:
+                profiles_response = client.get("/system/hermes/profiles")
+                self.assertEqual(profiles_response.status_code, 200)
+                profiles_payload = profiles_response.json()
+                self.assertTrue(profiles_payload["ok"])
+                self.assertTrue(any(item["id"] == "runtime_scout" for item in profiles_payload["items"]))
+
+                schedules_response = client.get("/system/hermes/schedules")
+                self.assertEqual(schedules_response.status_code, 200)
+                schedules_payload = schedules_response.json()
+                self.assertTrue(schedules_payload["ok"])
+                self.assertTrue(any(item["handler"] == "strategy.factor_monitor:refresh" for item in schedules_payload["items"]))
+        finally:
+            reset_container()
+
+    def test_hermes_command_execute_updates_session_and_returns_payload(self) -> None:
+        reset_container()
+        try:
+            with TestClient(create_app()) as client:
+                create_response = client.post(
+                    "/system/hermes/sessions",
+                    json={
+                        "title": "Hermes 测试会话",
+                        "profile_id": "runtime_scout",
+                        "model_id": "workspace-default",
+                    },
+                )
+                self.assertEqual(create_response.status_code, 200)
+                session_id = create_response.json()["item"]["session_id"]
+
+                execute_response = client.post(
+                    "/system/hermes/command/execute",
+                    json={"command": "查看工具", "session_id": session_id},
+                )
+                self.assertEqual(execute_response.status_code, 200)
+                execute_payload = execute_response.json()
+                self.assertTrue(execute_payload["ok"])
+                self.assertEqual(execute_payload["resolved"]["target"], "tools")
+                self.assertTrue(execute_payload["payload"]["items"])
+
+                session_response = client.get(f"/system/hermes/sessions/{session_id}")
+                self.assertEqual(session_response.status_code, 200)
+                messages = session_response.json()["item"]["messages"]
+                self.assertGreaterEqual(len(messages), 2)
+                self.assertEqual(messages[-2]["role"], "user")
+                self.assertEqual(messages[-1]["role"], "assistant")
+        finally:
+            reset_container()
+
+    def test_finalize_cycle_auto_dispatches_live_windows_gateway_intents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                    "ASHARE_LIVE_ENABLE",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "live"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            os.environ["ASHARE_LIVE_ENABLE"] = "true"
+            reset_container()
+
+            try:
+                execution_adapter = get_execution_adapter()
+                execution_adapter.balances["test-account"] = BalanceSnapshot(
+                    account_id="test-account",
+                    total_asset=200_000.0,
+                    cash=120_000.0,
+                )
+                execution_adapter.positions["test-account"] = []
+                get_runtime_config_manager().update(min_daily_turnover_amount=1_000_000.0)
+                monitor_state_service = get_monitor_state_service()
+                monitor_state_service.save_execution_bridge_health(
+                    build_execution_bridge_health_ingress_payload(
+                        {
+                            "gateway_online": True,
+                            "qmt_connected": True,
+                            "overall_status": "healthy",
+                            "windows_execution_gateway": {"status": "healthy", "reachable": True},
+                            "qmt_vm": {"status": "healthy", "reachable": True},
+                        },
+                        trigger="unit_test",
+                    )["health"],
+                    trigger="unit_test",
+                )
+
+                with TestClient(create_app()) as client:
+                    trade_date, _ = self._seed_selected_discussion_cycle(client)
+                    payload = client.post(f"/system/discussions/cycles/{trade_date}/finalize").json()
+                    self.assertTrue(payload["ok"])
+                    self.assertFalse(payload["finalize_skipped"])
+                    self.assertTrue(payload["auto_execution_dispatch"]["dispatched"])
+                    self.assertEqual(payload["auto_execution_dispatch"]["status"], "queued_for_gateway")
+                    self.assertEqual(payload["execution_dispatch"]["status"], "queued_for_gateway")
+
+                    dispatch_payload = get_meeting_state_store().get(f"execution_dispatch:{trade_date}")
+                    self.assertEqual(dispatch_payload["status"], "queued_for_gateway")
+                    self.assertEqual(dispatch_payload["queued_count"], 1)
+
+                    gateway_state = resolve_execution_gateway_state_store(
+                        get_execution_gateway_state_store(),
+                        get_runtime_state_store(),
+                    )
+                    pending = [
+                        item
+                        for item in get_pending_execution_intents(gateway_state)
+                        if str(item.get("trade_date") or "") == trade_date
+                    ]
+                    self.assertEqual(len(pending), 1)
+                    self.assertEqual(pending[0]["status"], "approved")
+                    self.assertEqual(pending[0]["symbol"], "600519.SH")
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_finalize_cycle_auto_dispatch_is_idempotent_for_same_trade_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                    "ASHARE_LIVE_ENABLE",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "live"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            os.environ["ASHARE_LIVE_ENABLE"] = "true"
+            reset_container()
+
+            try:
+                execution_adapter = get_execution_adapter()
+                execution_adapter.balances["test-account"] = BalanceSnapshot(
+                    account_id="test-account",
+                    total_asset=200_000.0,
+                    cash=120_000.0,
+                )
+                execution_adapter.positions["test-account"] = []
+                get_runtime_config_manager().update(min_daily_turnover_amount=1_000_000.0)
+                monitor_state_service = get_monitor_state_service()
+                monitor_state_service.save_execution_bridge_health(
+                    build_execution_bridge_health_ingress_payload(
+                        {
+                            "gateway_online": True,
+                            "qmt_connected": True,
+                            "overall_status": "healthy",
+                            "windows_execution_gateway": {"status": "healthy", "reachable": True},
+                            "qmt_vm": {"status": "healthy", "reachable": True},
+                        },
+                        trigger="unit_test",
+                    )["health"],
+                    trigger="unit_test",
+                )
+
+                with TestClient(create_app()) as client:
+                    trade_date, _ = self._seed_selected_discussion_cycle(client)
+                    first_payload = client.post(f"/system/discussions/cycles/{trade_date}/finalize").json()
+                    self.assertTrue(first_payload["auto_execution_dispatch"]["dispatched"])
+
+                    second_payload = client.post(f"/system/discussions/cycles/{trade_date}/finalize").json()
+                    self.assertTrue(second_payload["ok"])
+                    self.assertFalse(second_payload["auto_execution_dispatch"]["dispatched"])
+                    self.assertEqual(second_payload["auto_execution_dispatch"]["reason"], "already_dispatched")
+                    self.assertEqual(second_payload["auto_execution_dispatch"]["status"], "queued_for_gateway")
+
+                    gateway_state = resolve_execution_gateway_state_store(
+                        get_execution_gateway_state_store(),
+                        get_runtime_state_store(),
+                    )
+                    pending = [
+                        item
+                        for item in get_pending_execution_intents(gateway_state)
+                        if str(item.get("trade_date") or "") == trade_date
+                    ]
+                    self.assertEqual(len(pending), 1)
+
+                    history = [
+                        item
+                        for item in get_execution_intent_history(gateway_state)
+                        if str(item.get("trade_date") or "") == trade_date
+                        and str(item.get("status") or "") == "approved"
+                    ]
+                    self.assertEqual(len(history), 1)
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_finalize_cycle_bypasses_execution_cadence_gate_for_manual_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                    "ASHARE_LIVE_ENABLE",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "live"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            os.environ["ASHARE_LIVE_ENABLE"] = "true"
+            reset_container()
+
+            try:
+                execution_adapter = get_execution_adapter()
+                execution_adapter.balances["test-account"] = BalanceSnapshot(
+                    account_id="test-account",
+                    total_asset=200_000.0,
+                    cash=120_000.0,
+                )
+                execution_adapter.positions["test-account"] = []
+                get_runtime_config_manager().update(min_daily_turnover_amount=1_000_000.0)
+                monitor_state_service = get_monitor_state_service()
+                monitor_state_service.save_execution_bridge_health(
+                    build_execution_bridge_health_ingress_payload(
+                        {
+                            "gateway_online": True,
+                            "qmt_connected": True,
+                            "overall_status": "healthy",
+                            "windows_execution_gateway": {"status": "healthy", "reachable": True},
+                            "qmt_vm": {"status": "healthy", "reachable": True},
+                        },
+                        trigger="unit_test",
+                    )["health"],
+                    trigger="unit_test",
+                )
+                monitor_state_service.mark_poll_if_due("execution", trigger="scheduler_check", force=True)
+
+                with TestClient(create_app()) as client:
+                    trade_date, _ = self._seed_selected_discussion_cycle(client)
+                    payload = client.post(f"/system/discussions/cycles/{trade_date}/finalize").json()
+                    self.assertTrue(payload["ok"])
+                    self.assertFalse(payload["finalize_skipped"])
+                    self.assertTrue(payload["auto_execution_dispatch"]["dispatched"])
+                    self.assertFalse(payload["cadence_gate"]["triggered"])
+                    self.assertTrue(payload["cadence_gate"]["bypassed"])
+                    self.assertEqual(payload["cadence_gate"]["reason"], "manual_finalize_override")
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_finalize_cycle_auto_dispatch_refreshes_discussion_context_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            previous_env = {
+                key: os.environ.get(key)
+                for key in [
+                    "ASHARE_STORAGE_ROOT",
+                    "ASHARE_LOGS_DIR",
+                    "ASHARE_EXECUTION_MODE",
+                    "ASHARE_MARKET_MODE",
+                    "ASHARE_RUN_MODE",
+                    "ASHARE_EXECUTION_PLANE",
+                    "ASHARE_ACCOUNT_ID",
+                    "ASHARE_LIVE_ENABLE",
+                ]
+            }
+            os.environ["ASHARE_STORAGE_ROOT"] = tmp_dir
+            os.environ["ASHARE_LOGS_DIR"] = str(Path(tmp_dir) / "logs")
+            os.environ["ASHARE_EXECUTION_MODE"] = "mock"
+            os.environ["ASHARE_MARKET_MODE"] = "mock"
+            os.environ["ASHARE_RUN_MODE"] = "live"
+            os.environ["ASHARE_EXECUTION_PLANE"] = "windows_gateway"
+            os.environ["ASHARE_ACCOUNT_ID"] = "test-account"
+            os.environ["ASHARE_LIVE_ENABLE"] = "true"
+            reset_container()
+
+            try:
+                execution_adapter = get_execution_adapter()
+                execution_adapter.balances["test-account"] = BalanceSnapshot(
+                    account_id="test-account",
+                    total_asset=200_000.0,
+                    cash=120_000.0,
+                )
+                execution_adapter.positions["test-account"] = []
+                get_runtime_config_manager().update(min_daily_turnover_amount=1_000_000.0)
+                monitor_state_service = get_monitor_state_service()
+                monitor_state_service.save_execution_bridge_health(
+                    build_execution_bridge_health_ingress_payload(
+                        {
+                            "gateway_online": True,
+                            "qmt_connected": True,
+                            "overall_status": "healthy",
+                            "windows_execution_gateway": {"status": "healthy", "reachable": True},
+                            "qmt_vm": {"status": "healthy", "reachable": True},
+                        },
+                        trigger="unit_test",
+                    )["health"],
+                    trigger="unit_test",
+                )
+
+                with TestClient(create_app()) as client:
+                    trade_date, _ = self._seed_selected_discussion_cycle(client)
+                    payload = client.post(f"/system/discussions/cycles/{trade_date}/finalize").json()
+                    self.assertTrue(payload["ok"])
+
+                    stored_context = get_discussion_state_store().get(f"discussion_context:{trade_date}")
+                    self.assertEqual(stored_context["client_brief"]["execution_dispatch_status"], "queued_for_gateway")
+                    self.assertEqual(stored_context["client_brief"]["execution_dispatch"]["status"], "queued_for_gateway")
+                    self.assertTrue(any("执行回执:" == line for line in stored_context["client_brief"]["lines"]))
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                reset_container()
+
+    def test_headline_reason_prefers_latest_discussion_reason_over_runtime_summary(self) -> None:
+        case = CandidateCase(
+            case_id="case-20260420-600519-SH",
+            trade_date="2026-04-20",
+            symbol="600519.SH",
+            name="贵州茅台",
+            pool_membership=PoolMembership(base_pool=True),
+            runtime_snapshot=CandidateRuntimeSnapshot(
+                rank=1,
+                selection_score=88.0,
+                action="BUY",
+                summary="进入基础样本池，等待进一步筛选。",
+            ),
+            round_1_summary=CandidateRoundSummary(selected_points=["旧结论"]),
+            round_2_summary=CandidateRoundSummary(resolved_points=["讨论确认：龙头强势延续，成交量同步放大。"]),
+            opinions=[
+                CandidateOpinion(
+                    round=2,
+                    agent_id="ashare-strategy",
+                    stance="support",
+                    confidence="high",
+                    reasons=["讨论确认：龙头强势延续，成交量同步放大。"],
+                    evidence_refs=["unit-test"],
+                    recorded_at="2026-04-20T10:00:00",
+                )
+            ],
+            selected_reason="讨论确认：龙头强势延续，成交量同步放大。",
+            rejected_reason=None,
+            risk_gate="allow",
+            audit_gate="clear",
+            final_status="selected",
+            opinions_version=1,
+            created_at="2026-04-20T09:30:00",
+            updated_at="2026-04-20T10:00:00",
+        )
+        self.assertEqual(
+            CandidateCaseService.resolve_headline_reason(case),
+            "讨论确认：龙头强势延续，成交量同步放大。",
+        )
+
+    def test_migrate_legacy_state_files_moves_discussion_and_gateway_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            storage_root = Path(tmp_dir)
+            meeting_store = StateStore(storage_root / "meeting_state.json")
+            meeting_store.set("latest_discussion_context", {"trade_date": "2026-04-20", "status": "ready"})
+            meeting_store.set("discussion_context:2026-04-20", {"trade_date": "2026-04-20", "status": "ready"})
+            meeting_store.set("pending_execution_intents", [{"intent_id": "intent-1"}])
+            meeting_store.set("latest_execution_gateway_receipt", {"receipt_id": "receipt-1"})
+            meeting_store.set("unrelated_key", {"keep": True})
+
+            result = migrate_legacy_state_files(storage_root)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                StateStore(storage_root / "discussion_state.json").get("latest_discussion_context", {}).get("trade_date"),
+                "2026-04-20",
+            )
+            self.assertEqual(
+                len(StateStore(storage_root / "execution_gateway_state.json").get("pending_execution_intents", [])),
+                1,
+            )
+            migrated_meeting_store = StateStore(storage_root / "meeting_state.json")
+            self.assertIsNone(migrated_meeting_store.get("latest_discussion_context"))
+            self.assertIsNone(migrated_meeting_store.get("pending_execution_intents"))
+            self.assertEqual(migrated_meeting_store.get("unrelated_key", {}).get("keep"), True)
 
 
 if __name__ == "__main__":

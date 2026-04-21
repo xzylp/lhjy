@@ -103,12 +103,9 @@ def build_router(
                     </span>
                 </div>
                 <div class="pt-4 grid grid-cols-2 gap-2">
-                    <form action="/dashboard/actions/mode" method="post">
-                        <input type="hidden" name="mode" value="{ 'paper' if run_mode == 'live' else 'live' }">
-                        <button type="submit" class="w-full bg-slate-100 hover:bg-slate-200 text-slate-800 py-2 rounded text-sm font-medium transition">
-                            切换至 { '模拟' if run_mode == 'live' else '实盘' }
-                        </button>
-                    </form>
+                    <div class="w-full bg-slate-50 text-slate-500 py-2 rounded text-sm font-medium text-center border">
+                        运行模式已锁定为实盘
+                    </div>
                     <form action="/dashboard/actions/toggle-live" method="post">
                         <button type="submit" class="w-full { 'bg-red-50 text-red-700 hover:bg-red-100' if live_enable else 'bg-green-50 text-green-700 hover:bg-green-100' } py-2 rounded text-sm font-medium transition border">
                             { '停用下单' if live_enable else '启用实盘' }
@@ -212,16 +209,12 @@ def build_router(
 
     @router.post("/actions/mode")
     async def change_mode(mode: str = Form(...)):
-        if mode not in ("dry-run", "paper", "live"):
-            raise HTTPException(status_code=400, detail="Invalid mode")
-        
-        # 实际修改 .env 文件或通过 config_mgr (这里简化为更新内存并建议手动重启)
-        settings.run_mode = mode # type: ignore
+        if mode != "live":
+            raise HTTPException(status_code=409, detail="run_mode 已锁定为 live，禁止切换到非实盘模式")
+        settings.run_mode = "live"  # type: ignore
         if audit_store:
-            audit_store.append(category="dashboard", message=f"仪表盘触发运行模式切换: {mode}")
-        
-        # TODO: 真正持久化到 .env
-        return HTMLResponse("<script>alert('已切换内存状态，生效需重启 Control Plane'); window.location='/dashboard';</script>")
+            audit_store.append(category="dashboard", message="仪表盘确认运行模式保持 live")
+        return HTMLResponse("<script>alert('运行模式固定为 live'); window.location='/dashboard';</script>")
 
     @router.post("/actions/toggle-live")
     async def toggle_live():

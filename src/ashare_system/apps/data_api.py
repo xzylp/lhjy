@@ -149,6 +149,10 @@ def build_router(settings: AppSettings) -> APIRouter:
             ],
             "resources": resources,
             "storage_domains": {
+                "db_root": str(layout.db_root),
+                "lake_root": str(layout.lake_root),
+                "state_root": str(layout.state_root),
+                "reports_root": str(layout.reports_root),
                 "raw_market_symbol_root": str(layout.raw_market_symbol_root),
                 "raw_market_index_root": str(layout.raw_market_index_root),
                 "raw_market_structure_root": str(layout.raw_market_structure_root),

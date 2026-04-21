@@ -41,6 +41,20 @@ def _sanitize_gateway_detail(detail: Any) -> str:
     return text
 
 
+def _resolve_sellable_volume(raw_position: Any) -> int:
+    """统一扣除在途数量，避免当天买入仓位被错误识别为可卖。"""
+    can_use_volume = int(getattr(raw_position, "can_use_volume", 0) or 0)
+    on_road_volume = int(getattr(raw_position, "on_road_volume", 0) or 0)
+    return max(can_use_volume - on_road_volume, 0)
+
+
+def _resolve_sellable_volume_from_payload(item: dict[str, Any]) -> int:
+    """兼容 Windows / Go 桥 positions 负载的可卖数量口径。"""
+    can_use_volume = int(item.get("can_use_volume", item.get("available", 0)) or 0)
+    on_road_volume = int(item.get("on_road_volume", 0) or 0)
+    return max(can_use_volume - on_road_volume, 0)
+
+
 class ExecutionAdapter:
     """交易执行适配器基类"""
 
@@ -278,7 +292,14 @@ class XtQuantExecutionAdapter(ExecutionAdapter):
     def get_positions(self, account_id: str) -> list[PositionSnapshot]:
         trader, account = self._ensure_trader()
         return [
-            PositionSnapshot(account_id=p.account_id, symbol=p.stock_code, quantity=int(p.volume), available=int(p.can_use_volume), cost_price=float(p.avg_price), last_price=float(p.market_value / p.volume) if p.volume else 0.0)
+            PositionSnapshot(
+                account_id=p.account_id,
+                symbol=p.stock_code,
+                quantity=int(p.volume),
+                available=_resolve_sellable_volume(p),
+                cost_price=float(p.avg_price),
+                last_price=float(p.market_value / p.volume) if p.volume else 0.0,
+            )
             for p in (trader.query_stock_positions(account) or [])
         ]
 
@@ -516,7 +537,7 @@ class WindowsProxyExecutionAdapter(ExecutionAdapter):
                     account_id=str(payload.get("account_id") or item.get("account_id") or account_id),
                     symbol=str(item.get("stock_code") or item.get("symbol") or ""),
                     quantity=int(item.get("volume", 0) or 0),
-                    available=int(item.get("can_use_volume", 0) or 0),
+                    available=_resolve_sellable_volume_from_payload(item),
                     cost_price=float(item.get("open_price", item.get("avg_price", 0.0)) or 0.0),
                     last_price=float(
                         item.get("last_price")

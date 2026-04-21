@@ -9,13 +9,19 @@ from .container import (
     get_audit_store,
     get_agent_score_service,
     get_candidate_case_service,
+    get_catalog_service,
+    get_document_index_service,
+    get_discussion_state_store,
     get_discussion_cycle_service,
     get_execution_adapter,
+    get_execution_gateway_state_store,
     get_feishu_longconn_state_store,
+    get_history_store,
     get_message_dispatcher,
     get_market_adapter,
     get_meeting_state_store,
     get_monitor_state_service,
+    get_position_watch_state_store,
     get_parameter_service,
     get_research_state_store,
     get_runtime_config_manager,
@@ -29,24 +35,33 @@ from .precompute import DossierPrecomputeService
 from .account_state import AccountStateService
 from .strategy.screener import StockScreener
 from .startup_recovery import StartupRecoveryService
+from .infra.state_migration import migrate_legacy_state_files
 
 
 def create_app() -> FastAPI:
     """创建 all-in-one FastAPI 应用"""
     settings = get_settings()
+    migrate_legacy_state_files(settings.storage_root)
     execution_adapter = get_execution_adapter()
     market_adapter = get_market_adapter()
     audit_store = get_audit_store()
     runtime_state_store = get_runtime_state_store()
     research_state_store = get_research_state_store()
     meeting_state_store = get_meeting_state_store()
+    discussion_state_store = get_discussion_state_store()
+    execution_gateway_state_store = get_execution_gateway_state_store()
+    position_watch_state_store = get_position_watch_state_store()
     parameter_service = get_parameter_service()
     candidate_case_service = get_candidate_case_service()
     discussion_cycle_service = get_discussion_cycle_service()
     agent_score_service = get_agent_score_service()
     monitor_state_service = get_monitor_state_service()
     feishu_longconn_state_store = get_feishu_longconn_state_store()
+    catalog_service = get_catalog_service()
+    document_index_service = get_document_index_service()
+    history_store = get_history_store()
     message_dispatcher = get_message_dispatcher()
+    document_index_service.index_workspace_documents(settings.workspace)
     startup_recovery_service = StartupRecoveryService(execution_adapter, meeting_state_store)
     account_state_service = AccountStateService(
         settings,
@@ -57,6 +72,8 @@ def create_app() -> FastAPI:
     )
 
     async def _run_startup_housekeeping() -> None:
+        if settings.run_mode != "live":
+            return
         try:
             account_state_payload = await asyncio.to_thread(
                 account_state_service.snapshot,
@@ -153,6 +170,9 @@ def create_app() -> FastAPI:
             runtime_state_store=runtime_state_store,
             research_state_store=research_state_store,
             meeting_state_store=meeting_state_store,
+            discussion_state_store=discussion_state_store,
+            execution_gateway_state_store=execution_gateway_state_store,
+            position_watch_state_store=position_watch_state_store,
             parameter_service=parameter_service,
             candidate_case_service=candidate_case_service,
             discussion_cycle_service=discussion_cycle_service,
@@ -223,6 +243,7 @@ def create_app() -> FastAPI:
             audit_store=audit_store,
             runtime_state_store=runtime_state_store,
             meeting_state_store=meeting_state_store,
+            research_state_store=research_state_store,
             config_mgr=config_mgr,
             parameter_service=parameter_service,
             candidate_case_service=candidate_case_service,
@@ -239,6 +260,31 @@ def create_app() -> FastAPI:
             settings=settings,
             audit_store=audit_store,
             research_state_store=research_state_store,
+        )
+    )
+
+    # 检索路由
+    from .apps.search_api import build_router as build_search_router
+    app.include_router(
+        build_search_router(
+            document_index=document_index_service,
+            catalog_service=catalog_service,
+            history_store=history_store,
+            runtime_state_store=runtime_state_store,
+        )
+    )
+
+    # Hermes 通用控制平台路由
+    from .apps.hermes_api import build_router as build_hermes_router
+    app.include_router(
+        build_hermes_router(
+            settings=settings,
+            audit_store=audit_store,
+            runtime_state_store=runtime_state_store,
+            research_state_store=research_state_store,
+            meeting_state_store=meeting_state_store,
+            agent_score_service=agent_score_service,
+            monitor_state_service=monitor_state_service,
         )
     )
 

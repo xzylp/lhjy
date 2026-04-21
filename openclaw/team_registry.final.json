@@ -81,10 +81,10 @@
     "wsl_url_source": "ASHARE_API_BASE_URL / ASHARE_WSL_SERVICE_URL / ASHARE_SERVICE_HOST + ASHARE_SERVICE_PORT"
   },
   "agent_weights": {
-    "ashare-audit": 1.0,
-    "ashare-strategy": 1.0,
     "ashare-research": 1.0,
-    "ashare-risk": 1.0
+    "ashare-audit": 1.0,
+    "ashare-risk": 1.0,
+    "ashare-strategy": 1.0
   },
   "operating_model": {
     "mode": "continuous_desk",

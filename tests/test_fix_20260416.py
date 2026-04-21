@@ -68,6 +68,39 @@ class TestFix20260416(unittest.TestCase):
                 self.assertTrue(result["_fallback"])
                 self.assertEqual(result["asset"]["total_asset"], 100000.0)
 
+    def test_execution_adapter_positions_deduct_on_road_volume(self):
+        adapter = GoPlatformExecutionAdapter(self.settings)
+
+        with patch.object(adapter, "_request_json") as mock_request:
+            mock_request.return_value = {
+                "ok": True,
+                "account_id": "8890130545",
+                "positions": [
+                    {
+                        "stock_code": "603069.SH",
+                        "volume": 1000,
+                        "can_use_volume": 1000,
+                        "on_road_volume": 0,
+                        "open_price": 17.24441,
+                        "market_value": 17770.0,
+                    },
+                    {
+                        "stock_code": "000010.SZ",
+                        "volume": 800,
+                        "can_use_volume": 800,
+                        "on_road_volume": 800,
+                        "open_price": 3.89625,
+                        "market_value": 3120.0,
+                    },
+                ],
+            }
+
+            positions = adapter.get_positions("8890130545")
+
+        self.assertEqual(len(positions), 2)
+        self.assertEqual(positions[0].available, 1000)
+        self.assertEqual(positions[1].available, 0)
+
     def test_healthcheck_accepts_go_platform_in_live_mode(self):
         self.settings.run_mode = "live"
         self.settings.live_trade_enabled = True

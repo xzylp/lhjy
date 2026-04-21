@@ -1,139 +1,151 @@
 import React from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { fetchSymbolDetail } from '../api';
-import { ChevronLeft, Info, ShieldX, TrendingUp, Zap } from 'lucide-react';
+import { ChevronLeft, Info, ShieldX, TrendingUp } from 'lucide-react';
+import { fetchSymbolDeskBrief } from '../api';
+import { TonePill } from '../components/Common';
 
 const SymbolDetailPage = () => {
   const { symbol } = useParams();
   const { data, isLoading } = useQuery({
-    queryKey: ['symbolDetail', symbol],
-    queryFn: () => fetchSymbolDetail(symbol!),
-    enabled: !!symbol,
+    queryKey: ['symbolDeskBrief', symbol],
+    queryFn: () => fetchSymbolDeskBrief(symbol!),
+    enabled: Boolean(symbol),
+    refetchInterval: 15000,
   });
 
   if (isLoading) {
-    return <div className="p-8 text-gray-400">Aggregating Symbol Intel...</div>;
+    return <div className="p-8 text-stone-400">正在聚合个股工作台事实...</div>;
   }
 
-  const { research, precheck } = data || {};
-  const isBlocked = precheck?.execution_gate?.status === 'BLOCKED';
+  const tradeAdvice = data?.trade_advice || {};
+  const blockers = data?.blockers || [];
+  const nextActions = data?.next_actions || [];
+  const riskNotes = data?.risk_notes || [];
+  const summaryLines = data?.summary_lines || [];
+  const position = data?.position || {};
+  const relatedCandidates = data?.related_candidates || [];
 
   return (
-    <div className="p-8 space-y-8 animate-in fade-in duration-500">
-      <Link to="/dashboard/discussion" className="flex items-center text-slate-400 hover:text-slate-900 transition mb-4 group">
-        <ChevronLeft className="w-4 h-4 mr-1 group-hover:-translate-x-1 transition-transform" />
-        <span className="text-sm font-bold uppercase tracking-widest">返回列表</span>
+    <div className="space-y-8">
+      <Link to="/dashboard/discussion" className="inline-flex items-center text-stone-400 transition hover:text-slate-900">
+        <ChevronLeft className="mr-1 h-4 w-4" />
+        <span className="text-sm font-bold uppercase tracking-[0.18em]">返回机会流</span>
       </Link>
 
-      <div className="flex flex-col lg:flex-row justify-between items-start gap-8">
-        {/* Left: Info Card */}
-        <div className="flex-1 space-y-8 w-full">
-          <div className="bg-white rounded-3xl p-8 shadow-sm border border-gray-100 relative overflow-hidden">
-            <div className="absolute top-0 right-0 p-8">
-               <div className={`px-4 py-1 rounded-full text-xs font-black uppercase ${isBlocked ? 'bg-red-50 text-red-600 border border-red-100' : 'bg-green-50 text-green-600 border border-green-100'}`}>
-                 {isBlocked ? 'Execution Blocked' : 'Ready to Dispatch'}
-               </div>
+      <div className="grid gap-8 xl:grid-cols-[1.1fr_0.9fr]">
+        <div className="space-y-8">
+          <section className="rounded-[32px] border border-stone-200 bg-white/90 p-8 shadow-sm">
+            <div className="flex flex-wrap items-center gap-3">
+              <TonePill status={tradeAdvice?.recommendation_level || 'unknown'}>
+                {tradeAdvice?.recommendation_level || 'unknown'}
+              </TonePill>
+              <TonePill status={blockers.length ? 'warning' : 'ok'}>
+                {blockers.length ? '存在阻断' : '无硬阻断'}
+              </TonePill>
             </div>
-            
-            <div className="flex items-center space-x-4 mb-8">
-              <div className="w-16 h-16 bg-slate-900 rounded-2xl flex items-center justify-center text-white text-2xl font-black italic">
-                {symbol?.substring(0, 2)}
+            <h1 className="mt-5 text-4xl font-black tracking-tight text-slate-900">{data?.name || symbol}</h1>
+            <div className="mt-2 font-mono text-sm text-stone-400">{symbol}</div>
+            <div className="mt-6 rounded-3xl border border-stone-200 bg-stone-50/70 p-5">
+              <div className="text-[11px] uppercase tracking-[0.24em] text-stone-400">交易结论</div>
+              <div className="mt-2 text-2xl font-black tracking-tight text-slate-900">
+                {tradeAdvice?.summary || '当前还没有成熟交易结论。'}
               </div>
+              <div className="mt-3 text-sm text-stone-600">立场：{tradeAdvice?.stance || '--'}</div>
+            </div>
+          </section>
+
+          <section className="rounded-[32px] border border-stone-200 bg-white/90 p-8 shadow-sm">
+            <div className="flex items-center gap-3">
+              <Info className="h-5 w-5 text-blue-500" />
               <div>
-                <h1 className="text-4xl font-black text-slate-900 tracking-tighter uppercase">{research?.name || symbol}</h1>
-                <p className="text-gray-400 font-mono font-medium tracking-widest">{symbol} • {research?.sector || 'A-Share Target'}</p>
+                <div className="text-[11px] uppercase tracking-[0.24em] text-stone-400">研究与盘面事实</div>
+                <div className="mt-1 text-2xl font-black tracking-tight text-slate-900">结构化底稿</div>
               </div>
             </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-8 pt-8 border-t border-gray-50">
-               <div>
-                 <div className="text-[10px] text-gray-400 uppercase font-black mb-2 tracking-widest">讨论定位</div>
-                 <p className="text-slate-700 font-bold">{research?.discussion_role || 'Mainline Candidate'}</p>
-               </div>
-               <div>
-                 <div className="text-[10px] text-gray-400 uppercase font-black mb-2 tracking-widest">核心逻辑</div>
-                 <p className="text-slate-700 font-bold">{research?.main_logic || '尚未同步逻辑摘要'}</p>
-               </div>
-               <div>
-                 <div className="text-[10px] text-gray-400 uppercase font-black mb-2 tracking-widest">动能等级</div>
-                 <div className="flex space-x-1 mt-1">
-                    {[1,2,3,4,5].map(i => <div key={i} className={`w-4 h-1.5 rounded-full ${i <= (research?.momentum_rank || 3) ? 'bg-blue-500' : 'bg-gray-100'}`}></div>)}
-                 </div>
-               </div>
+            <div className="mt-5 space-y-3 text-sm leading-7 text-stone-700">
+              {summaryLines.length ? summaryLines.map((line: string, index: number) => <div key={index}>{line}</div>) : (
+                <div>当前还没有补足结构化底稿。</div>
+              )}
             </div>
-          </div>
-
-          {/* Logic & Research Section */}
-          <div className="bg-white rounded-3xl p-8 shadow-sm border border-gray-100">
-             <h3 className="font-bold text-slate-800 mb-6 flex items-center">
-               <Info className="w-5 h-5 mr-2 text-blue-500" />
-               研究底稿与 Agent 归因
-             </h3>
-             <div className="prose prose-sm max-w-none text-slate-600 leading-relaxed">
-                {research?.summary_text || '暂无详细研究摘要数据回显。'}
-             </div>
-          </div>
+          </section>
         </div>
 
-        {/* Right: Execution & Risk Gate */}
-        <div className="w-full lg:w-96 space-y-6">
-           <div className="bg-slate-900 rounded-3xl p-8 text-white shadow-2xl">
-              <h3 className="text-xs font-black uppercase tracking-widest text-slate-500 mb-6 flex items-center">
-                <TrendingUp className="w-4 h-4 mr-2" />
-                交易台复核决策
-              </h3>
-              
-              <div className="space-y-6">
-                 <div className="bg-white/5 rounded-2xl p-4 border border-white/10">
-                    <p className="text-[10px] text-slate-500 uppercase font-bold mb-1">建议动作 (Advice)</p>
-                    <p className="text-xl font-black text-blue-400 tracking-tight">{precheck?.trade_advice || 'HOLD / WAIT'}</p>
-                 </div>
+        <div className="space-y-6">
+          <Panel title="交易台建议" eyebrow="Desk Advice" icon={TrendingUp}>
+            <InfoRow label="建议级别" value={tradeAdvice?.recommendation_level || '--'} />
+            <InfoRow label="立场" value={tradeAdvice?.stance || '--'} />
+            <InfoRow label="持仓数量" value={position?.quantity ? String(position.quantity) : '当前未持仓'} />
+            <div className="mt-4 space-y-2 text-sm leading-6 text-stone-600">
+              {nextActions.length ? nextActions.map((line: string, index: number) => <div key={index}>{line}</div>) : <div>当前没有额外下一步建议。</div>}
+            </div>
+          </Panel>
 
-                 <div className="space-y-4">
-                    <div className="flex justify-between text-sm">
-                       <span className="text-slate-400">分时信号</span>
-                       <span className="font-bold text-green-400">Strong Buy</span>
-                    </div>
-                    <div className="flex justify-between text-sm">
-                       <span className="text-slate-400">价格触发</span>
-                       <span className="font-mono text-slate-200">Above {precheck?.trigger_price || '--'}</span>
-                    </div>
-                    <div className="flex justify-between text-sm">
-                       <span className="text-slate-400">止损位</span>
-                       <span className="font-mono text-red-400">{precheck?.stop_loss || '--'}</span>
-                    </div>
-                 </div>
+          <Panel title="阻断与风险提示" eyebrow="Risk" icon={ShieldX}>
+            <div className="space-y-3">
+              {blockers.length ? blockers.map((item: string, index: number) => (
+                <div key={index} className="rounded-2xl border border-rose-100 bg-rose-50/60 px-4 py-4 text-sm leading-6 text-rose-700">
+                  {item}
+                </div>
+              )) : (
+                <div className="rounded-2xl border border-emerald-100 bg-emerald-50/60 px-4 py-4 text-sm text-emerald-700">
+                  当前没有执行侧硬阻断。
+                </div>
+              )}
+              {riskNotes.length ? riskNotes.map((item: string, index: number) => (
+                <div key={`risk-${index}`} className="rounded-2xl border border-stone-200 px-4 py-4 text-sm leading-6 text-stone-600">
+                  {item}
+                </div>
+              )) : null}
+            </div>
+          </Panel>
 
-                 <button className="w-full py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-2xl font-black uppercase tracking-widest transition shadow-xl shadow-blue-900/40">
-                    Apply Execution
-                 </button>
-              </div>
-           </div>
-
-           {/* Risk Blockers */}
-           <div className="bg-white rounded-3xl p-8 shadow-sm border border-red-50">
-              <h3 className="text-xs font-black uppercase tracking-widest text-red-400 mb-6 flex items-center">
-                <ShieldX className="w-4 h-4 mr-2" />
-                风控电子围栏
-              </h3>
-              <div className="space-y-4">
-                 {precheck?.execution_gate?.blockers?.length > 0 ? (
-                   precheck.execution_gate.blockers.map((b: string, i: number) => (
-                     <div key={i} className="flex items-start space-x-3 text-xs text-slate-600 bg-red-50/50 p-3 rounded-xl border border-red-100/50">
-                        <div className="w-1.5 h-1.5 rounded-full bg-red-500 mt-1.5"></div>
-                        <p className="leading-relaxed font-medium">{b}</p>
-                     </div>
-                   ))
-                 ) : (
-                   <p className="text-xs text-gray-400 italic">No active blockers for this target.</p>
-                 )}
-              </div>
-           </div>
+          <Panel title="相关候选" eyebrow="Comparables" icon={Info}>
+            <div className="space-y-3">
+              {relatedCandidates.length ? relatedCandidates.map((item: any) => (
+                <div key={item.symbol} className="rounded-2xl border border-stone-200 px-4 py-4">
+                  <div className="text-sm font-bold text-slate-900">{item.symbol} {item.name || ''}</div>
+                  <div className="mt-2 text-xs leading-6 text-stone-500">
+                    {item.final_status || 'unknown'} / risk {item.risk_gate || '--'} / audit {item.audit_gate || '--'}
+                  </div>
+                </div>
+              )) : <div className="text-sm text-stone-400">当前没有可比较的相关候选。</div>}
+            </div>
+          </Panel>
         </div>
       </div>
     </div>
   );
 };
+
+const Panel = ({
+  eyebrow,
+  title,
+  icon: Icon,
+  children,
+}: {
+  eyebrow: string;
+  title: string;
+  icon: any;
+  children: React.ReactNode;
+}) => (
+  <div className="rounded-[28px] border border-stone-200 bg-white/90 p-6 shadow-sm">
+    <div className="flex items-center gap-3">
+      <Icon className="h-5 w-5 text-stone-500" />
+      <div>
+        <div className="text-[11px] uppercase tracking-[0.24em] text-stone-400">{eyebrow}</div>
+        <div className="mt-1 text-2xl font-black tracking-tight text-slate-900">{title}</div>
+      </div>
+    </div>
+    <div className="mt-5">{children}</div>
+  </div>
+);
+
+const InfoRow = ({ label, value }: { label: string; value: string }) => (
+  <div className="flex items-center justify-between rounded-2xl border border-stone-200 px-4 py-3">
+    <div className="text-sm text-stone-500">{label}</div>
+    <div className="text-sm font-bold text-slate-900">{value}</div>
+  </div>
+);
 
 export default SymbolDetailPage;

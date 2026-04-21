@@ -42,6 +42,7 @@ EXECUTION_REASON_LABELS = {
     "total_position_limit_reached": "总仓位已达上限",
     "budget_below_min_lot": "剩余预算不足一手",
     "trading_session_closed": "当前非交易时段",
+    "execution_mode_unknown": "执行模式未识别",
 }
 
 
@@ -150,6 +151,33 @@ def execution_dispatch_notification_template(title: str, lines: list[str]) -> st
     if not lines:
         return title
     return "\n".join([f"📨 **{title}**", *[f"- {line}" for line in lines]])
+
+
+def position_watch_notification_template(title: str, lines: list[str], action_suggestions: list[str] | None = None) -> str:
+    body = [f"📡 **{title}**"]
+    if lines:
+        body.extend(f"- {line}" for line in lines)
+    suggestions = [str(item).strip() for item in list(action_suggestions or []) if str(item).strip()]
+    if suggestions:
+        body.append("- 交易动作建议:")
+        body.extend(f"  - {item}" for item in suggestions[:6])
+    return "\n".join(body)
+
+
+def latency_alert_notification_template(title: str, alerts: list[dict]) -> str:
+    body = [f"⏱️ **{title}**"]
+    if not alerts:
+        body.append("- 当前没有延迟告警。")
+        return "\n".join(body)
+    for item in alerts[:6]:
+        chain = str(item.get("chain") or "unknown")
+        stage = str(item.get("stage") or "unknown")
+        elapsed_ms = float(item.get("elapsed_ms", 0.0) or 0.0)
+        threshold_ms = float(item.get("threshold_ms", 0.0) or 0.0)
+        symbol = str((item.get("metadata") or {}).get("symbol") or "").strip()
+        suffix = f" | {symbol}" if symbol else ""
+        body.append(f"- {chain} / {stage}{suffix}: {elapsed_ms:.1f}ms > {threshold_ms:.1f}ms")
+    return "\n".join(body)
 
 
 def execution_precheck_summary_lines(execution_precheck: dict | None) -> list[str]:

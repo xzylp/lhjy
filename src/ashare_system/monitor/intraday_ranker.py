@@ -31,23 +31,58 @@ class IntradayRanker:
         ]
 
         if str(market_payload.get("regime") or "") == "chaos":
-            actions = [
-                RankAction(
-                    symbol=item["symbol"],
-                    action="FREEZE_ALL",
-                    trigger="market_chaos",
-                    reason="市场 regime=chaos，盘中候选统一冻结等待情绪修复。",
-                    priority_delta=-999,
-                    generated_at=generated_at,
+            actions: list[RankAction] = []
+            for item in candidate_payloads:
+                symbol = item["symbol"]
+                if not symbol:
+                    continue
+                sector_payload = sector_map.get(item["sector"], {})
+                life_cycle = str(sector_payload.get("life_cycle") or "")
+                zt_count_delta = self._int(sector_payload.get("zt_count_delta"))
+                has_negative_event = self._has_negative_event(
+                    symbol=symbol,
+                    sector_name=item["sector"],
+                    event_context=event_payload,
                 )
-                for item in candidate_payloads
-                if item["symbol"]
-            ]
+                verified_strength = (
+                    not has_negative_event
+                    and (
+                        life_cycle == "ferment" and zt_count_delta >= 2
+                        or item["playbook"] in {"leader_chase", "trend_acceleration", "sector_resonance"}
+                    )
+                )
+                if verified_strength:
+                    actions.append(
+                        RankAction(
+                            symbol=symbol,
+                            action="DOWNGRADE",
+                            trigger="market_chaos_verified_strength",
+                            reason="市场处于 chaos，仅保留已验证强势候选，当前标的降级保留并要求二次确认。",
+                            priority_delta=-3,
+                            generated_at=generated_at,
+                        )
+                    )
+                    continue
+                actions.append(
+                    RankAction(
+                        symbol=symbol,
+                        action="FREEZE",
+                        trigger="market_chaos_freeze_weak",
+                        reason="市场处于 chaos，弱候选冻结等待情绪修复或更强确认。",
+                        priority_delta=-100,
+                        generated_at=generated_at,
+                    )
+                )
+            freeze_all_active = bool(actions) and all(item.action == "FREEZE" for item in actions)
             return IntradayRankResult(
                 generated_at=generated_at,
                 actions=actions,
-                freeze_all_active=True,
-                summary_lines=["市场进入 chaos，所有候选暂时冻结。"],
+                freeze_all_active=freeze_all_active,
+                summary_lines=(
+                    ["市场进入 chaos，弱候选冻结，已验证强势候选降级保留。"]
+                    if actions
+                    else ["市场进入 chaos，当前暂无可处理候选。"]
+                ),
             )
 
         actions: list[RankAction] = []
@@ -140,7 +175,12 @@ class IntradayRanker:
             or str(payload.get("resolved_sector") or "").strip()
             or str(playbook_payload.get("sector") or "").strip()
         )
-        return {"symbol": symbol, "sector": sector}
+        playbook = (
+            str(payload.get("playbook") or "").strip()
+            or str(payload.get("assigned_playbook") or "").strip()
+            or str(playbook_payload.get("playbook") or "").strip()
+        )
+        return {"symbol": symbol, "sector": sector, "playbook": playbook}
 
     @staticmethod
     def _int(value: Any) -> int:

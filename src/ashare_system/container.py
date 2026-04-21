@@ -61,6 +61,29 @@ def get_meeting_state_store():
 
 
 @lru_cache(maxsize=1)
+def get_discussion_state_store():
+    from .infra.audit_store import StateStore
+
+    settings = get_settings()
+    return StateStore(settings.storage_root / "discussion_state.json")
+
+
+@lru_cache(maxsize=1)
+def get_execution_gateway_state_store():
+    from .infra.audit_store import StateStore
+
+    settings = get_settings()
+    return StateStore(settings.storage_root / "execution_gateway_state.json")
+
+
+@lru_cache(maxsize=1)
+def get_position_watch_state_store():
+    from .infra.audit_store import StateStore
+    settings = get_settings()
+    return StateStore(settings.storage_root / "position_watch_state.json")
+
+
+@lru_cache(maxsize=1)
 def get_monitor_state_store():
     from .infra.audit_store import StateStore
 
@@ -90,16 +113,90 @@ def get_monitor_state_service():
 
 
 @lru_cache(maxsize=1)
+def get_control_plane_db():
+    from .data.control_db import ControlPlaneDB
+
+    settings = get_settings()
+    return ControlPlaneDB(settings.control_plane_db_path)
+
+
+@lru_cache(maxsize=1)
+def get_catalog_service():
+    from .data.catalog_service import CatalogService
+
+    return CatalogService(get_control_plane_db())
+
+
+@lru_cache(maxsize=1)
+def get_document_index_service():
+    from .data.document_index import DocumentIndexService
+
+    return DocumentIndexService(get_control_plane_db(), get_catalog_service())
+
+
+@lru_cache(maxsize=1)
+def get_history_store():
+    from .data.history_store import HistoryStore
+
+    settings = get_settings()
+    return HistoryStore(settings.storage_root, get_control_plane_db(), get_catalog_service())
+
+
+@lru_cache(maxsize=1)
 def get_feishu_notifier():
     from .notify.feishu import FeishuNotifier
 
     settings = get_settings()
+    config = settings.notify.get_feishu_bot_config("main")
     return FeishuNotifier(
-        settings.notify.feishu_app_id,
-        settings.notify.feishu_app_secret,
-        settings.notify.feishu_chat_id,
-        important_chat_id=settings.notify.feishu_important_chat_id,
-        supervision_chat_id=settings.notify.feishu_supervision_chat_id,
+        config["app_id"],
+        config["app_secret"],
+        config["chat_id"],
+        important_chat_id=config["important_chat_id"],
+        supervision_chat_id=config["supervision_chat_id"],
+        bot_role=config["role"],
+        bot_name=config["bot_name"],
+        bot_id=config["bot_id"],
+    )
+
+
+@lru_cache(maxsize=1)
+def get_feishu_supervision_notifier():
+    from .notify.feishu import FeishuNotifier
+
+    settings = get_settings()
+    config = settings.notify.get_feishu_bot_config("supervision")
+    if not config["app_id"] or not config["app_secret"]:
+        return None
+    return FeishuNotifier(
+        config["app_id"],
+        config["app_secret"],
+        config["chat_id"],
+        important_chat_id=config["important_chat_id"],
+        supervision_chat_id=config["supervision_chat_id"],
+        bot_role=config["role"],
+        bot_name=config["bot_name"],
+        bot_id=config["bot_id"],
+    )
+
+
+@lru_cache(maxsize=1)
+def get_feishu_execution_notifier():
+    from .notify.feishu import FeishuNotifier
+
+    settings = get_settings()
+    config = settings.notify.get_feishu_bot_config("execution")
+    if not config["app_id"] or not config["app_secret"]:
+        return None
+    return FeishuNotifier(
+        config["app_id"],
+        config["app_secret"],
+        config["chat_id"],
+        important_chat_id=config["important_chat_id"],
+        supervision_chat_id=config["supervision_chat_id"],
+        bot_role=config["role"],
+        bot_name=config["bot_name"],
+        bot_id=config["bot_id"],
     )
 
 
@@ -107,7 +204,11 @@ def get_feishu_notifier():
 def get_message_dispatcher():
     from .notify.dispatcher import MessageDispatcher
 
-    return MessageDispatcher(get_feishu_notifier())
+    return MessageDispatcher(
+        get_feishu_notifier(),
+        supervision_feishu=get_feishu_supervision_notifier(),
+        execution_feishu=get_feishu_execution_notifier(),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -165,6 +266,7 @@ def get_discussion_cycle_service():
         settings.storage_root / "discussion_cycles.json",
         candidate_case_service=get_candidate_case_service(),
         parameter_service=get_parameter_service(),
+        agent_score_service=get_agent_score_service(),
         learned_asset_service=get_learned_asset_service(),
     )
 
@@ -196,14 +298,23 @@ def reset_container() -> None:
     get_execution_adapter.cache_clear()
     get_market_adapter.cache_clear()
     get_runtime_config_manager.cache_clear()
+    get_control_plane_db.cache_clear()
+    get_catalog_service.cache_clear()
+    get_document_index_service.cache_clear()
+    get_history_store.cache_clear()
     get_audit_store.cache_clear()
     get_runtime_state_store.cache_clear()
     get_research_state_store.cache_clear()
     get_meeting_state_store.cache_clear()
+    get_discussion_state_store.cache_clear()
+    get_execution_gateway_state_store.cache_clear()
+    get_position_watch_state_store.cache_clear()
     get_monitor_state_store.cache_clear()
     get_feishu_longconn_state_store.cache_clear()
     get_monitor_state_service.cache_clear()
     get_feishu_notifier.cache_clear()
+    get_feishu_supervision_notifier.cache_clear()
+    get_feishu_execution_notifier.cache_clear()
     get_message_dispatcher.cache_clear()
     get_qmt_launcher.cache_clear()
     get_parameter_registry.cache_clear()

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 import pandas as pd
 
 from .slippage import CostModel
 from .metrics import BacktestMetrics, MetricsCalculator
+from ..execution.quality_tracker import ExecutionQualityTracker
 from ..logging_config import get_logger
 
 logger = get_logger("backtest.engine")
@@ -22,6 +24,15 @@ class BacktestConfig:
     slippage_rate: float = 0.001
     min_commission: float = 5.0
     position_pct: float = 0.10  # 默认单票仓位比例 (无 PositionManager 时)
+    max_positions: int = 5
+    stop_loss_pct: float = 0.05
+    take_profit_pct: float = 0.12
+    trailing_stop_pct: float = 0.06
+    max_holding_days: int = 10
+    rebalance_mode: str = "volatility_scaled"
+    execution_quality_report_path: str | None = None
+    slippage_lookback_days: int = 20
+    benchmark_curve: pd.Series | None = None
 
 
 @dataclass
@@ -30,6 +41,7 @@ class BacktestPosition:
     quantity: int = 0
     cost_price: float = 0.0
     entry_date: str = ""
+    highest_price: float = 0.0
 
 
 @dataclass
@@ -45,8 +57,29 @@ class BacktestEngine:
 
     def __init__(self, config: BacktestConfig | None = None) -> None:
         self.config = config or BacktestConfig()
-        self.cost_model = CostModel()
         self.calc = MetricsCalculator()
+        self.cost_model = CostModel(slippage_rate=self._resolve_slippage_rate())
+
+    def _resolve_slippage_rate(self) -> float:
+        configured = float(self.config.slippage_rate or 0.0)
+        report_path = str(self.config.execution_quality_report_path or "").strip()
+        if not report_path:
+            return configured
+        try:
+            tracker = ExecutionQualityTracker(Path(report_path))
+            avg_bps = tracker.recent_avg_slippage_bps(self.config.slippage_lookback_days)
+        except Exception:
+            avg_bps = None
+        if avg_bps is None:
+            return configured
+        dynamic_rate = max(float(avg_bps) / 10000.0, 0.0)
+        if abs(dynamic_rate - configured) > 0.0005:
+            logger.warning(
+                "backtest_assumption_drift: slippage_rate %.4f%% -> %.4f%%",
+                configured * 100,
+                dynamic_rate * 100,
+            )
+        return dynamic_rate
 
     def run(self, signals: pd.DataFrame, price_data: dict[str, pd.DataFrame]) -> BacktestResult:
         """
@@ -73,8 +106,35 @@ class BacktestEngine:
         for i, date in enumerate(dates):
             date_str = pd.Timestamp(date).strftime("%Y-%m-%d")
 
+            # ── 先用当日区间检查止损/止盈/跟踪止盈 ──
+            risk_exit_symbols: dict[str, tuple[str, float]] = {}
+            for symbol, pos in list(positions.items()):
+                df = normalized_price.get(symbol)
+                if df is None or date_str not in df.index:
+                    continue
+                row = df.loc[date_str]
+                high_price = float(row["high"] if "high" in df.columns else row["close"])
+                low_price = float(row["low"] if "low" in df.columns else row["close"])
+                close_price = float(row["close"])
+                pos.highest_price = max(float(pos.highest_price or pos.cost_price or close_price), high_price)
+                stop_loss_price = pos.cost_price * (1 - self.config.stop_loss_pct)
+                take_profit_price = pos.cost_price * (1 + self.config.take_profit_pct)
+                trailing_stop_price = pos.highest_price * (1 - self.config.trailing_stop_pct)
+                holding_days = max((pd.Timestamp(date_str) - pd.Timestamp(pos.entry_date)).days, 0) if pos.entry_date else 0
+                if low_price <= stop_loss_price:
+                    risk_exit_symbols[symbol] = ("STOP_LOSS", stop_loss_price)
+                elif high_price >= take_profit_price:
+                    risk_exit_symbols[symbol] = ("TAKE_PROFIT", take_profit_price)
+                elif close_price <= trailing_stop_price and pos.highest_price > pos.cost_price:
+                    risk_exit_symbols[symbol] = ("TRAILING_STOP", trailing_stop_price)
+                elif holding_days >= self.config.max_holding_days:
+                    risk_exit_symbols[symbol] = ("MAX_HOLDING_DAYS", close_price)
+
             # ── 执行上一日的信号（用今日开盘价） ──
-            for symbol, action in pending_signals.items():
+            executable_signals = dict(pending_signals)
+            for symbol, (exit_reason, _exit_price) in risk_exit_symbols.items():
+                executable_signals[symbol] = "SELL"
+            for symbol, action in executable_signals.items():
                 df = normalized_price.get(symbol)
                 if df is None or date_str not in df.index:
                     continue
@@ -84,14 +144,25 @@ class BacktestEngine:
                     continue
 
                 if action == "BUY" and symbol not in positions:
-                    qty = int(cash * self.config.position_pct / exec_price / 100) * 100
+                    allocation = self._resolve_position_allocation(
+                        cash=cash,
+                        price_frame=df.loc[:date_str],
+                        open_slots=max(self.config.max_positions - len(positions), 1),
+                    )
+                    qty = int(allocation / exec_price / 100) * 100
                     if qty >= 100:
                         cost = self.cost_model.calc(exec_price, qty, "BUY")
                         total = exec_price * qty + cost.total
                         if cash >= total:
                             cash -= total
-                            positions[symbol] = BacktestPosition(symbol=symbol, quantity=qty, cost_price=exec_price, entry_date=date_str)
-                            trades.append({"date": date_str, "symbol": symbol, "side": "BUY", "price": exec_price, "qty": qty, "pnl": 0})
+                            positions[symbol] = BacktestPosition(
+                                symbol=symbol,
+                                quantity=qty,
+                                cost_price=exec_price,
+                                entry_date=date_str,
+                                highest_price=exec_price,
+                            )
+                            trades.append({"date": date_str, "symbol": symbol, "side": "BUY", "price": exec_price, "qty": qty, "pnl": 0, "reason": "SIGNAL"})
 
                 elif action == "SELL" and symbol in positions:
                     pos = positions.pop(symbol)
@@ -99,7 +170,18 @@ class BacktestEngine:
                     proceeds = exec_price * pos.quantity - cost.total
                     pnl = proceeds - pos.cost_price * pos.quantity
                     cash += proceeds
-                    trades.append({"date": date_str, "symbol": symbol, "side": "SELL", "price": exec_price, "qty": pos.quantity, "pnl": pnl})
+                    exit_reason = risk_exit_symbols.get(symbol, ("SIGNAL", exec_price))[0]
+                    trades.append(
+                        {
+                            "date": date_str,
+                            "symbol": symbol,
+                            "side": "SELL",
+                            "price": exec_price,
+                            "qty": pos.quantity,
+                            "pnl": pnl,
+                            "reason": exit_reason,
+                        }
+                    )
 
             # ── 收集今日信号（明日执行） ──
             pending_signals = {}
@@ -117,9 +199,19 @@ class BacktestEngine:
             equity_log[date_str] = cash + pos_value
 
         equity_curve = pd.Series(equity_log)
-        metrics = self.calc.calc(equity_curve, trades)
+        metrics = self.calc.calc(equity_curve, trades, benchmark_curve=self.config.benchmark_curve)
         logger.info("回测完成: 总收益=%.1f%%, 夏普=%.2f, 最大回撤=%.1f%%", metrics.total_return * 100, metrics.sharpe_ratio, metrics.max_drawdown * 100)
         return BacktestResult(metrics=metrics, equity_curve=equity_curve, trades=trades, positions=positions)
+
+    def _resolve_position_allocation(self, *, cash: float, price_frame: pd.DataFrame, open_slots: int) -> float:
+        base_allocation = cash * self.config.position_pct
+        if self.config.rebalance_mode != "volatility_scaled" or price_frame.empty or len(price_frame) < 10:
+            return min(base_allocation, cash / max(open_slots, 1))
+        returns = price_frame["close"].pct_change().dropna().tail(20)
+        realized_vol = float(returns.std() or 0.0)
+        vol_scale = 1.0 / max(realized_vol * 100.0, 1.0)
+        adjusted = base_allocation * min(max(vol_scale, 0.45), 1.35)
+        return min(adjusted, cash / max(open_slots, 1))
 
 
 def build_trade_records_from_backtest_result(

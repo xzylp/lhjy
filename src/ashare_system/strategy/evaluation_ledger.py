@@ -64,6 +64,8 @@ class EvaluationLedgerService:
         applied_constraints: dict[str, Any],
         repository: dict[str, Any],
         generated_at: str,
+        autonomy_trace: dict[str, Any] | None = None,
+        retry_plan: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         record = {
             "trace_id": trace_id,
@@ -83,6 +85,10 @@ class EvaluationLedgerService:
             "applied_constraints": dict(applied_constraints or {}),
             "candidate_count": len(candidates),
             "filtered_count": len(filtered_out),
+            "candidates": [self._slim_candidate_record(item) for item in list(candidates or [])],
+            "filtered_out": [self._slim_filtered_record(item) for item in list(filtered_out or [])],
+            "autonomy_trace": dict(autonomy_trace or {}),
+            "retry_plan": dict(retry_plan or {}),
             "selected_symbols": list(proposal_packet.get("selected_symbols") or []),
             "watchlist_symbols": list(proposal_packet.get("watchlist_symbols") or []),
             "discussion_focus": list(proposal_packet.get("discussion_focus") or []),
@@ -431,6 +437,12 @@ class EvaluationLedgerService:
             )
         trade_date = self._resolve_trade_date(record, latest)
         score_date = str(latest.get("reconciled_at") or "")[:10] if str(latest.get("reconciled_at") or "") else ""
+        agent_score_settlement = self._build_agent_score_settlement(
+            record=record,
+            attribution_items=attribution_items,
+            trade_date=trade_date,
+            score_date=score_date or trade_date,
+        )
         learning_bridge = self._build_learning_bridge(
             record=record,
             tracked_symbols=tracked_symbols,
@@ -470,6 +482,7 @@ class EvaluationLedgerService:
             "items": reconciliation_items,
             "attribution_items": attribution_items,
             "learning_bridge": learning_bridge,
+            "agent_score_settlement": agent_score_settlement,
             "note": self._build_outcome_note(
                 tracked_symbol_count=len(tracked_symbols),
                 matched_symbol_count=len(matched_symbols),
@@ -494,6 +507,101 @@ class EvaluationLedgerService:
         )
         return updated
 
+    def _build_agent_score_settlement(
+        self,
+        *,
+        record: dict[str, Any],
+        attribution_items: list[dict[str, Any]],
+        trade_date: str,
+        score_date: str,
+    ) -> dict[str, Any]:
+        if self._agent_score_service is None or self._candidate_case_service is None:
+            return {"available": False, "applied": False, "reason": "score_or_case_service_missing"}
+        if not attribution_items:
+            return {"available": False, "applied": False, "reason": "missing_attribution_items"}
+        if not score_date:
+            return {"available": False, "applied": False, "reason": "missing_score_date"}
+
+        outcome_state = dict(record.get("outcome") or {})
+        previous_settlement = dict(outcome_state.get("agent_score_settlement") or {})
+        settlement_key = f"{record.get('trace_id')}:{score_date}:{len(attribution_items)}"
+        if previous_settlement.get("settlement_key") == settlement_key and previous_settlement.get("applied"):
+            return {
+                "available": True,
+                "applied": False,
+                "reason": "already_applied",
+                "settlement_key": settlement_key,
+                "score_date": score_date,
+            }
+
+        case_ids = self._normalize_case_ids((record.get("runtime_job") or {}).get("case_ids"))
+        cases: list[Any] = []
+        for case_id in case_ids:
+            case = self._candidate_case_service.get_case(case_id)
+            if case is not None:
+                cases.append(case)
+        if not cases and trade_date:
+            tracked_symbols = {str(item.get("symbol") or "").strip() for item in attribution_items if str(item.get("symbol") or "").strip()}
+            cases = [
+                case
+                for case in self._candidate_case_service.list_cases(trade_date=trade_date, limit=500)
+                if str(case.symbol) in tracked_symbols
+            ]
+        if not cases:
+            return {"available": False, "applied": False, "reason": "missing_cases", "settlement_key": settlement_key}
+
+        from ..learning.settlement import AgentScoreSettlementService, SettlementSymbolOutcome
+
+        outcome_map = {
+            str(item.get("symbol") or "").strip(): SettlementSymbolOutcome(
+                symbol=str(item.get("symbol") or "").strip(),
+                next_day_close_pct=float(item.get("next_day_close_pct", 0.0) or 0.0),
+                note=str(item.get("note") or ""),
+            )
+            for item in attribution_items
+            if str(item.get("symbol") or "").strip()
+        }
+        settlement_results = AgentScoreSettlementService().settle(
+            cases,
+            outcome_map,
+            min_sample_count=1,
+        )
+        if not settlement_results:
+            return {"available": False, "applied": False, "reason": "empty_settlement_results", "settlement_key": settlement_key}
+
+        persisted_states = self._agent_score_service.run_daily_settlement(
+            settlement_results=[
+                {
+                    "agent_id": item.agent_id,
+                    "result_score_delta": item.result_score_delta,
+                    "cases_evaluated": item.cases_evaluated,
+                    "confidence_tier": item.confidence_tier,
+                    "settlement_key": settlement_key,
+                }
+                for item in settlement_results
+            ],
+            trade_date=score_date,
+        )
+        return {
+            "available": True,
+            "applied": True,
+            "score_date": score_date,
+            "settlement_key": settlement_key,
+            "agent_count": len(settlement_results),
+            "state_count": len(persisted_states),
+            "results": [
+                {
+                    "agent_id": item.agent_id,
+                    "result_score_delta": item.result_score_delta,
+                    "cases_evaluated": item.cases_evaluated,
+                    "confidence_tier": item.confidence_tier,
+                    "sample_count": item.sample_count,
+                    "insufficient_sample": item.insufficient_sample,
+                }
+                for item in settlement_results
+            ],
+        }
+
     def reconcile_backtest(
         self,
         *,
@@ -511,11 +619,13 @@ class EvaluationLedgerService:
         if not symbols:
             return record
 
-        # 构建信号 DataFrame (简化模型: 信号日买入)
+        # 构建信号 DataFrame：只对主选票发出买入信号，watchlist 不强制入场。
         generated_at = pd.Timestamp(record["generated_at"]).strftime("%Y-%m-%d")
-        signals = pd.DataFrame(index=[generated_at], columns=symbols)
-        for s in symbols:
-            signals.loc[generated_at, s] = "BUY"
+        selected_symbols = [str(item) for item in list(record.get("selected_symbols") or []) if str(item).strip()]
+        target_symbols = selected_symbols or symbols[: min(len(symbols), 5)]
+        signals = pd.DataFrame(index=[generated_at], columns=target_symbols)
+        for symbol in target_symbols:
+            signals.loc[generated_at, symbol] = "BUY"
             
         # 运行回测
         bt_config = BacktestConfig(**(config_overrides or {}))
@@ -535,9 +645,7 @@ class EvaluationLedgerService:
             "posterior_metrics": {
                 **record.get("outcome", {}).get("posterior_metrics", {}),
                 "backtest_metrics": metrics_dict,
-                "backtest_trades": [
-                    {k: v for k, v in t.items() if k != "pnl"} for t in result.trades[:10] # 仅记录前10笔
-                ],
+                "backtest_trades": [{k: v for k, v in t.items() if k != "pnl"} for t in result.trades[:10]],
             },
             "reconciled_at": self._now_factory().isoformat(),
             "updated_by": updated_by,
@@ -554,8 +662,8 @@ class EvaluationLedgerService:
         updated_by: str = "system:factor_evaluator",
     ) -> dict[str, Any]:
         """评估本次 compose 中各因子的预测效力 (Rank IC)。"""
+        import math
         import pandas as pd
-        import numpy as np
 
         record = self._find_record(trace_id)
         candidates = list(record.get("candidates") or [])
@@ -597,10 +705,18 @@ class EvaluationLedgerService:
             f_values = pd.Series({c["symbol"]: (c.get("factor_scores") or {}).get(f_name, 0.0) for c in candidates})
             f_values = f_values.reindex(returns_series.index)
             
-            if len(f_values.dropna()) > 2:
+            sample_count = int(len(f_values.dropna()))
+            if sample_count > 2:
                 rank_ic = f_values.rank().corr(returns_series.rank())
-                if not np.isnan(rank_ic):
-                    factor_performance[f_name] = round(rank_ic, 4)
+                if rank_ic is not None and not math.isnan(float(rank_ic)):
+                    t_stat = abs(float(rank_ic)) * math.sqrt(max(sample_count - 2, 1)) / math.sqrt(max(1.0 - float(rank_ic) ** 2, 1e-9))
+                    p_value = max(min(math.erfc(t_stat / math.sqrt(2.0)), 1.0), 0.0)
+                    factor_performance[f_name] = {
+                        "rank_ic": round(float(rank_ic), 4),
+                        "p_value": round(p_value, 4),
+                        "sample_count": sample_count,
+                        "significant": bool(p_value <= 0.1),
+                    }
 
         outcome_patch = {
             "posterior_metrics": {
@@ -627,6 +743,11 @@ class EvaluationLedgerService:
         factor_ledger = self._build_factor_ledger(records, limit=max(limit, 1))
         playbook_ledger = self._build_playbook_ledger(records, limit=max(limit, 1))
         compose_combo_ledger = self._build_compose_combo_ledger(records, limit=max(limit, 1))
+        unsupported_factor_ledger_count = sum(
+            1
+            for item in factor_ledger
+            if str(item.get("monitor_mode") or "") == "outcome_attribution_only"
+        )
         return {
             "summary": {
                 "total": len(records),
@@ -634,6 +755,7 @@ class EvaluationLedgerService:
                 "adopted_count": adopted_count,
                 "settled_count": settled_count,
                 "factor_ledger_count": len(factor_ledger),
+                "unsupported_factor_ledger_count": unsupported_factor_ledger_count,
                 "playbook_ledger_count": len(playbook_ledger),
                 "compose_combo_ledger_count": len(compose_combo_ledger),
             },
@@ -641,6 +763,51 @@ class EvaluationLedgerService:
             "playbook_ledger": playbook_ledger,
             "compose_combo_ledger": compose_combo_ledger,
             "items": items,
+        }
+
+    def estimate_composite_multiplier(self, lookback: int = 30) -> dict[str, Any]:
+        records = self.list_records(limit=max(lookback, 1))
+        candidate_samples = self._build_composite_multiplier_samples(records)
+        if len(candidate_samples) < 20:
+            return {
+                "available": False,
+                "sample_size": len(candidate_samples),
+                "resolved_multiplier": 4.0,
+                "source": "conservative_fallback",
+                "reason": "候选级已结算样本不足 20 条，暂不做历史回归校准",
+            }
+
+        selection_values = [float(item["selection_score"]) for item in candidate_samples]
+        adjustment_values = [float(item["composite_adjustment"]) for item in candidate_samples]
+        return_values = [float(item["realized_return"]) for item in candidate_samples]
+        selection_slope = self._regression_slope(selection_values, return_values)
+        adjustment_slope = self._regression_slope(adjustment_values, return_values)
+        if abs(selection_slope) <= 1e-9 or self._variance(adjustment_values) <= 1e-9:
+            return {
+                "available": False,
+                "sample_size": len(candidate_samples),
+                "resolved_multiplier": 4.0,
+                "source": "conservative_fallback",
+                "reason": "样本中的 selection_score 或 composite_adjustment 变化不足，无法做稳定校准",
+            }
+
+        raw_multiplier = adjustment_slope / selection_slope
+        ic = self._pearson(adjustment_values, return_values)
+        selection_ic = self._pearson(selection_values, return_values)
+        matched_win_rate = self._mean([1.0 if value > 0 else 0.0 for value in return_values])
+        resolved_multiplier = max(1.5, min(8.0, raw_multiplier))
+        return {
+            "available": True,
+            "sample_size": len(candidate_samples),
+            "resolved_multiplier": round(resolved_multiplier, 4),
+            "source": "candidate_level_return_regression",
+            "raw_multiplier": round(raw_multiplier, 6),
+            "selection_slope": round(selection_slope, 8),
+            "adjustment_slope": round(adjustment_slope, 8),
+            "adjustment_ic": round(ic, 6),
+            "selection_ic": round(selection_ic, 6),
+            "avg_realized_return": round(self._mean(return_values), 6),
+            "matched_win_rate": round(matched_win_rate, 4),
         }
 
     def _build_factor_ledger(self, records: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
@@ -671,6 +838,8 @@ class EvaluationLedgerService:
                         "version": meta["version"],
                         "group": meta["group"],
                         "name": meta["name"],
+                        "monitor_mode_breakdown": Counter(),
+                        "monitor_status_breakdown": Counter(),
                         "usage_count": 0,
                         "hit_symbols": set(),
                         "market_phase_breakdown": Counter(),
@@ -680,6 +849,9 @@ class EvaluationLedgerService:
                         "weighted_risks": [],
                         "weight_samples": [],
                         "return_samples": [],
+                        "settled_returns": [],
+                        "positive_outcomes": [],
+                        "filled_flags": [],
                         "effectiveness_events": [],
                         "last_used_at": "",
                     },
@@ -689,6 +861,8 @@ class EvaluationLedgerService:
                     weight = 1.0 / max(len(used_keys), 1)
                 ledger["usage_count"] += 1
                 ledger["hit_symbols"].update(hit_symbols)
+                ledger["monitor_mode_breakdown"][str(meta.get("monitor_mode") or "unknown")] += 1
+                ledger["monitor_status_breakdown"][str(meta.get("monitor_status") or "unknown")] += 1
                 ledger["market_phase_breakdown"][phase] += 1
                 ledger["adoption_breakdown"][adoption_status] += 1
                 ledger["outcome_breakdown"][outcome_status] += 1
@@ -696,11 +870,25 @@ class EvaluationLedgerService:
                 ledger["weighted_risks"].append(risk_metric * abs(weight))
                 ledger["weight_samples"].append(weight)
                 ledger["return_samples"].append(return_metric)
+                if outcome_status == "settled":
+                    ledger["settled_returns"].append(return_metric)
+                    ledger["positive_outcomes"].append(1.0 if return_metric >= 0 else 0.0)
+                    ledger["filled_flags"].append(
+                        1.0
+                        if float(
+                            ((record.get("outcome") or {}).get("posterior_metrics") or {}).get("filled_symbol_count", 0) or 0
+                        )
+                        > 0
+                        else 0.0
+                    )
                 ledger["effectiveness_events"].append({"trade_date": trade_date, "score": success_score})
                 ledger["last_used_at"] = str(record.get("recorded_at") or record.get("generated_at") or ledger["last_used_at"])
 
         payload = []
         for ledger in ledgers.values():
+            dominant_monitor_mode = "unknown"
+            if ledger["monitor_mode_breakdown"]:
+                dominant_monitor_mode = ledger["monitor_mode_breakdown"].most_common(1)[0][0]
             payload.append(
                 {
                     "key": ledger["key"],
@@ -708,6 +896,9 @@ class EvaluationLedgerService:
                     "version": ledger["version"],
                     "group": ledger["group"],
                     "name": ledger["name"],
+                    "monitor_mode": dominant_monitor_mode,
+                    "monitor_mode_breakdown": dict(sorted(ledger["monitor_mode_breakdown"].items())),
+                    "monitor_status_breakdown": dict(sorted(ledger["monitor_status_breakdown"].items())),
                     "usage_count": ledger["usage_count"],
                     "hit_symbols": sorted(ledger["hit_symbols"]),
                     "hit_symbol_count": len(ledger["hit_symbols"]),
@@ -716,6 +907,12 @@ class EvaluationLedgerService:
                     "risk_contribution": round(sum(ledger["weighted_risks"]), 6),
                     "effectiveness": self._build_effectiveness_summary(ledger["effectiveness_events"], recent_trade_dates),
                     "correlation": round(self._pearson(ledger["weight_samples"], ledger["return_samples"]), 4),
+                    "post_outcome_attribution": {
+                        "settled_count": len(ledger["settled_returns"]),
+                        "avg_return": round(self._mean(ledger["settled_returns"]), 6),
+                        "positive_rate": round(self._mean(ledger["positive_outcomes"]), 6),
+                        "filled_rate": round(self._mean(ledger["filled_flags"]), 6),
+                    },
                     "adoption_breakdown": dict(sorted(ledger["adoption_breakdown"].items())),
                     "outcome_breakdown": dict(sorted(ledger["outcome_breakdown"].items())),
                     "last_used_at": ledger["last_used_at"],
@@ -866,6 +1063,8 @@ class EvaluationLedgerService:
 
     def _normalize_factor_specs(self, record: dict[str, Any]) -> list[dict[str, Any]]:
         strategy = dict(record.get("strategy") or {})
+        factor_policy = dict((record.get("market_context") or {}).get("factor_policy") or {})
+        factor_effectiveness_trace = dict(factor_policy.get("factor_effectiveness_trace") or {})
         payload = []
         for raw in list(strategy.get("factors") or []):
             item = dict(raw or {})
@@ -873,6 +1072,18 @@ class EvaluationLedgerService:
             if not factor_id:
                 continue
             version = str(item.get("version") or "v1").strip() or "v1"
+            trace = dict(factor_effectiveness_trace.get(factor_id) or {})
+            monitor_status = str(trace.get("status") or "unknown").strip() or "unknown"
+            monitor_mode = str(trace.get("monitor_mode") or "").strip()
+            if not monitor_mode:
+                if monitor_status == "unsupported_for_monitor":
+                    monitor_mode = "outcome_attribution_only"
+                elif monitor_status in {"effective", "ineffective"}:
+                    monitor_mode = "cross_sectional_rank_ic"
+                elif monitor_status == "unavailable":
+                    monitor_mode = "cross_sectional_rank_ic_unavailable"
+                else:
+                    monitor_mode = "unknown"
             payload.append(
                 {
                     "id": factor_id,
@@ -881,6 +1092,10 @@ class EvaluationLedgerService:
                     "group": str(item.get("group") or "").strip(),
                     "name": str(item.get("name") or factor_id),
                     "weight": float(item.get("weight", 0.0) or 0.0),
+                    "monitor_status": monitor_status,
+                    "monitor_mode": monitor_mode,
+                    "mean_rank_ic": float(trace.get("mean_rank_ic", 0.0) or 0.0),
+                    "p_value": float(trace.get("p_value", 1.0) or 1.0),
                 }
             )
         return payload
@@ -914,6 +1129,10 @@ class EvaluationLedgerService:
             "group": "unknown",
             "name": factor_id or key,
             "weight": 0.0,
+            "monitor_status": "unknown",
+            "monitor_mode": "unknown",
+            "mean_rank_ic": 0.0,
+            "p_value": 1.0,
         }
 
     def _fallback_playbook_meta(self, key: str) -> dict[str, Any]:
@@ -1046,10 +1265,98 @@ class EvaluationLedgerService:
             return ""
         return f"playbooks[{playbook_part}]|factors[{factor_part}]"
 
+    def _slim_candidate_record(self, item: dict[str, Any]) -> dict[str, Any]:
+        factor_scores = {
+            str(key): round(float(value or 0.0), 4)
+            for key, value in dict(item.get("factor_scores") or {}).items()
+            if str(key).strip()
+        }
+        return {
+            "symbol": str(item.get("symbol") or "").strip(),
+            "name": str(item.get("name") or "").strip(),
+            "rank": int(item.get("rank", 0) or 0),
+            "selection_score": round(float(item.get("selection_score", 0.0) or 0.0), 4),
+            "composite_adjustment": round(float(item.get("composite_adjustment", 0.0) or 0.0), 6),
+            "composite_score": round(float(item.get("composite_score", 0.0) or 0.0), 4),
+            "action_hint": str(item.get("action_hint") or "").strip(),
+            "resolved_sector": str(item.get("resolved_sector") or item.get("sector") or "").strip(),
+            "factor_scores": factor_scores,
+            "scoring_meta": {
+                "composite_adjustment_multiplier": round(
+                    float(((item.get("scoring_meta") or {}).get("composite_adjustment_multiplier", 0.0) or 0.0)),
+                    4,
+                ),
+            },
+        }
+
+    def _slim_filtered_record(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "symbol": str(item.get("symbol") or "").strip(),
+            "name": str(item.get("name") or "").strip(),
+            "stage": str(item.get("stage") or "").strip(),
+            "reason": str(item.get("reason") or "").strip(),
+        }
+
+    def _build_composite_multiplier_samples(self, records: list[dict[str, Any]]) -> list[dict[str, float]]:
+        samples: list[dict[str, float]] = []
+        for record in records:
+            outcome = dict(record.get("outcome") or {})
+            if str(outcome.get("status") or "") != "settled":
+                continue
+            candidate_map = {
+                str(item.get("symbol") or "").strip(): dict(item)
+                for item in list(record.get("candidates") or [])
+                if str(item.get("symbol") or "").strip()
+            }
+            if not candidate_map:
+                continue
+            attribution_items = list(outcome.get("attribution_items") or [])
+            for attribution in attribution_items:
+                symbol = str(attribution.get("symbol") or "").strip()
+                candidate = candidate_map.get(symbol)
+                if candidate is None:
+                    continue
+                realized_return = attribution.get("holding_return_pct")
+                if realized_return is None:
+                    realized_return = attribution.get("next_day_close_pct")
+                if realized_return is None:
+                    continue
+                selection_score = float(candidate.get("selection_score", 0.0) or 0.0)
+                composite_adjustment = float(candidate.get("composite_adjustment", 0.0) or 0.0)
+                if composite_adjustment == 0.0:
+                    continue
+                samples.append(
+                    {
+                        "selection_score": selection_score,
+                        "composite_adjustment": composite_adjustment,
+                        "realized_return": float(realized_return or 0.0),
+                    }
+                )
+        return samples
+
     def _mean(self, values: list[float]) -> float:
         if not values:
             return 0.0
         return sum(float(item) for item in values) / len(values)
+
+    def _variance(self, values: list[float]) -> float:
+        if len(values) < 2:
+            return 0.0
+        mean_value = self._mean(values)
+        return sum((float(item) - mean_value) ** 2 for item in values) / len(values)
+
+    def _covariance(self, xs: list[float], ys: list[float]) -> float:
+        if len(xs) < 2 or len(ys) < 2 or len(xs) != len(ys):
+            return 0.0
+        mean_x = self._mean(xs)
+        mean_y = self._mean(ys)
+        return sum((float(x) - mean_x) * (float(y) - mean_y) for x, y in zip(xs, ys)) / len(xs)
+
+    def _regression_slope(self, xs: list[float], ys: list[float]) -> float:
+        variance = self._variance(xs)
+        if variance <= 1e-12:
+            return 0.0
+        return self._covariance(xs, ys) / variance
 
     def _pearson(self, xs: list[float], ys: list[float]) -> float:
         if len(xs) < 2 or len(ys) < 2 or len(xs) != len(ys):

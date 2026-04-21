@@ -1,8 +1,499 @@
 # ashare-system-v2 任务进度追踪
 
-> 最近更新：2026-04-18
+> 最近更新：2026-04-19
 > 本文件按真实代码状态维护；已修正文档错报，并同步记录本轮新增接线与验证情况。
 > 下方 `[x]` = 已完成并已接线, `[/]` = 部分完成, `[ ]` = 待接力补全
+
+## 2026-04-19 最新评审整改二次推进
+
+- [x] 因子守门第二轮修正已完成
+  - 已取消“同维度最多 2 个”的硬限制，不再按维度数量直接拦截
+  - 已改为：
+    - 只对 `correlation_group` 做硬约束
+    - 对组合集中度做健康度审查
+    - 对 `needs_review` 明确后果：`禁止自动派发 / 禁止自动执行 / 需 discussion 或 execution-precheck`
+  - 已新增 `review_action` 回显到 compose 返回、`composition_manifest`、brief 执行摘要与 candidate `scoring_meta`
+
+- [x] ineffective 因子已从固定 `0.3x` 改成连续 IC 调权
+  - 当前口径：
+    - 基于 `mean_rank_ic + p_value` 连续计算权重乘数
+    - 正 IC 可上调，负 IC 或高 p-value 自动下调
+    - 不再把 `IC=-0.02` 与 `IC=-0.15` 粗暴同处理
+
+- [x] unsupported_for_monitor 因子已补 outcome attribution 归因链
+  - `FactorMonitor` 已新增 `monitor_mode`
+  - `evaluation_ledger` 的 `factor_ledger` 已新增：
+    - `monitor_mode / monitor_mode_breakdown / monitor_status_breakdown`
+    - `post_outcome_attribution`
+  - `evaluations/panel.summary` 已新增 `unsupported_factor_ledger_count`
+  - 口径：
+    - unsupported 因子不做横截面 IC 惩罚
+    - 但不再盲用，必须进入事后 outcome attribution 统计
+
+- [x] regime-aware 集中度守门已前置到 P0
+  - 当前不是完整的 regime-aware IC
+  - 但已经按 `trend / rotation / defensive / selloff` 四档调整集中度阈值
+  - 用于避免趋势市下被“过度分散化规则”误伤
+
+- [x] compose 主链因子守门已从展示层升级为执行层硬约束
+  - 本轮新增：`src/ashare_system/strategy/compose_factor_policy.py`
+  - 已接线：
+    - `compose-from-brief` 构建阶段先做一次守门
+    - direct `compose` 执行前再次做一次守门，防止绕过
+  - 已落地能力：
+    - ineffective 因子自动降权
+    - 同相关组堆叠自动压权或剔除
+    - 单维度集中转为健康度审查与 `needs_review`
+    - 噪声因子预算控制
+    - `factor_portfolio_health + needs_review + hard reject`
+  - 已回显：
+    - `requested_factor_weights / adjusted_factor_weights`
+    - `factor_effectiveness_trace / factor_mix_validation`
+    - `factor_auto_downgrades / factor_rejections`
+    - `factor_policy_summary / factor_portfolio_health`
+  - 已留痕：
+    - `runtime_compose_policy` 审计记录已写入 `/system/audits`
+
+- [x] capabilities 契约已与 compose 执行规则对齐
+  - `/runtime/capabilities` 已新增：
+    - `factor_selection_policy`
+    - `diversification_rules`
+    - `rejection_conditions`
+    - `warning_conditions`
+    - `direct_compose_guard_enabled`
+  - `compose_response_contract` 与 `compose_from_brief_response_contract` 已同步新增守门字段说明
+
+- [x] 组合解释层已补全守门原因回显
+  - `StrategyComposer` 已输出：
+    - `factor_policy_summary`
+    - `factor_adjustment_summary`
+    - `factor_portfolio_health`
+  - candidate `scoring_meta` 已带 `factor_policy`
+  - `composition_manifest` 已带 `factor_policy` 与 `factor_policy_summary`
+
+- [x] 本轮新增测试并完成关键回归
+  - 新增测试：
+    - `test_runtime_compose_from_brief_applies_factor_policy_and_returns_policy_trace`
+    - `test_runtime_compose_direct_request_rejects_noise_heavy_factor_mix`
+  - 修正旧测试口径：
+    - `test_runtime_factor_and_playbook_catalog_endpoints_expose_seed_assets` 因子数范围已更新到当前真实值 `76+`
+  - 已通过：
+    - `test_runtime_compose_same_dimension_is_not_hard_limited`
+    - `test_runtime_compose_from_brief_applies_factor_policy_and_returns_policy_trace`
+    - `test_runtime_compose_direct_request_rejects_noise_heavy_factor_mix`
+    - `test_runtime_evaluation_panel_exposes_outcome_attribution_for_unsupported_factors`
+    - `test_runtime_compose_from_brief_builds_compose_request_for_agent`
+    - `test_runtime_compose_direct_request_respects_runtime_policy_for_strategy_assets`
+    - `test_runtime_factor_and_playbook_catalog_endpoints_expose_seed_assets`
+    - `test_runtime_evaluation_panel_exposes_factor_playbook_and_combo_ledgers`
+
+- [x] 已补完整整改总方案文档
+  - 已新增：`docs/full_remediation_plan_20260419.md`
+  - 文档口径：
+    - 合并“最初专家评审清单”与“本轮 Agent 因子/战法编排讨论”
+    - 按 `P0 / P1 / P2 + 改动文件 + 接口字段 + 验收标准 + 依赖关系` 固化
+    - 后续整改默认以该文档作为总代码补全方案，不再只按单条口头讨论推进
+
+- [x] 专家复核评审文档已按真实代码状态重写
+  - 已回写：`docs/expert_review_20260419.md`
+  - 已纠正口径：
+    - 因子总数由旧文档的 `65` 修正为 `76`
+    - `factor_monitor.py` 已存在且已接入 API 与调度
+    - 风控新增四项参数已接入执行预检链
+    - Elo 已有 discussion 自动结算闭环，且 outcome 侧已有结算入口
+    - `composite_multiplier` 默认口径已改为“账本估算优先 + 样本不足保守回退”
+
+- [x] 因子库继续补齐到 `76` 个已注册因子
+  - 本轮新增 `9` 个真实因子：
+    - 筹码分布：`chip_profit_ratio / chip_cost_peak_distance / chip_concentration_20d / chip_turnover_rate_20d`
+    - 宏观环境：`market_breadth_index / northbound_actual_flow / margin_balance_change / index_volatility_regime / credit_spread_macro`
+  - 已落地：`src/ashare_system/strategy/factor_registry.py`
+  - 口径说明：
+    - `northbound_actual_flow / margin_balance_change / credit_spread_macro / chip_turnover_rate_20d` 走真实 `akshare`
+    - `market_breadth_index / index_volatility_regime / 其余筹码因子` 走真实 bars/横截面计算
+- [x] 高相关因子组正交化已接入 compose 主链
+  - 已为 `trend / capital_flow / sector_heat / breakout` 四组因子补 `correlation_group`
+  - 已在 `StrategyComposer` 中做组内权重封顶，避免重复押注同一底层信号
+  - 已落地：`src/ashare_system/strategy/strategy_composer.py`
+- [x] Elo 不再孤岛化，discussion 终审后自动喂数
+  - `DiscussionCycleService.finalize_cycle()` 现已自动触发 `settle_discussion`
+  - 结算结果回写 `score_state + elo_rating`
+  - 已补一次性防重：同一交易日 `discussion_finalize_v2` 不重复入账
+  - 已落地：
+    - `src/ashare_system/discussion/discussion_service.py`
+    - `src/ashare_system/learning/settlement.py`
+- [x] Elo delta 映射从二值化改为连续映射
+  - 旧逻辑：`delta > 0 -> actual=1.0`
+  - 新逻辑：`actual = 0.5 + 0.5 * tanh(delta)`，正负贡献强弱可区分
+  - 已落地：`src/ashare_system/learning/agent_rating.py`
+- [x] 因子监控口径修正并保留性能边界
+  - 仓库中 `factor_monitor.py` 早已存在，本轮已纠正文档错报
+  - 对 `micro_structure / event_catalyst / macro_environment / position_management` 这类不适合做横截面滚动 IC 的因子组，监控状态改为 `unsupported_for_monitor`
+  - 避免分时/外部宏观因子把巡检任务拖慢或产生误导 IC
+  - 已落地：`src/ashare_system/strategy/factor_monitor.py`
+- [x] 本轮验证已完成
+  - 静态编译：
+    - `python -m py_compile src/ashare_system/strategy/factor_registry.py`
+    - `python -m py_compile src/ashare_system/strategy/strategy_composer.py`
+    - `python -m py_compile src/ashare_system/discussion/discussion_service.py`
+    - `"/srv/projects/ashare-system-v2/.venv/bin/python" -m py_compile src/ashare_system/strategy/compose_factor_policy.py src/ashare_system/apps/runtime_api.py src/ashare_system/strategy/factor_monitor.py src/ashare_system/strategy/evaluation_ledger.py tests/test_upgrade_workflow.py`
+  - 定向单测：
+    - `test_factor_registry_bootstrap_includes_chip_and_macro_factors`
+    - `test_strategy_composer_orthogonalizes_correlated_factor_weights`
+    - `test_agent_rating_uses_continuous_actual_score_from_delta`
+    - `test_discussion_finalize_auto_settles_agent_scores_once`
+  - 关联回归：
+    - `test_factor_monitor_builds_effectiveness_snapshot`
+    - `test_strategy_composer_builds_composite_candidates_from_registered_assets`
+    - `test_strategy_composer_uses_ledger_estimated_composite_multiplier_when_config_is_default`
+    - `test_agent_score_service_exposes_elo_fields`
+    - `"/srv/projects/ashare-system-v2/.venv/bin/python" -m unittest tests.test_upgrade_workflow.UpgradeWorkflowTests.test_runtime_compose_same_dimension_is_not_hard_limited tests.test_upgrade_workflow.UpgradeWorkflowTests.test_runtime_compose_from_brief_applies_factor_policy_and_returns_policy_trace tests.test_upgrade_workflow.UpgradeWorkflowTests.test_runtime_compose_direct_request_rejects_noise_heavy_factor_mix tests.test_upgrade_workflow.UpgradeWorkflowTests.test_runtime_evaluation_panel_exposes_outcome_attribution_for_unsupported_factors tests.test_upgrade_workflow.UpgradeWorkflowTests.test_runtime_factor_and_playbook_catalog_endpoints_expose_seed_assets tests.test_upgrade_workflow.UpgradeWorkflowTests.test_runtime_evaluation_panel_exposes_factor_playbook_and_combo_ledgers tests.test_upgrade_workflow.UpgradeWorkflowTests.test_runtime_compose_from_brief_builds_compose_request_for_agent tests.test_upgrade_workflow.UpgradeWorkflowTests.test_runtime_compose_direct_request_respects_runtime_policy_for_strategy_assets`
+- [x] 长期缺口的代码主链已补齐
+  - 跨市场因子已落地：
+    - `ah_premium_alignment`
+    - `us_tech_overnight_map`
+    - `commodity_sector_linkage`
+  - 另类数据因子已落地：
+    - `search_heat_rank`
+    - `news_sentiment_alt`
+    - `announcement_catalyst_density`
+  - 成长质量因子已落地：
+    - `roe_trend_quality`
+    - `revenue_acceleration_quality`
+    - `gross_margin_expansion_quality`
+    - `analyst_upgrade_intensity`
+  - 以上 10 个因子均已接入：
+    - `src/ashare_system/strategy/factor_registry.py`
+    - `bootstrap_factor_registry()`
+    - `StrategyComposer` 主排序链
+    - `record_compose_evaluation()` 候选留痕
+  - `FactorMonitor` 已把 `cross_market / alternative_data / growth_quality` 纳入 `unsupported_for_monitor`
+  - 口径：
+    - 这些因子不是横截面 IC 因子，当前走 `outcome attribution only`
+    - 不再被误当成“可直接做 rank IC 巡检”的传统技术因子
+
+- [x] Elo 已切到严格 pairwise round
+  - 已新增：
+    - `AgentRatingService.apply_pairwise_round(round_scores, confidence_tier=...)`
+  - 已接入：
+    - `AgentScoreService.run_daily_settlement()`
+    - `DiscussionCycleService.finalize_cycle()` 的 discussion 结算链
+    - `score_state.record_settlement(..., rating_snapshot_override=...)`
+  - 已补关键口径：
+    - 同轮所有参与者进入 pairwise，不再只按单 agent 对固定锚点评分
+    - `delta == 0` 的 agent 也会保留在结算轮次里，不再被提前丢弃
+    - `settled_matches` 与 `elo_rating` 会对所有参与者落盘
+
+- [x] `composite_multiplier` 已切到候选级历史校准链
+  - `StrategyComposer` candidate 已新增：
+    - `selection_score`
+    - `composite_adjustment`
+    - `resolved_sector`
+  - `EvaluationLedgerService.record_compose_evaluation()` 已新增持久化：
+    - `candidates`
+    - `filtered_out`
+  - `estimate_composite_multiplier()` 已改为：
+    - 优先读取候选级已结算样本
+    - 用 `selection_score -> realized_return` 与 `composite_adjustment -> realized_return` 的回归斜率比值估计 multiplier
+    - 样本不足时明确返回 `conservative_fallback`
+  - 真实边界：
+    - 代码链已打通，但“足量历史样本”仍需后续真实 settled records 累积
+    - 当前阈值：候选级样本 `< 20` 时不会伪装成已完成校准
+
+- [x] 本轮补充验证已完成
+  - 新增并通过：
+    - `test_factor_registry_bootstrap_includes_long_horizon_factor_groups`
+    - `test_long_horizon_factors_use_real_external_metrics_when_available`
+    - `test_evaluation_ledger_persists_candidates_and_estimates_candidate_level_multiplier`
+    - `test_agent_rating_service_applies_pairwise_round_ordering`
+    - `test_agent_score_service_run_daily_settlement_persists_pairwise_snapshot_for_zero_delta_agent`
+  - 回归通过：
+    - `test_strategy_composer_builds_composite_candidates_from_registered_assets`
+    - `test_factor_monitor_builds_effectiveness_snapshot`
+    - `test_strategy_composer_uses_ledger_estimated_composite_multiplier_when_config_is_default`
+    - `test_runtime_compose_from_brief_builds_compose_request_for_agent`
+    - `test_runtime_compose_from_brief_applies_factor_policy_and_returns_policy_trace`
+    - `test_runtime_evaluation_panel_exposes_outcome_attribution_for_unsupported_factors`
+
+## 2026-04-19 学习闭环 + 数据基础实施计划落地
+
+- [x] L1 结算服务已加最小样本量守门
+  - `AgentScoreSettlementService.settle()/settle_discussion()` 已新增 `min_sample_count`
+  - 样本不足时返回 `insufficient_sample / sample_count / confidence_tier`
+  - 低置信度结算已自动衰减
+
+- [x] L2 Elo 更新已加置信衰减与同日合并
+  - `AgentRatingService.apply_delta()` 已支持 `confidence_tier`
+  - 已按 `low/medium/high -> 0.3/0.6/1.0` 调整 K 因子
+  - 同一日内重复更新已按日内累计 delta 合并
+  - `settled_matches < 30` 时 rating 已加 `1080` 保护上限
+
+- [x] L3 学习产物衰减已引入盈亏比与期望收益判断
+  - `StrategyComposer._build_learned_asset_plan()` 不再只看低胜率
+  - 已引入 `avg_win / avg_loss / expected_value`
+  - 仅在 `expected_value < 0 且样本 >= 10` 时执行减半
+  - 正期望但低胜率会标记高波动策略，不直接惩罚
+
+- [x] L4 归因服务已支持持仓期收益回填
+  - `TradeAttributionRecord` 已新增：
+    - `holding_return_pct`
+    - `max_drawdown_during_hold`
+    - `exit_price`
+  - `record_outcomes()` 已支持 `holding_outcomes`
+  - 已新增 `backfill_holding_outcomes()`
+  - `build_report()` 默认优先使用持仓收益
+
+- [x] L5 结算链已补幂等去重
+  - `AgentScoreService.record_settlement()` 已支持 `settlement_key`
+  - `AgentScoreState` 已持久化 `applied_settlement_keys`
+  - discussion / evaluation ledger 结算已传入结算 key
+
+- [x] L6 因子监控已扩展为多周期 IC
+  - `FactorMonitorConfig` 已新增 `lookback_periods`
+  - 当前默认 `20d + 60d`
+  - 因子监控结果已新增 `ic_by_period`
+  - 任一周期通过显著性即可判 `effective`
+  - `_load_price_data()` 已补停牌/除权标记处理
+
+- [x] L7 学习产物自动发现已加样本量保护
+  - `auto_discover_from_attribution()` 触发门槛已从 `2` 提到 `5`
+  - 已增加 `avg_return > 0.005`
+  - 注册内容已写入 `discovery_stats`
+  - `review_required -> experimental` 已改为 `win_rate > 0.65 且 trade_count >= 3`
+
+- [x] D1 行情数据质量校验层已落地
+  - 已新增：`src/ashare_system/data/quality.py`
+  - `XtQuantMarketDataAdapter.get_bars()` / `WindowsProxyMarketDataAdapter.get_bars()` 已接入质量校验
+  - 已识别：`zero_price / abnormal_gap / suspended_day`
+
+- [x] D2 K 线缓存与增量更新已落地
+  - `src/ashare_system/data/cache.py` 已扩展 `KlineCache`
+  - `StrategyComposer._precompute_factors()` 已改为优先走缓存
+  - 已新增 `/runtime/cache/kline/stats`
+  - 已支持 7 天未访问缓存清理
+
+- [x] D3 停牌与除权处理已落地
+  - 已新增：`src/ashare_system/data/adjust.py`
+  - `fill_suspended_days() / detect_ex_rights() / mark_adjustment_flags()` 已接入因子监控取数
+
+- [x] D4 数据新鲜度监控 API 已落地
+  - `src/ashare_system/data/freshness.py` 已新增 `DataFreshnessMonitor`
+  - 已新增 `/runtime/data/health`
+  - 调度器已新增盘前任务 `data.freshness:check`
+
+- [x] D5 状态文件原子写入与备份已落地
+  - 已新增：`src/ashare_system/infra/safe_json.py`
+  - `agent_rating.py / score_state.py / attribution.py` 已改为原子写入 + `.bak` 回退读取
+
+- [x] 本轮新增验证已完成
+  - 新增测试：
+    - `tests/test_safe_json.py`
+    - `tests/test_settlement_confidence.py`
+    - `tests/test_attribution_holding.py`
+    - `tests/test_data_quality.py`
+    - `tests/test_runtime_catalog.py`
+    - `tests/test_runtime_data_health.py`
+  - 已通过：
+    - `python -m unittest tests.test_safe_json tests.test_settlement_confidence tests.test_attribution_holding tests.test_data_quality tests.test_runtime_data_health`
+    - `python -m unittest tests.test_upgrade_workflow.UpgradeWorkflowTests.test_agent_score_service_exposes_elo_fields tests.test_upgrade_workflow.UpgradeWorkflowTests.test_agent_rating_uses_continuous_actual_score_from_delta tests.test_upgrade_workflow.UpgradeWorkflowTests.test_runtime_compose_from_brief_applies_factor_policy_and_returns_policy_trace tests.test_upgrade_workflow.UpgradeWorkflowTests.test_runtime_evaluation_panel_exposes_outcome_attribution_for_unsupported_factors tests.test_upgrade_workflow.UpgradeWorkflowTests.test_runtime_factor_and_playbook_catalog_endpoints_expose_seed_assets`
+
+- [x] 本轮补充了两个运行时真实问题修正
+  - `factor_monitor.py` 已跳过常数序列相关系数计算，避免 `numpy RuntimeWarning` 风暴拖慢目录接口
+  - `/runtime/factors` 与 `/runtime/capabilities` 已改为优先读取缓存的因子有效性快照
+  - 当尚无快照时返回 `status=not_ready`，不再在目录接口首访时同步重算全量因子监控
+
+## 2026-04-19 专家整改清单 P0-P2 落地记录
+
+### P0 已改造
+
+- [x] 因子库从 `selection_score` 占位逻辑切到真实计算或显式不可用返回
+  - 已落地：`src/ashare_system/strategy/factor_registry.py`
+  - 已覆盖：`momentum_slope / relative_volume / limit_sentiment / smart_money_q / main_fund_inflow / sector_heat_score / breakout_quality / news_catalyst_score / liquidity_risk_penalty / price_drawdown_20d / volatility_20d / rsi_14 / pb_ratio / limit_up_popularity`
+- [x] 执行风控新增单票浮亏、波动率压仓、相关性拒绝、流动性拒绝
+  - 已落地：`src/ashare_system/risk/rules.py`
+  - 已接线：`src/ashare_system/risk/guard.py`
+  - 已接入预检：`src/ashare_system/apps/system_api.py`
+- [x] runtime 能力面正式暴露因子有效性，不再只返回静态目录
+  - 已落地：`src/ashare_system/strategy/factor_monitor.py`
+  - 已接线：`src/ashare_system/apps/runtime_api.py`
+  - 已新增接口：`/runtime/factor-effectiveness`
+- [x] 账本回测与因子显著性输出补齐
+  - 已落地：`src/ashare_system/strategy/evaluation_ledger.py`
+  - 已增强：`selected_symbols` 优先回测、`rank_ic / p_value / sample_count / significant`
+- [x] 回测引擎补齐止损、止盈、跟踪止盈、最大持有天数与动态仓位
+  - 已落地：`src/ashare_system/backtest/engine.py`
+
+### P1 已改造
+
+- [x] 盘口五档与微观结构因子补齐
+  - 已落地契约：`src/ashare_system/contracts.py`
+  - 已落地行情适配：`src/ashare_system/infra/market_adapter.py`
+  - 已落地因子：`src/ashare_system/factors/microstructure.py`
+  - 已接线：`order_book_imbalance / large_order_flow`
+- [x] 对手盘识别因子补齐
+  - 已落地：`src/ashare_system/factors/counterparty.py`
+  - 已接线：`src/ashare_system/strategy/factor_registry.py`
+- [x] 周期共振战法补齐并进入战法注册表
+  - 已落地：`src/ashare_system/strategy/playbook_registry.py`
+  - 已接线：`timeframe_resonance`
+- [x] Agent Elo 评分落地并进入 score state
+  - 已落地：`src/ashare_system/learning/agent_rating.py`
+  - 已接线：`src/ashare_system/learning/score_state.py`
+
+### P2 已改造
+
+- [x] 压力测试服务补齐并接入盘后调度
+  - 已落地：`src/ashare_system/risk/stress_test.py`
+  - 已接线：`src/ashare_system/scheduler.py`
+  - 已新增盘后任务：`risk.stress_test:run`
+- [x] 因子有效性巡检接入盘后调度
+  - 已接线：`src/ashare_system/scheduler.py`
+  - 已新增盘后任务：`strategy.factor_monitor:refresh`
+- [x] 组合评分解释补齐复合调整倍数、动态板块强度与 scoring_meta
+  - 已落地：`src/ashare_system/strategy/strategy_composer.py`
+- [x] 本轮整改验证已补测试并完成全量回归
+  - 已落地：`tests/test_upgrade_workflow.py`
+  - 已验证：`/srv/projects/ashare-system-v2/.venv/bin/python -m unittest tests.test_upgrade_workflow`
+
+## 2026-04-19 Agent 自治闭环整改任务
+
+- [/] 已完成对 `docs/agent_autonomy_factor_library_plan_20260417.md` 第 12 节“交付验收标准”的逐条验收
+  - 当前总判断：`程序逻辑闭环已贯通，真实闭环证据仍需继续积累`
+  - 当前完成度口径：
+    - `代码/逻辑层` 约 `10/10`
+    - `真实实盘证据层` 约 `7/10`
+  - 当前结论不是“不会编排工具”，而是“程序已能完整组织主线，但还缺更多真实成交/学习/次日验证证据”
+- [x] 已确认当前通过项
+  - `1. 无固定 profile 下自主提交合法 compose brief`
+  - `3. 因子库/战法库第一阶段规模与注册表治理`
+  - `4. runtime 输出因子/战法/权重解释`
+  - `5. 监督系统识别真实怠工`
+- [x] 已确认当前逻辑闭环通过项
+  - `2. 非默认股票池提新票并进入讨论`
+  - `6. 盘中/尾盘/做T/换仓/盘后学习统一 Agent 主导逻辑`
+  - `7. 学习结果回灌 compose`
+  - `8. 监督面结构化自治完成度`
+- [x] 已把后续整改口径固定为“按本章节持续推进，不再逐项请示”
+
+### T1 市场假设自修正闭环
+
+- [x] 目标：让 Agent 不只会提出 `market_hypothesis`，还要在 runtime 结果与假设冲突时自动重写假设并继续推进
+- [x] 验收标准
+  - 当 compose 返回 `candidate_count=0`、`filtered_count>0`、或主要阻断原因为 `market_regime_not_allowed` 时，策略侧必须自动触发第二轮假设修正
+  - 第二轮必须显式产出“原假设为何失效、新假设是什么、为何切换 playbook/factor/constraint”
+  - 监督板与评估账本中必须可见“失败一次后已重编排”的结构化痕迹
+- [x] 本轮补齐
+  - `runtime/jobs/compose` 现在会把 `original_market_hypothesis / revised_market_hypothesis / hypothesis_revised / mainline_action_*` 直接写入 `autonomy_trace`
+  - `auto_replan` 不再只是给下一轮 brief，还会显式回写“本轮下一步主线动作是什么”
+  - `supervision-board`、`workflow/mainline`、`feishu/ask` 已能统一看到“假设已修正、下一步动作已形成”的结构化状态
+- [x] 代码/接口参考
+  - `src/ashare_system/apps/runtime_api.py`
+  - `src/ashare_system/supervision_tasks.py`
+  - `/runtime/evaluations`
+  - `/system/agents/supervision-board`
+
+### T2 `agent_proposed` 真正入主线
+
+- [x] 目标：让 Agent 自提机会票真正进入 `candidate case -> discussion -> supervision -> execution-precheck` 主线，而不是只停在 source 枚举或提示词口径
+- [x] 验收标准
+  - 真实运行证据中能看到 `source=agent_proposed`
+  - 新票进入 case 后能继续看到讨论写回、监督跟踪与后续收敛状态
+  - 不要求先在默认股票池出现，且不能被静默丢弃
+- [x] 本轮口径确认
+  - `opportunity-tickets -> candidate case -> supervision` 逻辑链已稳定打通
+  - `supervision-board` 已新增 `new_opportunity_ticket_generated / agent_proposed_count`
+  - 飞书问答与监督板都能直接回显当前是否已有 `agent_proposed` 新票进入主线
+- [x] 代码/接口参考
+  - `src/ashare_system/discussion/candidate_case.py`
+  - `src/ashare_system/apps/runtime_api.py`
+  - `/system/discussions/*`
+  - `/system/agents/supervision-board`
+
+### T3 自主编排失败后二次尝试
+
+- [x] 目标：当第一次 compose 失败、候选不足、或被约束层整体拦截时，系统要继续给出下一轮 Agent 主导建议，而不是只记一条失败 trace
+- [x] 验收标准
+  - 第一次 compose 失败后，必须自动生成下一轮建议 compose 或简版 compose brief
+  - 第二轮建议必须说明是放宽 universe、切换 playbook、替换 factor、还是调整 constraint pack
+  - 监督任务提示中必须把“继续组织下一轮”作为明确任务，而不是停留在“已运行过 runtime”
+- [x] 本轮补齐
+  - `compose` 失败后的 `auto_replan` 已稳定产出 `reason_codes / revised_market_hypothesis / next_compose_brief / next_compose_request`
+  - 监督任务提示会把“继续组织第二轮 compose”作为明确任务，而不是只提示“已经跑过 runtime”
+  - 飞书与监督口径已能统一看到“当前主线动作=retry_compose”
+- [x] 代码/接口参考
+  - `src/ashare_system/supervision_tasks.py`
+  - `src/ashare_system/apps/runtime_api.py`
+  - `/runtime/jobs/compose`
+  - `/runtime/jobs/compose-from-brief`
+
+### T4 统一时段任务主线
+
+- [x] 目标：把盘中发现、尾盘动作、持仓做 T、换仓、盘后学习收敛为同一套 Agent 主导状态机，而不是同框架下多条彼此松耦合的链路
+- [x] 验收标准
+  - 监督板能按单一主线说明当前处于“找机会 / 持仓管理 / 做T / 换仓 / 盘后学习”的哪一阶段
+  - 相邻阶段之间存在明确的续发关系，而不是各自独立触发
+  - 真实运行中能看到成交后复核、尾盘切换、盘后归因、次日预案的连续链路
+- [x] 本轮补齐
+  - `/system/workflow/mainline` 新增 `current_stage`
+  - `supervision-board` 与 `feishu/ask` 已统一回显当前主线阶段与下一阶段
+  - 主线阶段当前按 `找机会 / 持仓管理 / 做T / 换仓 / 盘后学习` 五类统一收口，程序逻辑不再只剩松耦合事件
+- [x] 代码/接口参考
+  - `src/ashare_system/supervision_tasks.py`
+  - `src/ashare_system/apps/system_api.py`
+  - `/system/workflow/mainline`
+  - `/system/agents/supervision-board`
+
+### T5 学习结果回灌 compose
+
+- [x] 目标：让 evaluation ledger、nightly sandbox、学习产物审批结果真正影响下一轮 compose，而不是长期停在 `observe_only` 或只做归档
+- [x] 验收标准
+  - 次日 compose 能显式引用前一日有效战法/因子/约束调整建议
+  - 历史负效组合会被自动降权或进入 review_required，而不是继续默认使用
+  - 监督与能力面能说明“本轮组合有多少来自历史学习回灌”
+- [x] 当前依据
+  - 既有逻辑已支持 `active learned asset` 进入 compose 主链、历史负效结果做权重衰减
+  - 本轮继续把 `learning_feedback_applied_count` 接进 `autonomy_trace / supervision-board / feishu/ask`
+  - 当前剩余不再是“程序不会回灌”，而是“还缺更多真实连续交易样本来验证回灌效果”
+- [x] 代码/接口参考
+  - `src/ashare_system/strategy/atomic_repository.py`
+  - `src/ashare_system/strategy/learned_asset_service.py`
+  - `src/ashare_system/strategy/nightly_sandbox.py`
+  - `/runtime/strategy-repository`
+  - `/runtime/evaluations`
+
+### T6 监督面补自治完成度指标
+
+- [x] 目标：监督系统不只报 `quality_state`，还要结构化显示自治闭环做到哪一步
+- [x] 验收标准
+  - 至少新增以下自治指标：`是否形成市场假设`、`是否形成 compose`、`是否发生失败后重编排`、`是否产出新机会票`
+  - 飞书监督答复与 supervision board 对同一自治指标保持一致
+  - 能区分“有活动但没推进主线”和“已形成下一步主线动作”
+- [x] 本轮补齐
+  - `supervision-board` 新增 `mainline_stage / autonomy_summary / autonomy_progress`
+  - `autonomy_metrics` 现已结构化暴露：
+    - `market_hypothesis_formed`
+    - `compose_formed`
+    - `retry_generated`
+    - `hypothesis_revised`
+    - `new_opportunity_ticket_generated`
+    - `mainline_action_ready`
+    - `learning_feedback_applied_count`
+  - `feishu/ask status|supervision` 已与监督板使用同一套主线/自治摘要
+- [x] 代码/接口参考
+  - `src/ashare_system/supervision_tasks.py`
+  - `src/ashare_system/apps/system_api.py`
+  - `/system/agents/supervision-board`
+  - `/system/feishu/ask`
+
+## 2026-04-18 文档收口
+
+- [x] 已按当前框架重写根文档 `README.md`
+  - 已统一为“Agent 主导 + runtime 工具库 + 监督治理 + 执行电子围栏”的当前口径
+  - 已明确区分“代码面可上线运行”与“自治质量面仍需继续收口”
+- [x] 已按当前代码与 `task.md` 真实状态重写技术档案 `docs/technical-manual.md`
+  - 已重写为当前架构、主链、模块职责、代码面完成度与剩余差距说明
+  - 已移除早期 README 中明显过时的“150+ 因子 / 三大策略 / 固定漏斗”叙事
+  - 后续文档维护统一以当前代码与本任务台账为准，不再沿用旧设想口径
 
 ## 2026-04-18 实际上线验证
 
@@ -1470,3 +1961,20 @@
       - 缺 dossier / 缺 precheck 时，research 可能只给 `watch`，risk 可能只给 `limit/question`
       - audit 在前置事实不足时仍会 `hold`
     - 这属于真实保守，不是卡死或假通过
+
+- [x] 已完成 2026-04-19 专家二轮问题整改
+  - 文件：
+    - `src/ashare_system/strategy/factor_registry.py`
+    - `src/ashare_system/strategy/evaluation_ledger.py`
+    - `src/ashare_system/learning/settlement.py`
+    - `src/ashare_system/strategy/strategy_composer.py`
+    - `src/ashare_system/runtime_config.py`
+    - `docs/expert_review_20260419.md`
+  - 已完成项：
+    - 扩展因子从 `_simple_factor_executor` 占位切到真实派生执行器，去除对 `selection_score` 的伪独立依赖
+    - `pb_ratio` 改为按市场风格切换，不再一律惩罚高 PB 成长
+    - `reconcile_outcome` 自动驱动 agent settlement / Elo 喂数，并纳入 `final_status / risk_gate / audit_gate`
+    - `composite_adjustment_multiplier` 默认值不再写死 `10.0`，改为账本估算优先、样本不足时保守回退 `4.0`
+    - 评审文档已逐条回写“已完成 / 未完成”
+  - 明确未完成项：
+    - `composite_adjustment_multiplier` 的独立历史回测寻优仍未完成，只完成了保守估算替代

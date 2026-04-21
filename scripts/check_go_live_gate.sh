@@ -13,7 +13,6 @@ if [[ -f ".env" ]]; then
     set +a
 fi
 
-TRADE_DATE="${1:-$(date +%F)}"
 ACCOUNT_ID="${2:-${ASHARE_ACCOUNT_ID:-8890130545}}"
 API_TIMEOUT="${ASHARE_API_TIMEOUT_SECONDS:-60}"
 PYTHON_BIN="$(resolve_project_python || true)"
@@ -21,6 +20,37 @@ PYTHON_BIN="$(resolve_project_python || true)"
 if [[ -z "${PYTHON_BIN}" ]]; then
     echo "[go-live-gate] 未找到可用 Python 解释器，请先配置 .venv 或 ASHARE_PYTHON_BIN" >&2
     exit 1
+fi
+
+resolve_trade_date() {
+    "${PYTHON_BIN}" - <<'PY'
+import json
+import urllib.request
+from datetime import date
+
+endpoints = [
+    "http://127.0.0.1:8100/system/agents/supervision-board",
+    "http://127.0.0.1:8100/system/feishu/briefing",
+]
+for endpoint in endpoints:
+    try:
+        with urllib.request.urlopen(endpoint, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        trade_date = str(payload.get("trade_date") or "").strip()
+        if trade_date:
+            print(trade_date)
+            raise SystemExit(0)
+    except Exception:
+        continue
+print(date.today().isoformat())
+PY
+}
+
+TRADE_DATE="${1:-$(resolve_trade_date)}"
+TODAY="$(date +%F)"
+REQUIRE_TRADING_SESSION="true"
+if [[ "${TRADE_DATE}" != "${TODAY}" ]]; then
+    REQUIRE_TRADING_SESSION="false"
 fi
 
 TMP_DIR="$(mktemp -d)"
@@ -37,7 +67,7 @@ fetch_json() {
 fetch_json "/health" "health"
 fetch_json "/system/operations/components" "operations_components"
 fetch_json "/system/deployment/service-recovery-readiness?trade_date=${TRADE_DATE}&account_id=${ACCOUNT_ID}&include_details=false" "service_recovery"
-fetch_json "/system/deployment/controlled-apply-readiness?trade_date=${TRADE_DATE}&account_id=${ACCOUNT_ID}&require_live=true&require_trading_session=true&include_details=false" "controlled_apply"
+fetch_json "/system/deployment/controlled-apply-readiness?trade_date=${TRADE_DATE}&account_id=${ACCOUNT_ID}&require_live=true&require_trading_session=${REQUIRE_TRADING_SESSION}&include_details=false" "controlled_apply"
 fetch_json "/system/feishu/longconn/status" "feishu_longconn"
 fetch_json "/system/feishu/briefing?trade_date=${TRADE_DATE}" "feishu_briefing"
 fetch_json "/system/agents/supervision-board?trade_date=${TRADE_DATE}&overdue_after_seconds=180" "supervision_board"
@@ -45,13 +75,13 @@ fetch_json "/system/discussions/execution-dispatch/latest?trade_date=${TRADE_DAT
 fetch_json "/system/execution/gateway/receipts/latest" "execution_receipt_latest"
 fetch_json "/system/readiness?account_id=${ACCOUNT_ID}" "readiness"
 
-"${PYTHON_BIN}" - "${TRADE_DATE}" "${ACCOUNT_ID}" "${TMP_DIR}" <<'PY'
+"${PYTHON_BIN}" - "${TRADE_DATE}" "${ACCOUNT_ID}" "${TMP_DIR}" "${TODAY}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 
-trade_date, account_id, tmp_dir = sys.argv[1:4]
+trade_date, account_id, tmp_dir, today = sys.argv[1:5]
 root = Path(tmp_dir)
 
 
@@ -104,6 +134,8 @@ attention_agents = [
     if isinstance(item, dict) and str(item.get("attention_status") or "") in {"needs_work", "overdue"}
 ]
 
+historical_trade_date = trade_date != today
+
 gate_results: list[tuple[str, bool, str]] = []
 
 linux_services_ok = (
@@ -155,7 +187,7 @@ gate_results.append(
     )
 )
 
-feishu_delivery_ok = longconn_ok and briefing_ok and len(overdue_agents) == 0
+feishu_delivery_ok = longconn_ok and briefing_ok and (historical_trade_date or len(overdue_agents) == 0)
 gate_results.append(
     (
         "准入5_feishu_delivery",

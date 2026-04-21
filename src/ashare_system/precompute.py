@@ -589,6 +589,7 @@ class DossierPrecomputeService:
         return list(reversed(retained_reversed))
 
     def _resolve_trade_date(self, as_of_time: str | None = None) -> str:
+        current_trade_date = self._now_factory().date().isoformat()
         if as_of_time:
             try:
                 return datetime.fromisoformat(as_of_time).date().isoformat()
@@ -597,8 +598,13 @@ class DossierPrecomputeService:
         latest_runtime = self._runtime_state_store.get("latest_runtime_report", {})
         generated_at = latest_runtime.get("generated_at")
         if generated_at:
-            return datetime.fromisoformat(generated_at).date().isoformat()
-        return self._now_factory().date().isoformat()
+            try:
+                runtime_trade_date = datetime.fromisoformat(generated_at).date().isoformat()
+                if runtime_trade_date == current_trade_date:
+                    return runtime_trade_date
+            except ValueError:
+                pass
+        return current_trade_date
 
     def _resolve_symbols(self, trade_date: str, symbols: list[str], source: str, limit: int) -> list[str]:
         if symbols:
